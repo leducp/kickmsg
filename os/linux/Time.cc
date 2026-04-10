@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <ctime>
 #include <stdexcept>
+#include <system_error>
 #include <string>
 
 namespace kickmsg

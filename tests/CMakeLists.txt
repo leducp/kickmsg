@@ -5,8 +5,7 @@ add_executable(kickmsg_unit
     unit/subscriber-t.cc
     unit/node-t.cc
 )
-target_link_libraries(kickmsg_unit PRIVATE kickmsg kickcat GTest::gtest_main)
-set_kickcat_properties(kickmsg_unit)
+target_link_libraries(kickmsg_unit PRIVATE kickmsg GTest::gtest_main)
 set_target_properties(kickmsg_unit
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -23,15 +22,13 @@ add_executable(kickmsg_stress_test
     stress/live_repair.cc
     stress/edge_cases.cc
 )
-target_link_libraries(kickmsg_stress_test PRIVATE kickmsg kickcat)
-set_kickcat_properties(kickmsg_stress_test)
+target_link_libraries(kickmsg_stress_test PRIVATE kickmsg)
 set_target_properties(kickmsg_stress_test
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(kickmsg_crash_test crash_test.cc)
-target_link_libraries(kickmsg_crash_test PRIVATE kickmsg kickcat)
-set_kickcat_properties(kickmsg_crash_test)
+target_link_libraries(kickmsg_crash_test PRIVATE kickmsg)
 set_target_properties(kickmsg_crash_test
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

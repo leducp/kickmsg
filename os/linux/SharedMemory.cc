@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
