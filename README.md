@@ -11,7 +11,7 @@ KickMsg provides MPMC publish/subscribe over shared memory with zero-copy receiv
 - **Per-subscriber isolation**: a slow subscriber only overflows its own ring — fast subscribers are unaffected
 - **Crash resilient**: publisher crashes never deadlock the channel; bounded slot leaks are recoverable via GC
 - **Topic-centric naming**: subscribers connect by topic name, not publisher identity
-- **C++17**, no external dependencies beyond OS layer
+- **C++17**, no external dependencies beyond POSIX / Win32
 
 ## Channel Patterns
 
@@ -96,23 +96,37 @@ region.reclaim_orphaned_slots();
 
 ## Building
 
-KickMsg is built as part of the KickCAT project.
+### Prerequisites
+
+- C++17 compiler (GCC 10+, Clang 12+, MSVC 2019+)
+- CMake 3.15+
+- Conan 2.x (for test/benchmark dependencies)
+
+### Build
 
 ```bash
-# From the KickCAT root:
-./scripts/configure.sh build --with=unit_tests
-./scripts/setup_build.sh build
-cd build && make -j
+# Install dependencies
+pip install conan
+conan install conanfile.py -of=build --build=missing -o unit_tests=True
+
+# Configure and build
+cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH=build \
+    -DBUILD_UNIT_TESTS=ON \
+    -DBUILD_EXAMPLES=ON
+cmake --build build
 
 # Run tests
-./kickmsg_unit
-./kickmsg_stress_test
+./build/kickmsg_unit
+./build/kickmsg_stress_test
+./build/kickmsg_crash_test
 
-# Run examples (if BUILD_MASTER_EXAMPLES is ON)
-./lib/kickmsg/examples/hello_pubsub
-./lib/kickmsg/examples/hello_zerocopy
-./lib/kickmsg/examples/hello_broadcast
-./lib/kickmsg/examples/hello_diagnose
+# Run examples
+./build/examples/hello_pubsub
+./build/examples/hello_zerocopy
+./build/examples/hello_broadcast
+./build/examples/hello_diagnose
 ```
 
 ### As a subdirectory
@@ -122,12 +136,13 @@ add_subdirectory(kickmsg)
 target_link_libraries(my_app PRIVATE kickmsg)
 ```
 
-### Relevant CMake options (set in KickCAT's top-level CMakeLists.txt)
+### CMake Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `BUILD_UNIT_TESTS` | `OFF` | Build unit and stress tests |
-| `BUILD_MASTER_EXAMPLES` | `OFF` | Build example programs |
+| `BUILD_EXAMPLES` | `OFF` | Build example programs |
+| `BUILD_BENCHMARKS` | `OFF` | Build benchmarks (requires Google Benchmark) |
 | `ENABLE_TSAN` | `OFF` | Enable ThreadSanitizer |
 
 ## Platform Support
@@ -135,7 +150,7 @@ target_link_libraries(my_app PRIVATE kickmsg)
 | Platform | SharedMemory | Futex |
 |----------|-------------|-------|
 | Linux | `shm_open` / `mmap` | `SYS_futex` |
-| macOS | `shm_open` / `mmap` | `__ulock_wait` / `__ulock_wake` |
+| Windows | `CreateFileMapping` / `MapViewOfFile` | `WaitOnAddress` / `WakeByAddressAll` |
 
 ## Architecture
 

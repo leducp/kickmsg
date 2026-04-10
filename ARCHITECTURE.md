@@ -949,12 +949,12 @@ OS abstraction layer for platform-specific functionality. The two
 interfaces used are:
 
 ```
-Abstraction      Provided by         Linux                    macOS (Darwin)
+Abstraction      Provided by           Linux                    Windows
 ────────────────────────────────────────────────────────────────────────────────
-SharedMemory     kickcat/OS/          shm_open / ftruncate     (same, POSIX)
-                 SharedMemory.h       / mmap
-Futex            kickcat/OS/          SYS_futex                __ulock_wait
-                 Futex.h              (FUTEX_WAIT/_WAKE)       /_wake
+SharedMemory     kickmsg/os/           shm_open / ftruncate     CreateFileMapping
+                 SharedMemory.h        / mmap                   / MapViewOfFile
+Futex            kickmsg/os/           SYS_futex                WaitOnAddress
+                 Futex.h               (FUTEX_WAIT/_WAKE)       / WakeByAddressAll
 ```
 
 **macOS caveat:** `__ulock_wait` / `__ulock_wake` are private Apple APIs.
