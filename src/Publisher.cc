@@ -246,7 +246,7 @@ namespace kickmsg
                                               microseconds timeout)
     {
         constexpr int CHECK_INTERVAL = 1024;
-        nanoseconds start = kickcat::since_epoch();
+        nanoseconds start = kickmsg::since_epoch();
 
         int i = 0;
         while (true)
@@ -259,7 +259,7 @@ namespace kickmsg
             ++i;
             if ((i & (CHECK_INTERVAL - 1)) == 0)
             {
-                if (kickcat::elapsed_time(start) >= timeout)
+                if (kickmsg::elapsed_time(start) >= timeout)
                 {
                     return INVALID_SLOT;
                 }

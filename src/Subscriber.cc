@@ -2,7 +2,7 @@
 #include <stdexcept>
 
 #include "kickmsg/Subscriber.h"
-#include "kickcat/OS/Time.h"
+#include "kickmsg/os/Time.h"
 
 namespace kickmsg
 {
@@ -71,11 +71,11 @@ namespace kickmsg
         // Wait for all admitted publishers to finish.
         bool quiesced = true;
         microseconds deadline{header_->commit_timeout_us};
-        nanoseconds start = kickcat::since_epoch();
+        nanoseconds start = kickmsg::since_epoch();
         while (ring::get_in_flight(
                    ring->state_flight.load(std::memory_order_acquire)) > 0)
         {
-            if (kickcat::elapsed_time(start) >= deadline)
+            if (kickmsg::elapsed_time(start) >= deadline)
             {
                 // Publisher likely crashed. Do NOT force in_flight to 0:
                 // a slow-but-alive publisher may still be mid-commit.
@@ -85,7 +85,7 @@ namespace kickmsg
                 ++drain_timeouts_;
                 break;
             }
-            kickcat::sleep(0ns);
+            kickmsg::sleep(0ns);
         }
 
         if (quiesced)
@@ -262,7 +262,7 @@ namespace kickmsg
     std::optional<Subscriber::SampleRef> Subscriber::receive(nanoseconds timeout)
     {
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
-        nanoseconds start = kickcat::since_epoch();
+        nanoseconds start = kickmsg::since_epoch();
 
         while (true)
         {
@@ -272,7 +272,7 @@ namespace kickmsg
                 return sample;
             }
 
-            nanoseconds elapsed = kickcat::elapsed_time(start);
+            nanoseconds elapsed = kickmsg::elapsed_time(start);
             if (elapsed >= timeout)
             {
                 return std::nullopt;
@@ -383,7 +383,7 @@ namespace kickmsg
     std::optional<Subscriber::SampleView> Subscriber::receive_view(nanoseconds timeout)
     {
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
-        nanoseconds start = kickcat::since_epoch();
+        nanoseconds start = kickmsg::since_epoch();
 
         while (true)
         {
@@ -393,7 +393,7 @@ namespace kickmsg
                 return sample;
             }
 
-            nanoseconds elapsed = kickcat::elapsed_time(start);
+            nanoseconds elapsed = kickmsg::elapsed_time(start);
             if (elapsed >= timeout)
             {
                 return std::nullopt;

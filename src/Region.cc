@@ -3,7 +3,7 @@
 #include <unistd.h>
 
 #include "kickmsg/Region.h"
-#include "kickcat/OS/Time.h"
+#include "kickmsg/os/Time.h"
 
 namespace kickmsg
 {
@@ -65,7 +65,7 @@ namespace kickmsg
         h->commit_timeout_us = static_cast<uint64_t>(cfg.commit_timeout.count());
         h->config_hash       = compute_config_hash(type, cfg);
         h->creator_pid       = static_cast<uint64_t>(getpid());
-        h->created_at_ns     = static_cast<uint64_t>(kickcat::since_epoch().count());
+        h->created_at_ns     = static_cast<uint64_t>(kickmsg::since_epoch().count());
         h->creator_name_len  = creator_len;
         std::memcpy(header_creator_name(h), creator_name, creator_len);
 
@@ -163,7 +163,7 @@ namespace kickmsg
             catch (...)
             {
             }
-            kickcat::sleep(10ms);
+            kickmsg::sleep(10ms);
         }
 
         throw std::runtime_error(

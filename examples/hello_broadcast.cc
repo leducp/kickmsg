@@ -15,7 +15,7 @@
 
 #include <kickmsg/Node.h>
 
-using namespace kickcat;
+using namespace kickmsg;
 
 struct ChatMessage
 {
@@ -39,7 +39,7 @@ static void chat_node(char const* name, char const* message,
     ready.fetch_add(1, std::memory_order_release);
     while (ready.load(std::memory_order_acquire) < total_nodes)
     {
-        kickcat::sleep(1ms);
+        kickmsg::sleep(1ms);
     }
 
     // Send our message
@@ -49,7 +49,7 @@ static void chat_node(char const* name, char const* message,
     pub.send(&msg, sizeof(msg));
 
     // Give others time to publish
-    kickcat::sleep(10ms);
+    kickmsg::sleep(10ms);
 
     // Receive messages from others
     while (auto sample = sub.try_receive())

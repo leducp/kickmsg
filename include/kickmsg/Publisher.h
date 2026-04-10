@@ -1,14 +1,12 @@
 #ifndef KICKMSG_PUBLISHER_H
 #define KICKMSG_PUBLISHER_H
 
-#include "types.h"
-#include "Region.h"
-#include "kickcat/OS/Futex.h"
+#include "kickmsg/types.h"
+#include "kickmsg/Region.h"
+#include "kickmsg/os/Futex.h"
 
 namespace kickmsg
 {
-    using kickcat::futex_wake_all;
-
     class Publisher
     {
     public:

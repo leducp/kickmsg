@@ -10,12 +10,12 @@
 #include <thread>
 #include <vector>
 
-#include "kickcat/OS/Time.h"
+#include "kickmsg/os/Time.h"
 
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
-using namespace kickcat;
+using namespace kickmsg;
 
 #if defined(__SANITIZE_THREAD__) || defined(__has_feature) && __has_feature(thread_sanitizer)
     constexpr int TSAN_SCALE = 100;
@@ -89,7 +89,7 @@ inline void publisher_thread(kickmsg::SharedRegion& region, int pub_id, uint32_t
                 std::fprintf(stderr, "  [FATAL] publisher %d: send() returned %d\n", pub_id, rc);
                 std::abort();
             }
-            kickcat::sleep(0ns);
+            kickmsg::sleep(0ns);
         }
     }
 }

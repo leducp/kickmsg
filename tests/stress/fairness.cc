@@ -32,7 +32,7 @@ bool run_fairness_test()
         });
     }
 
-    kickcat::sleep(10ms);
+    kickmsg::sleep(10ms);
 
     std::thread pub_thread(publisher_thread, std::ref(region), 0, NUM_MSGS);
     pub_thread.join();

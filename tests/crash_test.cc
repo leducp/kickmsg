@@ -16,11 +16,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "kickcat/OS/Time.h"
+#include "kickmsg/os/Time.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
-using namespace kickcat;
+using namespace kickmsg;
 
 static constexpr char const* SHM_NAME = "/kickmsg_crash_test";
 
@@ -49,7 +49,7 @@ static void child_publisher_main(int /*round*/)
         auto* ptr = pub.allocate(sizeof(CrashPayload));
         if (ptr == nullptr)
         {
-            kickcat::sleep(0ns);
+            kickmsg::sleep(0ns);
             continue;
         }
 
@@ -131,7 +131,7 @@ static RoundResult run_one_round(int round)
     }
 
     // Let publisher run for 20-50ms
-    kickcat::sleep(milliseconds{20 + (round % 30)});
+    kickmsg::sleep(milliseconds{20 + (round % 30)});
 
     // Kill publisher mid-flight
     kill(pub_pid, SIGKILL);
@@ -182,7 +182,7 @@ static RoundResult run_one_round(int round)
             msg.checksum = compute_checksum(msg);
             while (pub.send(&msg, sizeof(msg)) < 0)
             {
-                kickcat::sleep(0ns);
+                kickmsg::sleep(0ns);
             }
         }
         _exit(0);
@@ -229,7 +229,7 @@ int main()
     close(result_pipe[1]); // close write end in parent
 
     // Let subscriber attach
-    kickcat::sleep(50ms);
+    kickmsg::sleep(50ms);
 
     constexpr int NUM_ROUNDS = 10;
     int any_recovery = 0;

@@ -46,7 +46,7 @@ bool run_pool_exhaustion()
                     std::abort();
                 }
                 eagain_count.fetch_add(1, std::memory_order_relaxed);
-                kickcat::sleep(0ns);
+                kickmsg::sleep(0ns);
             }
         }
     };
@@ -78,7 +78,7 @@ bool run_pool_exhaustion()
             }
 
             // Deliberately slow consumer
-            kickcat::sleep(1us);
+            kickmsg::sleep(1us);
 
             if (sample->len() == sizeof(Payload))
             {
@@ -98,7 +98,7 @@ bool run_pool_exhaustion()
         sub_threads.emplace_back(slow_sub, i);
     }
 
-    kickcat::sleep(10ms);
+    kickmsg::sleep(10ms);
 
     std::vector<std::thread> pub_threads;
     for (int i = 0; i < NUM_PUBS; ++i)

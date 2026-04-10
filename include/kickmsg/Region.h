@@ -4,13 +4,11 @@
 #include <string>
 #include <vector>
 
-#include "types.h"
-#include "kickcat/OS/SharedMemory.h"
+#include "kickmsg/types.h"
+#include "kickmsg/os/SharedMemory.h"
 
 namespace kickmsg
 {
-    using kickcat::SharedMemory;
-
     class SharedRegion
     {
     public:

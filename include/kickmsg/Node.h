@@ -4,9 +4,9 @@
 #include <string>
 #include <vector>
 
-#include "Region.h"
-#include "Publisher.h"
-#include "Subscriber.h"
+#include "kickmsg/Region.h"
+#include "kickmsg/Publisher.h"
+#include "kickmsg/Subscriber.h"
 
 namespace kickmsg
 {

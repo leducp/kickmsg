@@ -13,11 +13,11 @@
 #include <cstring>
 #include <memory>
 
-#include "kickcat/OS/Time.h"
+#include "kickmsg/os/Time.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
-using namespace kickcat;
+using namespace kickmsg;
 
 static constexpr char const* SHM_NAME = "/kickmsg_microbench";
 

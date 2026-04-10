@@ -4,14 +4,12 @@
 #include <optional>
 #include <vector>
 
-#include "types.h"
-#include "Region.h"
-#include "kickcat/OS/Futex.h"
+#include "kickmsg/types.h"
+#include "kickmsg/Region.h"
+#include "kickmsg/os/Futex.h"
 
 namespace kickmsg
 {
-    using kickcat::futex_wait;
-
     class Subscriber
     {
     public:

@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 
-#include "kickcat/OS/Time.h"
+#include "kickmsg/os/Time.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
 #include <cstring>
 #include <thread>
 
-using namespace kickcat;
+using namespace kickmsg;
 
 class SubscriberTest : public ::testing::Test
 {
@@ -168,9 +168,9 @@ TEST_F(SubscriberTest, BlockingReceiveTimesOut)
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     kickmsg::Subscriber sub(region);
 
-    nanoseconds start  = kickcat::since_epoch();
+    nanoseconds start  = kickmsg::since_epoch();
     auto        sample = sub.receive(milliseconds{50});
-    nanoseconds elapsed = kickcat::since_epoch() - start;
+    nanoseconds elapsed = kickmsg::since_epoch() - start;
 
     EXPECT_FALSE(sample.has_value());
     EXPECT_GE(elapsed, milliseconds{40});
@@ -186,7 +186,7 @@ TEST_F(SubscriberTest, BlockingReceiveWakesOnPublish)
 
     std::thread sender([&]()
     {
-        kickcat::sleep(20ms);
+        kickmsg::sleep(20ms);
         uint32_t val = 123;
         pub.send(&val, sizeof(val));
     });
@@ -436,7 +436,7 @@ TEST_F(SubscriberTest, SlowPublisherNoCorruption)
         // Wait for signal to start publishing
         while (not pub_start.load(std::memory_order_acquire))
         {
-            kickcat::sleep(0ns);
+            kickmsg::sleep(0ns);
         }
 
         // Publish several messages slowly (each takes > commit_timeout)
@@ -444,7 +444,7 @@ TEST_F(SubscriberTest, SlowPublisherNoCorruption)
         {
             uint32_t val = static_cast<uint32_t>(i);
             pub.send(&val, sizeof(val));
-            kickcat::sleep(5ms); // 5ms >> 1ms timeout
+            kickmsg::sleep(5ms); // 5ms >> 1ms timeout
         }
 
         pub_done.store(true, std::memory_order_release);
@@ -455,7 +455,7 @@ TEST_F(SubscriberTest, SlowPublisherNoCorruption)
 
         // Let the publisher start and publish at least one message
         pub_start.store(true, std::memory_order_release);
-        kickcat::sleep(2ms);
+        kickmsg::sleep(2ms);
 
         // Read what we can
         while (auto sample = sub.try_receive())
@@ -469,7 +469,7 @@ TEST_F(SubscriberTest, SlowPublisherNoCorruption)
     // Wait for publisher to finish
     while (not pub_done.load(std::memory_order_acquire))
     {
-        kickcat::sleep(1ms);
+        kickmsg::sleep(1ms);
     }
 
     slow_pub.join();

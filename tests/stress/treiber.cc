@@ -30,7 +30,7 @@ bool run_treiber_stress()
             if (idx == kickmsg::INVALID_SLOT)
             {
                 contention_hits.fetch_add(1);
-                kickcat::sleep(0ns);
+                kickmsg::sleep(0ns);
                 --i;
                 continue;
             }

@@ -15,11 +15,11 @@
 #include <thread>
 #include <vector>
 
-#include "kickcat/OS/Time.h"
+#include "kickmsg/os/Time.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
-using namespace kickcat;
+using namespace kickmsg;
 
 static constexpr char const* SHM_NAME = "/kickmsg_bench";
 
@@ -117,7 +117,7 @@ static void run_latency(BenchConfig const& bc, bool zerocopy)
     // Warmup
     for (uint32_t i = 0; i < 100 and i < bc.num_msgs; ++i)
     {
-        nanoseconds ts = kickcat::since_epoch();
+        nanoseconds ts = kickmsg::since_epoch();
         std::memcpy(payload.data(), &ts, sizeof(ts));
         pub.send(payload.data(), payload.size());
 
@@ -134,12 +134,12 @@ static void run_latency(BenchConfig const& bc, bool zerocopy)
     // Measured run
     for (uint32_t i = 0; i < bc.num_msgs; ++i)
     {
-        nanoseconds send_ts = kickcat::since_epoch();
+        nanoseconds send_ts = kickmsg::since_epoch();
         std::memcpy(payload.data(), &send_ts, sizeof(send_ts));
 
         while (pub.send(payload.data(), payload.size()) < 0)
         {
-            kickcat::sleep(0ns);
+            kickmsg::sleep(0ns);
         }
 
         if (zerocopy)
@@ -149,7 +149,7 @@ static void run_latency(BenchConfig const& bc, bool zerocopy)
                 auto view = sub.try_receive_view();
                 if (view)
                 {
-                    nanoseconds recv_ts = kickcat::since_epoch();
+                    nanoseconds recv_ts = kickmsg::since_epoch();
                     nanoseconds sent;
                     std::memcpy(&sent, view->data(), sizeof(sent));
                     uint64_t lat = static_cast<uint64_t>((recv_ts - sent).count());
@@ -165,7 +165,7 @@ static void run_latency(BenchConfig const& bc, bool zerocopy)
                 auto sample = sub.try_receive();
                 if (sample)
                 {
-                    nanoseconds recv_ts = kickcat::since_epoch();
+                    nanoseconds recv_ts = kickmsg::since_epoch();
                     nanoseconds sent;
                     std::memcpy(&sent, sample->data(), sizeof(sent));
                     uint64_t lat = static_cast<uint64_t>((recv_ts - sent).count());
@@ -260,7 +260,7 @@ static void run_throughput(BenchConfig const& bc, bool zerocopy,
         });
     }
 
-    kickcat::sleep(10ms);
+    kickmsg::sleep(10ms);
 
     // Publishers
     std::atomic<uint64_t> total_sent{0};
@@ -285,8 +285,8 @@ static void run_throughput(BenchConfig const& bc, bool zerocopy,
     }
 
     // Run for 2 seconds
-    nanoseconds start = kickcat::since_epoch();
-    kickcat::sleep(seconds{2});
+    nanoseconds start = kickmsg::since_epoch();
+    kickmsg::sleep(seconds{2});
     done.store(true, std::memory_order_relaxed);
 
     for (auto& t : pub_threads)
@@ -298,7 +298,7 @@ static void run_throughput(BenchConfig const& bc, bool zerocopy,
         t.join();
     }
 
-    nanoseconds elapsed = kickcat::elapsed_time(start);
+    nanoseconds elapsed = kickmsg::elapsed_time(start);
     double elapsed_sec = std::chrono::duration<double>(elapsed).count();
 
     uint64_t sent = total_sent.load();

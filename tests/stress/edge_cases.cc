@@ -21,7 +21,7 @@ bool run_single_slot_ring()
     auto region = kickmsg::SharedRegion::create(
         shm_name, kickmsg::channel::PubSub, cfg, "single_slot_ring");
 
-    nanoseconds t0 = kickcat::since_epoch();
+    nanoseconds t0 = kickmsg::since_epoch();
 
     std::vector<SubResult> sub_results(NUM_SUBS);
     std::vector<std::thread> sub_threads;
@@ -35,7 +35,7 @@ bool run_single_slot_ring()
         });
     }
 
-    kickcat::sleep(10ms);
+    kickmsg::sleep(10ms);
 
     std::vector<std::thread> pub_threads;
     for (int i = 0; i < NUM_PUBS; ++i)
@@ -54,7 +54,7 @@ bool run_single_slot_ring()
         t.join();
     }
 
-    nanoseconds t1 = kickcat::since_epoch();
+    nanoseconds t1 = kickmsg::since_epoch();
     int64_t elapsed_ms = std::chrono::duration_cast<milliseconds>(t1 - t0).count();
 
     uint64_t total_sent = static_cast<uint64_t>(NUM_PUBS) * NUM_MSGS;
@@ -209,7 +209,7 @@ bool run_subscriber_saturation()
                     std::fprintf(stderr, "  [FATAL] send() returned %d\n", rc);
                     std::abort();
                 }
-                kickcat::sleep(0ns);
+                kickmsg::sleep(0ns);
             }
         }
     }

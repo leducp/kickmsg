@@ -50,7 +50,7 @@ bool run_live_repair()
             }
             else if (rc == -EAGAIN)
             {
-                kickcat::sleep(0ns);
+                kickmsg::sleep(0ns);
             }
         }
     };
@@ -110,7 +110,7 @@ bool run_live_repair()
     {
         while (not stop)
         {
-            kickcat::sleep(10ms);
+            kickmsg::sleep(10ms);
 
             auto* ring    = kickmsg::sub_ring_at(base, hdr, 0);
             auto* entries = kickmsg::ring_entries(ring);
@@ -130,7 +130,7 @@ bool run_live_repair()
     {
         while (not stop)
         {
-            kickcat::sleep(20ms);
+            kickmsg::sleep(20ms);
 
             auto report = region.diagnose();
             if (report.locked_entries > 0)
@@ -148,7 +148,7 @@ bool run_live_repair()
         sub_threads.emplace_back(sub_worker, i);
     }
 
-    kickcat::sleep(10ms);
+    kickmsg::sleep(10ms);
 
     // Start publishers
     std::vector<std::thread> pub_threads;
@@ -162,7 +162,7 @@ bool run_live_repair()
     std::thread healer_thread(healer);
 
     // Let it run
-    kickcat::sleep(test_duration);
+    kickmsg::sleep(test_duration);
 
     // Stop everything
     stop = true;

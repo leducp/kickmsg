@@ -15,7 +15,7 @@
 
 #include <kickmsg/Node.h>
 
-using namespace kickcat;
+using namespace kickmsg;
 
 struct TemperatureReading
 {
