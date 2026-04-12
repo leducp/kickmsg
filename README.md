@@ -150,6 +150,7 @@ target_link_libraries(my_app PRIVATE kickmsg)
 | Platform | SharedMemory | Futex |
 |----------|-------------|-------|
 | Linux | `shm_open` / `mmap` | `SYS_futex` |
+| macOS | `shm_open` / `mmap` | `__ulock_wait` / `__ulock_wake` |
 | Windows | `CreateFileMapping` / `MapViewOfFile` | `WaitOnAddress` / `WakeByAddressAll` |
 
 ## Architecture

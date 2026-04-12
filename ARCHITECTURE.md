@@ -950,15 +950,19 @@ the same conventions and organisation: headers in `include/kickmsg/os/`,
 platform-specific implementations in `os/<platform>/`.
 
 ```
-Abstraction      Header                Linux                    Windows
-────────────────────────────────────────────────────────────────────────────────
-SharedMemory     kickmsg/os/           shm_open / ftruncate     CreateFileMapping
-                 SharedMemory.h        / mmap                   / MapViewOfFile
-Futex            kickmsg/os/           SYS_futex                WaitOnAddress
-                 Futex.h               (FUTEX_WAIT/_WAKE)       / WakeByAddressAll
-Time             kickmsg/os/           clock_nanosleep          QueryPerformanceCounter
-                 Time.h                clock_gettime            / Sleep
+Abstraction      Header                Linux              macOS              Windows
+──────────────────────────────────────────────────────────────────────────────────────
+SharedMemory     kickmsg/os/           shm_open           shm_open           CreateFileMapping
+                 SharedMemory.h        ftruncate/mmap     ftruncate/mmap     MapViewOfFile
+Futex            kickmsg/os/           SYS_futex          __ulock_wait       WaitOnAddress
+                 Futex.h               FUTEX_WAIT/_WAKE   __ulock_wake       WakeByAddressAll
+Time             kickmsg/os/           clock_nanosleep    nanosleep          QueryPerformanceCounter
+                 Time.h                clock_gettime      clock_gettime      Sleep
 ```
+
+**macOS caveat:** `__ulock_wait` / `__ulock_wake` are private Apple APIs.
+The ABI has been stable since macOS 10.12 and is used internally by libc++
+and libdispatch, but Apple has not published a formal stability guarantee.
 
 The core engine (`types.h`, `Region.h`, `Publisher.h`, `Subscriber.h`,
 `Node.h`) uses only `std::atomic` C++17 and these three abstractions --

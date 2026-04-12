@@ -22,6 +22,13 @@ if(WIN32)
         os/windows/SharedMemory.cc
     )
     set(OS_LIBRARIES)
+elseif(APPLE)
+    set(OS_SOURCES
+        os/darwin/Time.cc
+        os/darwin/Futex.cc
+        os/darwin/SharedMemory.cc
+    )
+    set(OS_LIBRARIES pthread)
 else()
     set(OS_SOURCES
         os/linux/Time.cc

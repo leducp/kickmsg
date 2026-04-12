@@ -1,0 +1,11 @@
+build*/
+.venv/
+.vscode
+.project
+.cproject
+.settings/
+*.orig
+.cache/*
+compile_commands.json
+.clangd
+__pycache__/
