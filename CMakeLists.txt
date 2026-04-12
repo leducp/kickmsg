@@ -10,6 +10,7 @@ list(APPEND CMAKE_FIND_ROOT_PATH ${CMAKE_BINARY_DIR})
 option(BUILD_UNIT_TESTS "Build unit tests" OFF)
 option(BUILD_EXAMPLES   "Build examples" OFF)
 option(BUILD_BENCHMARKS "Build benchmarks (requires Google Benchmark)" OFF)
+option(BUILD_BRIDGE     "Build network bridge" OFF)
 option(ENABLE_TSAN      "Enable ThreadSanitizer" OFF)
 
 if(ENABLE_TSAN)
@@ -69,6 +70,11 @@ if(BUILD_UNIT_TESTS)
     find_package(GTest REQUIRED CONFIG)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# --- Bridge ---
+if(BUILD_BRIDGE)
+    add_subdirectory(bridge)
 endif()
 
 # --- Examples ---
