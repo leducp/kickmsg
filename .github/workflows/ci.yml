@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+    branches: [main]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}${{ matrix.label && format(' - {0}', matrix.label) || '' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # Linux x86_64: full test suite
+          - os: ubuntu-latest
+            label: tests
+            configure_args: "--with=unit_tests --with=examples"
+
+          # Linux x86_64: TSAN
+          - os: ubuntu-latest
+            label: tsan
+            configure_args: "--with=unit_tests --with=tsan"
+
+          # Linux x86_64: benchmarks
+          - os: ubuntu-latest
+            label: benchmarks
+            configure_args: "--with=benchmarks"
+
+          # Windows
+          - os: windows-latest
+            label: windows
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-conan
+
+      - name: Configure and build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          scripts/configure.sh build ${{ matrix.configure_args }}
+          scripts/setup_build.sh build --build-type ${{ env.BUILD_TYPE }}
+          cd build && make -j
+        shell: bash
+
+      - name: Configure and build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          conan install conanfile.py -of=build/ --build=missing -s build_type=${{ env.BUILD_TYPE }} -o unit_tests=True
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DBUILD_UNIT_TESTS=ON -DCMAKE_PREFIX_PATH=build -G "MinGW Makefiles"
+          cmake --build build --config ${{ env.BUILD_TYPE }}
+        shell: bash
+
+      - name: Unit tests
+        if: contains(matrix.configure_args, 'unit_tests') || runner.os == 'Windows'
+        working-directory: build
+        run: ctest . --output-on-failure
+        shell: bash
+
+      - name: Stress test
+        if: contains(matrix.configure_args, 'unit_tests') && runner.os == 'Linux'
+        working-directory: build
+        run: timeout 120 ./kickmsg_stress_test
+        shell: bash
+
+      - name: Crash test
+        if: contains(matrix.configure_args, 'unit_tests') && runner.os == 'Linux' && !contains(matrix.configure_args, 'tsan')
+        working-directory: build
+        run: ./kickmsg_crash_test
+        shell: bash
+
+      - name: Run benchmarks
+        if: contains(matrix.configure_args, 'benchmarks')
+        working-directory: build
+        run: ./kickmsg_microbench --benchmark_min_time=0.1s
+        shell: bash
+
+  # Cross-compile for ARM64 (no run — just verify it compiles)
+  cross_arm64:
+    name: Cross-compile (linux-aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-conan
+
+      - name: Install cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Configure and build
+        run: |
+          scripts/configure.sh build_arm --with=unit_tests
+          scripts/setup_build.sh build_arm --target linux-aarch64 --build-type ${{ env.BUILD_TYPE }}
+          cd build_arm && make -j
+        shell: bash
+
+      - name: Verify ARM binaries
+        run: file build_arm/kickmsg_unit build_arm/kickmsg_stress_test | grep "ARM aarch64"
+        shell: bash
