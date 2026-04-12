@@ -942,33 +942,30 @@ All supported architectures provide native 64-bit atomic CAS on aligned
 values, so there is no risk of torn reads. The correctness is portable;
 only the per-operation latency differs (by a few nanoseconds).
 
-### Platform Abstraction (KickCAT Integration)
+### Platform Abstraction
 
-kickmsg is a library within the KickCAT project and relies on KickCAT's
-OS abstraction layer for platform-specific functionality. The two
-interfaces used are:
+kickmsg includes its own minimal OS abstraction layer in `os/`, extracted
+from the [KickCAT](https://github.com/leducp/KickCAT) project. It follows
+the same conventions and organisation: headers in `include/kickmsg/os/`,
+platform-specific implementations in `os/<platform>/`.
 
 ```
-Abstraction      Provided by           Linux                    Windows
+Abstraction      Header                Linux                    Windows
 ────────────────────────────────────────────────────────────────────────────────
 SharedMemory     kickmsg/os/           shm_open / ftruncate     CreateFileMapping
                  SharedMemory.h        / mmap                   / MapViewOfFile
 Futex            kickmsg/os/           SYS_futex                WaitOnAddress
                  Futex.h               (FUTEX_WAIT/_WAKE)       / WakeByAddressAll
+Time             kickmsg/os/           clock_nanosleep          QueryPerformanceCounter
+                 Time.h                clock_gettime            / Sleep
 ```
 
-**macOS caveat:** `__ulock_wait` / `__ulock_wake` are private Apple APIs.
-They are used internally by libc++ and libdispatch (stable since macOS
-10.12), but Apple has not published a public header or formal stability
-guarantee. If Apple changes this ABI in a future release, a fallback to
-`kqueue` with `EVFILT_USER` or `dispatch_semaphore` would be needed.
-
 The core engine (`types.h`, `Region.h`, `Publisher.h`, `Subscriber.h`,
-`Node.h`) uses only `std::atomic` C++17 and these two abstractions --
+`Node.h`) uses only `std::atomic` C++17 and these three abstractions --
 no platform `#ifdef` leaks into the messaging logic.
 
-To add a new OS, implement the Futex and SharedMemory interfaces in
-KickCAT's `src/OS/<Platform>/` directory.
+To add a new platform, implement Time, Futex, and SharedMemory in a new
+`os/<platform>/` directory and add the sources to `CMakeLists.txt`.
 
 
 ## Why `futex` instead of `mutex` + `condvar`?
