@@ -5,7 +5,12 @@
 #include "kickmsg/Subscriber.h"
 
 #include <cstring>
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 class RegionTest : public ::testing::Test
 {
@@ -93,7 +98,9 @@ TEST_F(RegionTest, CreateOrOpenSecondOpens)
 TEST_F(RegionTest, CreateOrOpenConfigMismatchThrows)
 {
     auto cfg = default_cfg();
-    kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg, "node");
+    // Keep the region alive so the mapping exists when create_or_open runs.
+    // On Windows, named mappings are destroyed when the last handle closes.
+    auto existing = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg, "node");
 
     auto bad_cfg = cfg;
     bad_cfg.max_payload_size = cfg.max_payload_size * 2;

@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: kickmsg
+Description: Lock-free shared-memory MPMC messaging library
+Version: 1.0.0
+Libs: -L${libdir} @KICKMSG_PC_LIBS@ @KICKMSG_PC_SYSLIBS@
+Cflags: -I${includedir}

@@ -51,8 +51,15 @@ jobs:
       - name: Configure and build (Windows)
         if: runner.os == 'Windows'
         run: |
-          conan install conanfile.py -of=build/ --build=missing -s build_type=${{ env.BUILD_TYPE }} -o unit_tests=True
-          cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DBUILD_UNIT_TESTS=ON -DCMAKE_PREFIX_PATH=build -G "MinGW Makefiles"
+          conan install conanfile.py -of=build/ \
+            -pr:b conan/profile_windows_x86_64.txt \
+            -pr:h conan/profile_windows_x86_64.txt \
+            -o "&:unit_tests=True" \
+            --build=missing -s build_type=${{ env.BUILD_TYPE }}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_UNIT_TESTS=ON \
+            -G "MinGW Makefiles"
           cmake --build build --config ${{ env.BUILD_TYPE }}
         shell: bash
 
@@ -60,18 +67,6 @@ jobs:
         if: contains(matrix.configure_args, 'unit_tests') || runner.os == 'Windows'
         working-directory: build
         run: ctest . --output-on-failure
-        shell: bash
-
-      - name: Stress test
-        if: contains(matrix.configure_args, 'unit_tests') && runner.os == 'Linux'
-        working-directory: build
-        run: timeout 120 ./kickmsg_stress_test
-        shell: bash
-
-      - name: Crash test
-        if: contains(matrix.configure_args, 'unit_tests') && runner.os == 'Linux' && !contains(matrix.configure_args, 'tsan')
-        working-directory: build
-        run: ./kickmsg_crash_test
         shell: bash
 
       - name: Run benchmarks

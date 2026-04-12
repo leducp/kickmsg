@@ -5,7 +5,7 @@ add_executable(kickmsg_unit
     unit/subscriber-t.cc
     unit/node-t.cc
 )
-target_link_libraries(kickmsg_unit PRIVATE kickmsg GTest::gtest_main)
+target_link_libraries(kickmsg_unit PRIVATE kickmsg GTest::gmock_main)
 set_target_properties(kickmsg_unit
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -27,8 +27,11 @@ set_target_properties(kickmsg_stress_test
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-add_executable(kickmsg_crash_test crash_test.cc)
-target_link_libraries(kickmsg_crash_test PRIVATE kickmsg)
-set_target_properties(kickmsg_crash_test
-    PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+# Crash test uses fork/waitpid/SIGKILL — POSIX only
+if(NOT WIN32)
+    add_executable(kickmsg_crash_test crash_test.cc)
+    target_link_libraries(kickmsg_crash_test PRIVATE kickmsg)
+    set_target_properties(kickmsg_crash_test
+        PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()

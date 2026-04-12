@@ -17,8 +17,14 @@
 
 using namespace kickmsg;
 
-#if defined(__SANITIZE_THREAD__) || defined(__has_feature) && __has_feature(thread_sanitizer)
+#if defined(__SANITIZE_THREAD__)
     constexpr int TSAN_SCALE = 100;
+#elif defined(__has_feature)
+  #if __has_feature(thread_sanitizer)
+    constexpr int TSAN_SCALE = 100;
+  #else
+    constexpr int TSAN_SCALE = 1;
+  #endif
 #else
     constexpr int TSAN_SCALE = 1;
 #endif

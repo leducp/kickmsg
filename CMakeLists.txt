@@ -4,6 +4,9 @@ project(kickmsg LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Find conan-generated CMake package configs in the build directory
+list(APPEND CMAKE_FIND_ROOT_PATH ${CMAKE_BINARY_DIR})
+
 option(BUILD_UNIT_TESTS "Build unit tests" OFF)
 option(BUILD_EXAMPLES   "Build examples" OFF)
 option(BUILD_BENCHMARKS "Build benchmarks (requires Google Benchmark)" OFF)
@@ -21,7 +24,7 @@ if(WIN32)
         os/windows/Futex.cc
         os/windows/SharedMemory.cc
     )
-    set(OS_LIBRARIES)
+    set(OS_LIBRARIES synchronization)
 elseif(APPLE)
     set(OS_SOURCES
         os/darwin/Time.cc
@@ -49,11 +52,17 @@ add_library(kickmsg STATIC
 )
 
 target_include_directories(kickmsg
-    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/kickmsg
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/kickmsg
 )
 
 target_link_libraries(kickmsg PUBLIC ${OS_LIBRARIES})
+
+# --- Install, pkg-config, find_package ---
+include(cmake/install.cmake)
 
 # --- Tests ---
 if(BUILD_UNIT_TESTS)

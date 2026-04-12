@@ -254,7 +254,6 @@ step "Configuring CMake ($BUILD_TYPE)"
 cmake -S "$PROJECT_DIR" -B "$build_dir" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
     -DCMAKE_TOOLCHAIN_FILE="$OUTPUT_CMAKE_TOOLCHAIN" \
-    -DCMAKE_PREFIX_PATH="$build_dir" \
     $CMAKE_OPTIONS
 
 success "Build environment ready in $build_dir"
