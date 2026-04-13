@@ -96,3 +96,76 @@ jobs:
       - name: Verify ARM binaries
         run: file build_arm/kickmsg_unit build_arm/kickmsg_stress_test | grep "ARM aarch64"
         shell: bash
+
+  # Build Python wheels across the supported platforms.  Runs on every
+  # push so wheel-build regressions surface immediately; only the tagged
+  # release job below actually uploads to PyPI.
+  build-wheels:
+    name: Build Python Wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    env:
+      # `native`: the runner's own architecture.  Linux x86_64 runner →
+      # manylinux_x86_64 wheels; Linux ARM runner → manylinux_aarch64;
+      # macOS 14 runner (Apple Silicon) → universal2 via the macOS cibw
+      # config in pyproject.toml.
+      CIBW_ARCHS: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # so tools/setup/version.sh can read tags
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.1.0
+        with:
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheelhouse-kickmsg-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  # Publish to PyPI on tag push.  Uses OIDC trusted publishing (configured
+  # per-repo at https://pypi.org/manage/account/publishing/ — the `kickmsg`
+  # PyPI project must list this repository + environment `maintainer` as
+  # a trusted publisher).  No API tokens stored in GitHub secrets.
+  release:
+    needs: [build, cross_arm64, build-wheels]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    environment:
+      name: maintainer
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheelhouse-kickmsg-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+        run: |
+          gh release create "$tag" wheelhouse/*.whl \
+              --repo="$GITHUB_REPOSITORY" \
+              --title="${GITHUB_REPOSITORY#*/} ${tag#v}" \
+              --generate-notes
+
+      - name: Publish wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          packages-dir: wheelhouse
+          verify-metadata: true
+          attestations: true
+          print-hash: true
+          skip-existing: true

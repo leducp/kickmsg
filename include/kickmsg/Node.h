@@ -3,7 +3,7 @@
 
 #include <optional>
 #include <string>
-#include <vector>
+#include <unordered_map>
 
 #include "kickmsg/Region.h"
 #include "kickmsg/Publisher.h"
@@ -29,6 +29,16 @@ namespace kickmsg
     {
     public:
         Node(std::string const& name, std::string const& prefix = "kickmsg");
+
+        // Explicit non-copyable / move-only.  Node already holds SharedRegion
+        // values (move-only), so it's non-copyable de facto; declaring it
+        // explicitly short-circuits SFINAE probes from binding frameworks
+        // that would otherwise eagerly instantiate the internal container's
+        // copy machinery to check copyability.
+        Node(Node const&)            = delete;
+        Node& operator=(Node const&) = delete;
+        Node(Node&&) noexcept        = default;
+        Node& operator=(Node&&) noexcept = default;
 
         // --- PubSub (topic-centric, 1-to-N by convention) ---
         //
@@ -113,11 +123,9 @@ namespace kickmsg
         std::string make_broadcast_name(char const* channel) const;
         std::string make_mailbox_name(char const* owner, char const* tag) const;
 
-        // Lifetime: the returned pointer is only valid until the next
-        // mutation of regions_.  A caller MUST NOT hold the pointer
-        // across an emplace_back/emplace_or_reuse call — vector realloc
-        // would move the SharedRegion object (the mmap stays put, but
-        // the SharedRegion handle would dangle).
+        // unordered_map guarantees reference stability for elements
+        // (only iterators are invalidated on rehash), so pointers
+        // returned here remain valid across subsequent insertions.
         SharedRegion*       find_region(std::string const& shm_name);
         SharedRegion const* find_region(std::string const& shm_name) const;
 
@@ -132,12 +140,15 @@ namespace kickmsg
 
         std::string name_;
         std::string prefix_;
-        // Linear search by SharedRegion::name() — a Node typically holds
-        // a handful of regions, so O(N) lookup is negligible.  mmap
-        // addresses captured by Publisher/Subscriber stay valid when
-        // emplace_back reallocates the vector (handles point into the
-        // mapped pages, not into the SharedRegion object).
-        std::vector<SharedRegion> regions_;
+        // Keyed by SHM name for O(1) lookup.  A telemetry node on a
+        // humanoid robot can easily hold 100-300 topics (joints × (meas,
+        // target) + cameras + IMUs + force sensors + hands), so O(N)
+        // linear search over a vector/deque starts to matter.  The
+        // duplication with SharedRegion::name() costs ~30 B per entry —
+        // negligible at any scale we care about.  unordered_map also
+        // guarantees reference stability for elements (the mmap addresses
+        // used by Publisher/Subscriber don't move on rehash).
+        std::unordered_map<std::string, SharedRegion> regions_;
     };
 }
 

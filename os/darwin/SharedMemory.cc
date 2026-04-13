@@ -71,17 +71,22 @@ namespace kickmsg
 
     void SharedMemory::create(std::string const& name, std::size_t size)
     {
-        // macOS quirk: shm_open returns EINVAL when passed O_TRUNC on an
-        // existing SHM object — Linux accepts it but Darwin rejects it.
-        // This matters on the create_or_open() fast path, where try_create
-        // first opens the object with O_CREAT|O_EXCL and closes the fd,
-        // then this function reopens it to size and map.  Calling
-        // shm_unlink() first makes create() idempotent from the caller's
-        // point of view and sidesteps the O_TRUNC incompatibility: the
-        // subsequent shm_open sees a name that either didn't exist or
-        // was just detached, and then ftruncate(size) is always the
-        // first sizing call on the fresh object (which macOS also
-        // requires — a SHM object can only be ftruncated once).
+        // macOS has two shm_open / ftruncate quirks that the original
+        // `O_CREAT | O_TRUNC` Linux pattern trips over:
+        //   1. shm_open(O_CREAT|O_TRUNC) on an existing SHM object
+        //      returns EINVAL — Linux accepts it, Darwin rejects it.
+        //   2. ftruncate() can only be called once per SHM object; a
+        //      second call on the same object returns EINVAL.
+        // Unlink-then-exclusive-create sidesteps both: the subsequent
+        // shm_open sees a name that either didn't exist or was just
+        // detached, and the following ftruncate is always the first
+        // sizing call on a fresh object.
+        //
+        // This function is called by SharedRegion::create() (the strict
+        // factory where the caller intends exclusive ownership).  The
+        // race-prone caller SharedRegion::create_or_open() was refactored
+        // to NOT re-enter this function after its try_create probe — it
+        // stamps the header directly on the probe's mapping.
         ::shm_unlink(name.c_str());
         fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
         if (fd_ < 0)

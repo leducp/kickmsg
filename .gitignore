@@ -9,3 +9,7 @@ build*/
 compile_commands.json
 .clangd
 __pycache__/
+*.egg-info/
+.pytest_cache/
+wheelhouse/
+dist/
