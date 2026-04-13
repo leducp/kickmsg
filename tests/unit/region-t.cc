@@ -747,6 +747,87 @@ TEST_F(RegionTest, SchemaCreateOrOpenIgnoresOpenerSchemaWhenCreatorHadNone)
     EXPECT_FALSE(opened.schema().has_value());
 }
 
+TEST_F(RegionTest, SchemaCrossHandleObservesClaim)
+{
+    // Mirror the real cross-process flow: one SharedRegion handle claims,
+    // a second SharedRegion handle opened against the same SHM observes
+    // the claim.  This exercises the acquire-load in schema() across
+    // independent mapping handles, not just within a single object.
+    auto cfg = default_cfg();
+    auto r1  = kickmsg::SharedRegion::create(
+                   SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto r2 = kickmsg::SharedRegion::open(SHM_NAME);
+
+    // Initially both see Unset.
+    EXPECT_FALSE(r1.schema().has_value());
+    EXPECT_FALSE(r2.schema().has_value());
+
+    // r1 claims.  r2 must observe Set without any further fence on its
+    // side — acquire-load in schema() synchronizes with r1's release-store.
+    ASSERT_TRUE(r1.try_claim_schema(make_schema("xhandle/Type", 5, 0x9A, 0xBC)));
+
+    auto got_r2 = r2.schema();
+    ASSERT_TRUE(got_r2.has_value());
+    EXPECT_STREQ(got_r2->name, "xhandle/Type");
+    EXPECT_EQ(got_r2->version, 5u);
+
+    // Second claim via r2 fails (r1's claim stands).
+    EXPECT_FALSE(r2.try_claim_schema(make_schema("other/Type", 0, 0, 0)));
+}
+
+TEST_F(RegionTest, SchemaResetViaSecondHandleAfterCrash)
+{
+    // Mirror the cross-process crash-recovery flow: one handle wedges
+    // (simulated claimant crashed mid-claim), a second handle opened
+    // against the same SHM calls reset_schema_claim().
+    auto cfg = default_cfg();
+    auto r1  = kickmsg::SharedRegion::create(
+                   SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    // Wedge via r1 (simulate crash: CAS Claiming but never reach Set).
+    r1.header()->schema_state.store(kickmsg::schema::Claiming,
+                                    std::memory_order_release);
+
+    // Second handle (operator's repair tool) opens and recovers.
+    auto r2 = kickmsg::SharedRegion::open(SHM_NAME);
+    EXPECT_TRUE(r2.reset_schema_claim());
+
+    // r1 sees the reset too (same underlying state).
+    EXPECT_FALSE(r1.schema().has_value());
+
+    // Fresh claim via either handle now succeeds.
+    EXPECT_TRUE(r1.try_claim_schema(make_schema("after/Reset", 1, 0x42, 0x43)));
+    auto got = r2.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "after/Reset");
+}
+
+TEST_F(RegionTest, DiagnoseReportsSchemaStuck)
+{
+    // Wedged Claiming must surface via HealthReport alongside the other
+    // crash-residue indicators so supervisors can detect it on a
+    // routine health-check loop.
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    EXPECT_FALSE(region.diagnose().schema_stuck);
+
+    region.header()->schema_state.store(kickmsg::schema::Claiming,
+                                        std::memory_order_release);
+    EXPECT_TRUE(region.diagnose().schema_stuck);
+
+    // After reset, clean again.
+    ASSERT_TRUE(region.reset_schema_claim());
+    EXPECT_FALSE(region.diagnose().schema_stuck);
+
+    // A successful claim (state = Set) does NOT register as stuck.
+    ASSERT_TRUE(region.try_claim_schema(
+                    make_schema("healthy/Type", 1, 0x01, 0x02)));
+    EXPECT_FALSE(region.diagnose().schema_stuck);
+}
+
 TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
 {
     // Separation of concerns: schema presence is orthogonal to channel

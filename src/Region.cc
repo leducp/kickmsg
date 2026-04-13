@@ -205,6 +205,12 @@ namespace kickmsg
         auto* h = header();
         HealthReport report{};
 
+        // Schema slot wedged at Claiming: crashed claimant that CAS'd but
+        // never reached Set.  Mirrors the operator-surface pattern of
+        // retired_rings/locked_entries — reset_schema_claim() recovers it.
+        report.schema_stuck =
+            (h->schema_state.load(std::memory_order_acquire) == schema::Claiming);
+
         for (uint64_t i = 0; i < h->max_subs; ++i)
         {
             auto* ring    = sub_ring_at(b, h, static_cast<uint32_t>(i));
@@ -354,7 +360,14 @@ namespace kickmsg
         // for the state to settle at Set so a follow-up schema() read is
         // meaningful — but bound the wait: a claimant that crashed between
         // CAS→Claiming and store→Set leaves the slot wedged.  Operators
-        // recover such a wedge with reset_schema_claim().
+        // recover such a wedge with reset_schema_claim(), and diagnose()
+        // surfaces it via HealthReport::schema_stuck.
+        //
+        // MAX_YIELDS is chosen empirically: a memcpy of SchemaInfo (512 B)
+        // plus a release-store completes in well under a microsecond on
+        // any target platform, so 1024 yields gives the legitimate winner
+        // several orders of magnitude more than it needs while keeping the
+        // worst-case wait on a crashed claimant imperceptible to callers.
         constexpr int MAX_YIELDS = 1024;
         for (int i = 0; i < MAX_YIELDS and expected == schema::Claiming; ++i)
         {

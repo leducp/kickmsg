@@ -5,7 +5,7 @@ from conan.tools.files import copy
 import os
 
 
-class KickMsgConan(ConanFile):
+class KickmsgConan(ConanFile):
     """Conan package recipe for kickmsg.
 
     For consumers: add kickmsg as a requirement in your conanfile:

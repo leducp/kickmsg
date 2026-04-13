@@ -17,14 +17,13 @@
 ///      region without trying to recreate it, then try_claim_topic_schema()
 ///      atomically publishes the descriptor (Unset → Claiming → Set).
 ///
-///   4. Subscriber's next poll observes the schema, verifies it, and
-///      starts consuming.
+///   4. Subscriber's next poll observes the schema, verifies it via
+///      schema::diff(), and starts consuming.
 ///
 /// The library does no waiting on behalf of the user — the polling loop
 /// is entirely policy.  Replace it with whatever fits the deployment
 /// (timeout, exponential backoff, futex, etc).
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -34,52 +33,23 @@
 #include <string>
 #include <thread>
 
+#include <kickmsg/Hash.h>
 #include <kickmsg/Node.h>
 
 using namespace kickmsg;
 using namespace std::chrono_literals;
 
-// ---------------------------------------------------------------------------
-// Schema bytes — same FNV-1a helper as hello_schema.cc.  Real users would
-// drop in whatever hash family their tooling already uses.
-// ---------------------------------------------------------------------------
+constexpr uint32_t ALGO_FNV1A_64 = 1;
 
-namespace
+SchemaInfo make_schema(char const* name, std::string const& descriptor,
+                       uint32_t version)
 {
-    constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
-    constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
-
-    uint64_t fnv1a(std::string const& s)
-    {
-        uint64_t h = FNV_OFFSET;
-        for (auto c : s)
-        {
-            h ^= static_cast<uint8_t>(c);
-            h *= FNV_PRIME;
-        }
-        return h;
-    }
-
-    std::array<uint8_t, 64> identity_bytes(std::string const& descriptor)
-    {
-        std::array<uint8_t, 64> out{};
-        uint64_t h = fnv1a(descriptor);
-        std::memcpy(out.data(), &h, sizeof(h));
-        return out;
-    }
-
-    enum : uint32_t { ALGO_FNV1A_64 = 1 };
-
-    SchemaInfo make_schema(char const* name, std::string const& descriptor,
-                           uint32_t version)
-    {
-        SchemaInfo info{};
-        info.identity      = identity_bytes(descriptor);
-        std::snprintf(info.name, sizeof(info.name), "%s", name);
-        info.version       = version;
-        info.identity_algo = ALGO_FNV1A_64;
-        return info;
-    }
+    SchemaInfo info{};
+    info.identity      = hash::identity_from_fnv1a(descriptor);
+    std::snprintf(info.name, sizeof(info.name), "%s", name);
+    info.version       = version;
+    info.identity_algo = ALGO_FNV1A_64;
+    return info;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,8 +74,8 @@ channel::Config make_config()
     cfg.sub_ring_capacity = 8;
     cfg.pool_size         = 16;
     cfg.max_payload_size  = sizeof(Telemetry);
-    // Note: the *subscriber* deliberately leaves cfg.schema empty so the
-    // schema slot starts Unset.  The publisher will claim it on arrival.
+    // The subscriber deliberately leaves cfg.schema empty so the schema
+    // slot starts Unset.  The publisher will claim it on arrival.
     return cfg;
 }
 
@@ -114,13 +84,17 @@ int main()
     constexpr char const* PREFIX = "demo_late";
     constexpr char const* TOPIC  = "telemetry";
 
-    SharedMemory::unlink((std::string{"/"} + PREFIX + "_" + TOPIC).c_str());
-
     // ----- Subscriber starts first, creates the region -----
     Node sub_node("listener", PREFIX);
+    sub_node.unlink_topic(TOPIC);  // clean any leftover SHM from prior runs
     auto sub = sub_node.subscribe_or_create(TOPIC, make_config());
-    std::cout << "[listener]  region ready, schema = "
-              << (sub_node.topic_schema(TOPIC) ? "set" : "unset")
+
+    char const* initial_state = "unset";
+    if (sub_node.topic_schema(TOPIC).has_value())
+    {
+        initial_state = "set";
+    }
+    std::cout << "[listener]  region ready, schema = " << initial_state
               << " (waiting for publisher to claim)\n";
 
     // ----- Publisher arrives in another thread after a short delay -----
@@ -134,8 +108,13 @@ int main()
 
         SchemaInfo info = make_schema(SCHEMA_NAME, SCHEMA_DESCRIPTOR, SCHEMA_VERSION);
         bool       won  = pub_node.try_claim_topic_schema(TOPIC, info);
-        std::cout << "[driver]    joined region, "
-                  << (won ? "claimed" : "found existing")
+
+        char const* outcome = "found existing";
+        if (won)
+        {
+            outcome = "claimed";
+        }
+        std::cout << "[driver]    joined region, " << outcome
                   << " schema slot (" << SCHEMA_NAME
                   << " v" << SCHEMA_VERSION << ")\n";
 
@@ -174,11 +153,17 @@ int main()
         return 1;
     }
 
-    bool match = (got->identity == expected.identity)
-                 and (got->version == expected.version);
+    uint32_t d = schema::diff(*got, expected);
+    bool match = (d & (schema::Identity | schema::Version)) == 0;
+
+    char const* verdict = "mismatch, refusing";
+    if (match)
+    {
+        verdict = "OK, consuming";
+    }
     std::cout << "[listener]  observed schema '" << got->name
               << "' v" << got->version
-              << " — " << (match ? "OK, consuming" : "mismatch, refusing") << "\n";
+              << " — " << verdict << "\n";
 
     if (not match)
     {
@@ -213,7 +198,7 @@ int main()
     publisher_thread.join();
     std::cout << "[listener]  consumed " << received << " sample(s)\n";
 
-    SharedMemory::unlink((std::string{"/"} + PREFIX + "_" + TOPIC).c_str());
+    sub_node.unlink_topic(TOPIC);
     std::cout << "Done.\n";
     return 0;
 }

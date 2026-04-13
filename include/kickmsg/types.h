@@ -14,10 +14,10 @@ namespace kickmsg
     using namespace std::chrono;
 
     static_assert(std::atomic<uint64_t>::is_always_lock_free,
-        "KickMsg requires lock-free 64-bit atomics. "
+        "Kickmsg requires lock-free 64-bit atomics. "
         "32-bit platforms (RV32, MIPS32) are not supported.");
     static_assert(std::atomic<uint32_t>::is_always_lock_free,
-        "KickMsg requires lock-free 32-bit atomics.");
+        "Kickmsg requires lock-free 32-bit atomics.");
 
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
     constexpr uint32_t    VERSION         = 4;
@@ -76,6 +76,34 @@ namespace kickmsg
             Claiming = 1,  ///< A claim is in progress; payload bytes are being written
             Set      = 2,  ///< Payload is stable and safe to read
         };
+
+        /// Bitmask describing how two SchemaInfo values differ.
+        ///
+        /// Returned by diff().  Zero (Equal) means all checked fields match.
+        /// The library only compares fields with current semantic meaning —
+        /// `flags` and `reserved[]` are deliberately excluded so that
+        /// forward-compatible additions (a new flag bit, a new field carved
+        /// from reserved) do NOT retroactively break existing comparisons.
+        ///
+        /// The library never decides what counts as a mismatch for the
+        /// caller: users combine these bits per their own policy (e.g.
+        /// "Identity mismatch is fatal, Version mismatch triggers a
+        /// negotiation, Name mismatch is just logged").
+        enum Diff : uint32_t
+        {
+            Equal        = 0,
+            Identity     = 1u << 0,  ///< identity[] bytes differ
+            Layout       = 1u << 1,  ///< layout[] bytes differ
+            Version      = 1u << 2,  ///< version numbers differ
+            Name         = 1u << 3,  ///< name strings differ (up to 128 B)
+            IdentityAlgo = 1u << 4,  ///< identity_algo tags differ
+            LayoutAlgo   = 1u << 5,  ///< layout_algo tags differ
+        };
+
+        /// Compute a bitwise diff of the semantically-meaningful fields of
+        /// two schema descriptors.  Pure, side-effect free; library does
+        /// not apply any mismatch policy.
+        uint32_t diff(SchemaInfo const& a, SchemaInfo const& b);
     }
 
     namespace channel

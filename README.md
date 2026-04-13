@@ -1,8 +1,8 @@
-# KickMsg
+# Kickmsg
 
 Lock-free shared-memory messaging library for inter-process communication.
 
-KickMsg provides MPMC publish/subscribe over shared memory with zero-copy receive, per-subscriber ring isolation, and crash resilience — all without locks or kernel-mediated synchronization on the hot path.
+Kickmsg provides MPMC publish/subscribe over shared memory with zero-copy receive, per-subscriber ring isolation, and crash resilience — all without locks or kernel-mediated synchronization on the hot path.
 
 ## Features
 

@@ -1,5 +1,5 @@
 /// @file hello_zerocopy.cc
-/// @brief KickMsg zero-copy receive via the Node API.
+/// @brief Kickmsg zero-copy receive via the Node API.
 ///
 /// Demonstrates SampleView: a zero-copy handle that points directly into
 /// shared memory. The slot stays pinned (refcount > 0) while the view

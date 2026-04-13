@@ -71,7 +71,19 @@ namespace kickmsg
 
     void SharedMemory::create(std::string const& name, std::size_t size)
     {
-        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+        // macOS quirk: shm_open returns EINVAL when passed O_TRUNC on an
+        // existing SHM object — Linux accepts it but Darwin rejects it.
+        // This matters on the create_or_open() fast path, where try_create
+        // first opens the object with O_CREAT|O_EXCL and closes the fd,
+        // then this function reopens it to size and map.  Calling
+        // shm_unlink() first makes create() idempotent from the caller's
+        // point of view and sidesteps the O_TRUNC incompatibility: the
+        // subsequent shm_open sees a name that either didn't exist or
+        // was just detached, and then ftruncate(size) is always the
+        // first sizing call on the fresh object (which macOS also
+        // requires — a SHM object can only be ftruncated once).
+        ::shm_unlink(name.c_str());
+        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
         if (fd_ < 0)
         {
             throw_system_error("SharedMemory: shm_open(create)");

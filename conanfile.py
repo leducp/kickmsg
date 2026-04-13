@@ -1,7 +1,7 @@
 from conan import ConanFile
 
 
-class KickMsgDev(ConanFile):
+class KickmsgDev(ConanFile):
     """Local development conanfile for kickmsg."""
     settings = "os", "compiler", "build_type", "arch"
 

@@ -1,5 +1,5 @@
 /// @file hello_pubsub.cc
-/// @brief KickMsg publish/subscribe via the Node API.
+/// @brief Kickmsg publish/subscribe via the Node API.
 ///
 /// Two nodes communicate over a named topic:
 ///   - "sensor" advertises "temperature" and publishes readings

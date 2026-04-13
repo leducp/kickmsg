@@ -1,5 +1,5 @@
 /// @file hello_lowlevel.cc
-/// @brief KickMsg low-level API example using SharedRegion directly.
+/// @brief Kickmsg low-level API example using SharedRegion directly.
 ///
 /// Demonstrates the raw API without the Node abstraction:
 ///   1. Create a SharedRegion with explicit config

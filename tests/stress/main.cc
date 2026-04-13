@@ -13,7 +13,7 @@ bool run_subscriber_saturation();
 
 int main()
 {
-    std::printf("=== KickMsg Lock-Free Stress Tests ===\n\n");
+    std::printf("=== Kickmsg Lock-Free Stress Tests ===\n\n");
 
     TestRunner runner;
 

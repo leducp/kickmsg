@@ -1,8 +1,8 @@
-# KickMsg Architecture
+# Kickmsg Architecture
 
 ## Shared-memory Layout
 
-Every KickMsg channel is a single POSIX shared-memory region containing
+Every Kickmsg channel is a single POSIX shared-memory region containing
 three contiguous areas:
 
 ```
@@ -20,7 +20,7 @@ layout self-describing and forward-compatible.
 
 ## Concurrency Model
 
-At the channel level, KickMsg is **MPMC** (N publishers, M subscribers).
+At the channel level, Kickmsg is **MPMC** (N publishers, M subscribers).
 Internally this is decomposed into **M independent MPSC rings**: each
 subscriber owns exactly one ring, and all publishers write to all active
 rings. No ring ever has two readers.
@@ -93,7 +93,7 @@ MPMC ring: **no cross-subscriber impact**.
 
 ## Payload Contract
 
-KickMsg slots carry raw bytes -- there is no serialization or
+Kickmsg slots carry raw bytes -- there is no serialization or
 deserialization step on the hot path. The publisher `memcpy`s (or
 directly writes via `allocate()`) into a shared-memory slot, and the
 subscriber reads the bytes as-is. This eliminates encoding overhead
@@ -115,7 +115,7 @@ entirely, but it requires that **payloads are self-contained**:
 
 If you need to send complex or dynamically-sized types, serialize them
 into the slot yourself (e.g. FlatBuffers, Protocol Buffers, or a
-custom wire format). KickMsg handles the transport; serialization is
+custom wire format). Kickmsg handles the transport; serialization is
 the user's responsibility.
 
 
@@ -160,7 +160,7 @@ has finished initialization.
 
 ## Payload Schema Descriptor
 
-KickMsg carries opaque byte buffers on the data path — the library
+Kickmsg carries opaque byte buffers on the data path — the library
 never interprets a payload. For an IPC system that is exactly what
 the hot path needs, but it leaves a real problem at the edges:
 **two processes attached to the same region can disagree on what the
@@ -987,7 +987,7 @@ pitfall of lock-free CAS loops: between a thread's read and its CAS, other
 threads may change a value away and back, making the CAS succeed on stale
 state.
 
-KickMsg avoids ABA by ensuring that **every CAS target is effectively
+Kickmsg avoids ABA by ensuring that **every CAS target is effectively
 monotonic** -- it can never return to a previously observed value:
 
 ```

@@ -46,6 +46,10 @@ namespace kickmsg
 
         channel::Type channel_type() const { return header()->channel_type; }
 
+        /// The shared-memory name this region was created or opened with.
+        /// Empty for a default-constructed SharedRegion (before create/open).
+        std::string const& name() const { return name_; }
+
         /// Read the payload schema descriptor if one has been published.
         ///
         /// Returns nullopt when the schema slot is still Unset, or while a
@@ -95,12 +99,18 @@ namespace kickmsg
         ///  - draining_rings > 0: usually transient (subscriber tearing down),
         ///    persistent counts may indicate a stuck teardown
         ///  - live_rings: normal occupancy
+        ///  - schema_stuck: a claimant crashed between Unset → Claiming and
+        ///    the Set release-store.  Every future try_claim_schema() will
+        ///    return false after its bounded wait until an operator calls
+        ///    reset_schema_claim() (only safe after confirming the original
+        ///    claimant is gone).
         struct HealthReport
         {
             uint32_t locked_entries;   ///< Entries stuck at LOCKED_SEQUENCE
             uint32_t retired_rings;    ///< Free rings with stale in_flight > 0
             uint32_t draining_rings;   ///< Draining rings with in_flight > 0
             uint32_t live_rings;       ///< Active subscriber rings
+            bool     schema_stuck;     ///< schema_state wedged at Claiming (crashed claimant)
         };
         HealthReport diagnose();
 

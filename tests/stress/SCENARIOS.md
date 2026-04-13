@@ -1,4 +1,4 @@
-# KickMsg Stress Test Scenarios
+# Kickmsg Stress Test Scenarios
 
 All scenarios run as part of `kickmsg_stress_test`. Use `endurance.sh` for
 extended runs. TSAN builds scale message counts by 100x to keep runtime

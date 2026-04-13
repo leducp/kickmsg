@@ -323,7 +323,7 @@ static void run_throughput(BenchConfig const& bc, bool zerocopy,
 
 int main()
 {
-    std::printf("=== KickMsg Benchmark ===\n\n");
+    std::printf("=== Kickmsg Benchmark ===\n\n");
 
     std::vector<std::size_t> payload_sizes = {
         64, 256, 1024, 4096,                        // small

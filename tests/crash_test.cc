@@ -196,7 +196,7 @@ static RoundResult run_one_round(int round)
 
 int main()
 {
-    std::printf("=== KickMsg Multi-Process Crash Test ===\n\n");
+    std::printf("=== Kickmsg Multi-Process Crash Test ===\n\n");
 
     kickmsg::SharedMemory::unlink(SHM_NAME);
 

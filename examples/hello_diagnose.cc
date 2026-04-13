@@ -1,5 +1,5 @@
 /// @file hello_diagnose.cc
-/// @brief KickMsg health diagnostics example with fault injection.
+/// @brief Kickmsg health diagnostics example with fault injection.
 ///
 /// Demonstrates the diagnose() / repair_locked_entries() recovery workflow:
 ///   1. Create a healthy channel, verify diagnose() reports zero issues

@@ -1,7 +1,7 @@
 /// @file hello_schema.cc
-/// @brief KickMsg payload schema descriptor via the Node API.
+/// @brief Kickmsg payload schema descriptor via the Node API.
 ///
-/// KickMsg carries opaque bytes — the library never inspects payload
+/// Kickmsg carries opaque bytes — the library never inspects payload
 /// layout. That's exactly what the hot path needs, but it leaves a real
 /// IPC problem: two processes attached to the same topic can disagree on
 /// what the bytes mean, because they were built at different times or
@@ -9,9 +9,8 @@
 ///
 /// The optional SchemaInfo descriptor gives users a place to publish a
 /// fingerprint of the payload format so receivers can detect mismatches.
-/// The library only provides the slot and an atomic claim protocol; the
-/// caller chooses what bytes go in (a SHA, an FNV, a UUID, a protobuf
-/// descriptor hash, a Fletcher checksum of struct member offsets...) and
+/// The library only provides the slot, an atomic claim protocol, and
+/// a small pure diff helper; the caller chooses what bytes go in and
 /// what to do on mismatch (refuse, log, fall back, version-negotiate).
 ///
 /// This demo runs three nodes in one process:
@@ -25,59 +24,21 @@
 /// check works the same way across process boundaries because the
 /// descriptor lives in shared memory.
 
-#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <string>
 
+#include <kickmsg/Hash.h>
 #include <kickmsg/Node.h>
 
 using namespace kickmsg;
 
 // ---------------------------------------------------------------------------
-// User-supplied fingerprint helpers.  The library never calls these — any
-// hash family works (SHA-256, FNV, xxhash, UUID...).  We use a tiny FNV-1a
-// here to keep the example self-contained.
-// ---------------------------------------------------------------------------
-
-namespace
-{
-    constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
-    constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
-
-    uint64_t fnv1a(std::string const& s)
-    {
-        uint64_t h = FNV_OFFSET;
-        for (auto c : s)
-        {
-            h ^= static_cast<uint8_t>(c);
-            h *= FNV_PRIME;
-        }
-        return h;
-    }
-
-    /// Pack a 64-bit hash into the leading bytes of a 64-byte slot.
-    /// Real users would put a SHA-256 / SHA-512 / 128-bit hash etc here.
-    std::array<uint8_t, 64> identity_bytes(std::string const& descriptor)
-    {
-        std::array<uint8_t, 64> out{};
-        uint64_t h = fnv1a(descriptor);
-        std::memcpy(out.data(), &h, sizeof(h));
-        return out;
-    }
-
-    enum : uint32_t
-    {
-        ALGO_FNV1A_64 = 1,  // user-defined tag — library ignores it
-    };
-}
-
-// ---------------------------------------------------------------------------
-// The message type and its schema descriptor.  Bumping the type's layout
-// (adding a field, reordering, changing types) should bump SCHEMA_VERSION
-// AND change the descriptor string so the identity hash differs too.
+// The message type and its schema descriptor.  Bumping the layout (adding
+// a field, reordering, changing types) should bump SCHEMA_VERSION AND
+// change the descriptor string so the identity hash differs too.
 // ---------------------------------------------------------------------------
 
 struct ImuSample
@@ -87,54 +48,51 @@ struct ImuSample
     float    gx, gy, gz;
 };
 
-constexpr char const* SCHEMA_NAME      = "demo/Imu";
+constexpr char const* SCHEMA_NAME       = "demo/Imu";
 constexpr char const* SCHEMA_DESCRIPTOR =
     "demo.Imu(timestamp_ns:u64, ax:f32, ay:f32, az:f32, "
     "gx:f32, gy:f32, gz:f32)";
-constexpr uint32_t    SCHEMA_VERSION   = 2;
+constexpr uint32_t    SCHEMA_VERSION    = 2;
+
+// User-defined tag so tooling can tell "these bytes are an FNV-1a" vs
+// some other hash family — library ignores it.
+constexpr uint32_t    ALGO_FNV1A_64     = 1;
 
 SchemaInfo make_imu_schema(std::string const& descriptor, uint32_t version)
 {
-    SchemaInfo info{};                                    // zeroes reserved[]
-    info.identity      = identity_bytes(descriptor);
-    info.layout        = {};                              // unused in this demo
+    SchemaInfo info{};
+    info.identity      = hash::identity_from_fnv1a(descriptor);
+    // layout unused in this demo — a real app might fill it with a
+    // Fletcher checksum over member (offset, size, kind) tuples so ABI
+    // skew can be distinguished from "different type altogether".
     std::snprintf(info.name, sizeof(info.name), "%s", SCHEMA_NAME);
     info.version       = version;
     info.identity_algo = ALGO_FNV1A_64;
-    info.layout_algo   = 0;
-    info.flags         = 0;
     return info;
 }
 
 // ---------------------------------------------------------------------------
 // Subscriber-side mismatch policy.  Library never enforces — caller does.
+// We treat identity and version as fatal, everything else as advisory.
 // ---------------------------------------------------------------------------
 
-enum class SchemaCheck { Ok, Missing, IdentityMismatch, VersionMismatch };
-
-SchemaCheck verify(SchemaInfo const& got, SchemaInfo const& expected)
+char const* describe_diff(uint32_t d)
 {
-    if (got.identity != expected.identity)
-    {
-        return SchemaCheck::IdentityMismatch;
-    }
-    if (got.version != expected.version)
-    {
-        return SchemaCheck::VersionMismatch;
-    }
-    return SchemaCheck::Ok;
+    if (d == schema::Equal)          return "OK";
+    if (d & schema::Identity)        return "identity mismatch (different type)";
+    if (d & schema::Version)         return "version mismatch (same type, different rev)";
+    if (d & schema::Layout)          return "layout mismatch (ABI skew)";
+    if (d & schema::IdentityAlgo
+        || d & schema::LayoutAlgo)   return "algo tag mismatch";
+    if (d & schema::Name)            return "name mismatch (advisory)";
+    return "?";
 }
 
-char const* describe(SchemaCheck c)
+bool is_fatal(uint32_t d)
 {
-    switch (c)
-    {
-        case SchemaCheck::Ok:                return "OK";
-        case SchemaCheck::Missing:           return "no schema published";
-        case SchemaCheck::IdentityMismatch:  return "identity mismatch (different type)";
-        case SchemaCheck::VersionMismatch:   return "version mismatch (same type, different rev)";
-    }
-    return "?";
+    // User policy: identity and version are fatal; other diffs are logged
+    // but tolerated.  Another app might treat Layout as fatal too.
+    return (d & (schema::Identity | schema::Version)) != 0;
 }
 
 int main()
@@ -142,10 +100,9 @@ int main()
     constexpr char const* PREFIX = "demo_schema";
     constexpr char const* TOPIC  = "imu";
 
-    SharedMemory::unlink((std::string{"/"} + PREFIX + "_" + TOPIC).c_str());
-
     // ----- Publisher: advertise "imu" with v2 schema baked in -----
     Node pub_node("imu_driver", PREFIX);
+    pub_node.unlink_topic(TOPIC);  // clean any leftover SHM from prior runs
 
     channel::Config cfg;
     cfg.max_subscribers   = 4;
@@ -167,14 +124,14 @@ int main()
         auto got = good.topic_schema(TOPIC);
         if (not got.has_value())
         {
-            std::cout << "[good_sub]  refused: " << describe(SchemaCheck::Missing) << "\n";
+            std::cout << "[good_sub]  refused: no schema published\n";
             return 1;
         }
-        SchemaCheck check = verify(*got, expected);
+        uint32_t d = schema::diff(*got, expected);
         std::cout << "[good_sub]  observed schema '" << got->name
                   << "' v" << got->version
-                  << " — " << describe(check) << "\n";
-        if (check != SchemaCheck::Ok)
+                  << " — " << describe_diff(d) << "\n";
+        if (is_fatal(d))
         {
             return 1;
         }
@@ -187,10 +144,18 @@ int main()
     {
         SchemaInfo expected = make_imu_schema(SCHEMA_DESCRIPTOR, /*version=*/1);
         auto got = bad.topic_schema(TOPIC);
-        SchemaCheck check = got ? verify(*got, expected) : SchemaCheck::Missing;
-        std::cout << "[bad_sub]   expected v1, observed v" << (got ? got->version : 0)
-                  << " — " << describe(check) << "\n";
-        if (check != SchemaCheck::Ok)
+
+        uint32_t d           = schema::Equal;
+        uint32_t got_version = 0;
+        if (got.has_value())
+        {
+            d           = schema::diff(*got, expected);
+            got_version = got->version;
+        }
+
+        std::cout << "[bad_sub]   expected v1, observed v" << got_version
+                  << " — " << describe_diff(d) << "\n";
+        if (got.has_value() and is_fatal(d))
         {
             std::cout << "[bad_sub]   refusing to consume bytes it can't safely interpret\n";
             bad_should_consume = false;
@@ -224,12 +189,16 @@ int main()
     std::cout << "[good_sub]  consumed " << good_count << " sample(s)\n";
 
     // ----- bad_sub stays silent (its mismatch policy was: refuse) -----
+    // Note: bad_sub's ring still received the messages at the SHM layer
+    // — the publisher delivers to every Live ring unconditionally.  The
+    // "refusal" is purely application-level: bad_sub chooses not to pop
+    // the ring (which it would otherwise drain with try_receive).
     if (not bad_should_consume)
     {
         std::cout << "[bad_sub]   consumed 0 sample(s) (refused on schema mismatch)\n";
     }
 
-    SharedMemory::unlink((std::string{"/"} + PREFIX + "_" + TOPIC).c_str());
+    pub_node.unlink_topic(TOPIC);
     std::cout << "Done.\n";
     return 0;
 }
