@@ -1,28 +1,119 @@
 #ifndef KICKMSG_TYPES_H
 #define KICKMSG_TYPES_H
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <type_traits>
 
 namespace kickmsg
 {
     using namespace std::chrono;
 
     static_assert(std::atomic<uint64_t>::is_always_lock_free,
-        "KickMsg requires lock-free 64-bit atomics. "
+        "Kickmsg requires lock-free 64-bit atomics. "
         "32-bit platforms (RV32, MIPS32) are not supported.");
     static_assert(std::atomic<uint32_t>::is_always_lock_free,
-        "KickMsg requires lock-free 32-bit atomics.");
+        "Kickmsg requires lock-free 32-bit atomics.");
 
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
-    constexpr uint32_t    VERSION         = 3;
+    constexpr uint32_t    VERSION         = 4;
     constexpr uint32_t    INVALID_SLOT    = UINT32_MAX;
     constexpr uint64_t    LOCKED_SEQUENCE = UINT64_MAX;
     constexpr std::size_t CACHE_LINE      = 64;
 
-    constexpr microseconds DEFAULT_COMMIT_TIMEOUT = 100ms;
+    // A healthy commit (memcpy + atomic release-store) finishes in a few
+    // microseconds; even under moderate CAS contention it stays well under
+    // a millisecond.  10 ms is therefore ~1000× a normal commit — enough
+    // to absorb routine preemption without falsely evicting a live
+    // publisher, while still recovering from a real crash fast enough to
+    // avoid stalling subscribers.  Applications running under severe
+    // oversubscription (threads ≫ cores) may want to raise this; hard
+    // real-time setups may want to lower it.  Override via
+    // channel::Config::commit_timeout.
+    constexpr microseconds DEFAULT_COMMIT_TIMEOUT = 10ms;
+
+    /// Optional payload schema descriptor.
+    ///
+    /// The library never interprets any byte of this structure: it stores it
+    /// in the shared-memory header so that multiple processes (possibly built
+    /// at different times, from different sources) can agree — or disagree —
+    /// on the payload format carried by the channel.
+    ///
+    /// Policy (which fields to fill, how to compute the hashes, what counts as
+    /// a mismatch) is entirely up to the user.  Typical usage:
+    ///   - identity: cryptographic or non-cryptographic hash of a canonical
+    ///     descriptor of the logical type (name + version + field list).
+    ///   - layout: fingerprint of this binary's in-memory layout
+    ///     (e.g. a checksum over (offset, size, kind) tuples per member).
+    ///     Useful to distinguish "wrong type" from "same type, different ABI".
+    ///   - name: human-readable identifier for diagnostics.
+    ///   - version: user-defined version number.
+    ///   - identity_algo / layout_algo: opaque tags that let the user's tooling
+    ///     know which algorithm produced the corresponding bytes (e.g. 1=sha256,
+    ///     2=fnv128).  The library never reads them.
+    ///
+    /// Size is fixed at 512 bytes (8 cache lines) to leave generous room for
+    /// future fields without requiring another layout-version bump.
+    struct SchemaInfo
+    {
+        std::array<uint8_t, 64> identity;       ///< Logical fingerprint (user-defined bytes)
+        std::array<uint8_t, 64> layout;         ///< Structural fingerprint (user-defined bytes)
+        char                    name[128];      ///< Null-terminated, for diagnostics
+        uint32_t                version;        ///< User-defined version number
+        uint32_t                identity_algo;  ///< User tag: 0 = unspecified
+        uint32_t                layout_algo;    ///< User tag: 0 = unspecified
+        uint32_t                flags;          ///< Reserved bit flags (0 for now)
+        uint8_t                 reserved[240];  ///< Future fields — zero on write
+    };
+    static_assert(sizeof(SchemaInfo) == 512,
+        "SchemaInfo layout is part of the shared-memory ABI");
+    static_assert(std::is_trivially_copyable<SchemaInfo>::value,
+        "SchemaInfo must be trivially copyable for memcpy into shared memory");
+
+    /// Schema-slot publication state.  Drives a small state machine in the
+    /// header so a claim writes the payload bytes between Claiming and Set,
+    /// and readers only observe the payload once Set is published.
+    namespace schema
+    {
+        enum State : uint32_t
+        {
+            Unset    = 0,  ///< No schema has been claimed
+            Claiming = 1,  ///< A claim is in progress; payload bytes are being written
+            Set      = 2,  ///< Payload is stable and safe to read
+        };
+
+        /// Bitmask describing how two SchemaInfo values differ.
+        ///
+        /// Returned by diff().  Zero (Equal) means all checked fields match.
+        /// The library only compares fields with current semantic meaning —
+        /// `flags` and `reserved[]` are deliberately excluded so that
+        /// forward-compatible additions (a new flag bit, a new field carved
+        /// from reserved) do NOT retroactively break existing comparisons.
+        ///
+        /// The library never decides what counts as a mismatch for the
+        /// caller: users combine these bits per their own policy (e.g.
+        /// "Identity mismatch is fatal, Version mismatch triggers a
+        /// negotiation, Name mismatch is just logged").
+        enum Diff : uint32_t
+        {
+            Equal        = 0,
+            Identity     = 1u << 0,  ///< identity[] bytes differ
+            Layout       = 1u << 1,  ///< layout[] bytes differ
+            Version      = 1u << 2,  ///< version numbers differ
+            Name         = 1u << 3,  ///< name strings differ (up to 128 B)
+            IdentityAlgo = 1u << 4,  ///< identity_algo tags differ
+            LayoutAlgo   = 1u << 5,  ///< layout_algo tags differ
+        };
+
+        /// Compute a bitwise diff of the semantically-meaningful fields of
+        /// two schema descriptors.  Pure, side-effect free; library does
+        /// not apply any mismatch policy.
+        uint32_t diff(SchemaInfo const& a, SchemaInfo const& b);
+    }
 
     namespace channel
     {
@@ -45,6 +136,12 @@ namespace kickmsg
             // heavy scheduling pressure.  Longer = safer under load but adds
             // latency when a real crash occurs.
             microseconds commit_timeout{DEFAULT_COMMIT_TIMEOUT};
+
+            /// Optional schema descriptor baked into the header at create time.
+            /// Orthogonal to channel geometry: not included in config_hash, never
+            /// enforced by the library.  Users read it back via
+            /// SharedRegion::schema() and apply their own mismatch policy.
+            std::optional<SchemaInfo> schema;
         };
     }
 
@@ -86,8 +183,27 @@ namespace kickmsg
         uint16_t    creator_name_len;   ///< Length of creator name string
         // creator_name bytes follow immediately after sizeof(Header)
 
+        /// Payload schema descriptor — opt-in, off the hot path.
+        /// Published via a tiny state machine (Unset → Claiming → Set):
+        /// writers update schema_data while schema_state == Claiming, then
+        /// release-store Set.  Readers acquire-load schema_state and only
+        /// read schema_data if the state is Set.
+        alignas(CACHE_LINE) std::atomic<uint32_t> schema_state;
+        alignas(CACHE_LINE) SchemaInfo            schema_data;
+
         alignas(CACHE_LINE) std::atomic<uint64_t> free_top; ///< Treiber free-stack head (tagged: gen|idx)
     };
+
+    // The creator_name tail bytes are written at offset sizeof(Header) in the
+    // shared-memory mapping.  Guaranteeing sizeof(Header) is a multiple of
+    // CACHE_LINE ensures those bytes start on a fresh cache line and never
+    // share a line with any atomic field above (schema_state, schema_data,
+    // free_top).  The aliasing of alignas(CACHE_LINE) on several members plus
+    // struct-level alignment normally produces this automatically, but we
+    // assert it to catch accidental layout edits.
+    static_assert(sizeof(Header) % CACHE_LINE == 0,
+        "Header size must be cache-line multiple to isolate atomic fields "
+        "from the creator_name tail written at offset sizeof(Header)");
 
     /// Ring entry: one per position in a subscriber ring.
     /// Packed to guarantee binary layout across compilers.

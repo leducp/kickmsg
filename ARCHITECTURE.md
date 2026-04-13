@@ -1,8 +1,8 @@
-# KickMsg Architecture
+# Kickmsg Architecture
 
 ## Shared-memory Layout
 
-Every KickMsg channel is a single POSIX shared-memory region containing
+Every Kickmsg channel is a single POSIX shared-memory region containing
 three contiguous areas:
 
 ```
@@ -20,7 +20,7 @@ layout self-describing and forward-compatible.
 
 ## Concurrency Model
 
-At the channel level, KickMsg is **MPMC** (N publishers, M subscribers).
+At the channel level, Kickmsg is **MPMC** (N publishers, M subscribers).
 Internally this is decomposed into **M independent MPSC rings**: each
 subscriber owns exactly one ring, and all publishers write to all active
 rings. No ring ever has two readers.
@@ -93,7 +93,7 @@ MPMC ring: **no cross-subscriber impact**.
 
 ## Payload Contract
 
-KickMsg slots carry raw bytes -- there is no serialization or
+Kickmsg slots carry raw bytes -- there is no serialization or
 deserialization step on the hot path. The publisher `memcpy`s (or
 directly writes via `allocate()`) into a shared-memory slot, and the
 subscriber reads the bytes as-is. This eliminates encoding overhead
@@ -115,7 +115,7 @@ entirely, but it requires that **payloads are self-contained**:
 
 If you need to send complex or dynamically-sized types, serialize them
 into the slot yourself (e.g. FlatBuffers, Protocol Buffers, or a
-custom wire format). KickMsg handles the transport; serialization is
+custom wire format). Kickmsg handles the transport; serialization is
 the user's responsibility.
 
 
@@ -127,7 +127,7 @@ The region header is self-describing and forward-compatible:
 Header (at offset 0)
 ┌───────────────────────────────────────────────────────────┐
 │  magic (atomic)     0x4B49434B4D534721 ("KICKMSG!")       │
-│  version            3                                     │
+│  version            4                                     │
 │  channel_type       PubSub | Broadcast                    │
 │  total_size         total mmap size in bytes               │
 │  sub_rings_offset   byte offset to first subscriber ring  │
@@ -145,6 +145,8 @@ Header (at offset 0)
 │  created_at_ns      creation timestamp (nanoseconds)      │
 │  creator_name_len   length of creator name string         │
 │  creator_name[]     variable-length name (debugging)      │
+│  schema_state       Unset | Claiming | Set (atomic u32)   │
+│  schema_data        SchemaInfo — 512 B, 8 cache lines     │
 │  free_top           Treiber stack head (atomic u64)       │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -154,6 +156,113 @@ without breaking existing readers. The `magic` field is an
 `atomic<uint64_t>` written last with `release` during init and polled
 with `acquire` by `create_or_open()` to spin-wait until the creator
 has finished initialization.
+
+
+## Payload Schema Descriptor
+
+Kickmsg carries opaque byte buffers on the data path — the library
+never interprets a payload. For an IPC system that is exactly what
+the hot path needs, but it leaves a real problem at the edges:
+**two processes attached to the same region can disagree on what the
+bytes mean**, because they were built at different times, from
+different sources, or against different message definitions.
+
+The descriptor is an **opt-in, off-hot-path** slot in the header
+that lets users detect this disagreement. The library provides the
+mechanism (a 512-byte fixed-layout blob with a publish protocol);
+the user provides the policy (what fingerprints to compute, what
+counts as a mismatch, how to react).
+
+```
+SchemaInfo (512 B, 8 cache lines)
+┌──────────────────────────────────────────────────────────────┐
+│  identity[64]       logical fingerprint (user-defined bytes) │
+│  layout[64]         structural fingerprint (user-defined)    │
+│  name[128]          null-terminated, for diagnostics         │
+│  version            uint32 — user-defined version number     │
+│  identity_algo      uint32 — user tag (0 = unspecified)      │
+│  layout_algo        uint32 — user tag (0 = unspecified)      │
+│  flags              uint32 — reserved bit flags              │
+│  reserved[240]      future fields — zero on write            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Two-slot design.** Splitting identity (logical type) from layout
+(this binary's actual memory layout) lets users distinguish *wrong
+type* from *same type, different ABI*: two binaries may agree on
+`identity` (same logical Pose) but diverge on `layout` (one added a
+field, bumping `sizeof`). The library reports both back via
+`SchemaInfo`; callers decide whether ABI skew is tolerable.
+
+**Generous reserve.** 240 bytes of `reserved[]` are zeroed on every
+write so future additions (e.g. a creator host string, a descriptor
+URL, a signature) don't require another version bump.
+
+### Publish protocol
+
+The descriptor is published via a three-state atomic (`schema_state`):
+
+```
+       try_claim_schema()              memcpy schema_data
+    ┌───── CAS ─────────►┌─────────────────────────►┌────────┐
+    │ Unset              │   Claiming               │  Set   │
+    │ (state = 0)        │   (state = 1)            │(state=2)│
+    └────────────────────┘   payload bytes written  └────────┘
+                             between Claiming and Set
+```
+
+- Writer CAS `Unset → Claiming` (acq_rel). Winner memcpys the
+  payload into `schema_data`, then release-stores `Set`.
+- Reader acquire-loads `schema_state`. If `Set`, the payload is
+  stable to read. If `Unset` or `Claiming`, `schema()` returns
+  `std::nullopt`.
+- Losers of the CAS briefly yield if the observed state is
+  `Claiming` (bounded by a small iteration budget so a crashed
+  claimant can't wedge callers forever), then return `false` —
+  callers read back with `schema()` and apply their own mismatch
+  policy.
+
+### Crash-recovery primitive
+
+If a claimant is killed between the `Unset → Claiming` CAS and the
+release-store of `Set`, the slot stays wedged at `Claiming` and
+every future `try_claim_schema()` returns `false` after its bounded
+wait. `SharedRegion::reset_schema_claim()` is the operator-driven
+recovery: it atomically CASes `Claiming → Unset` so a new claim can
+proceed. This mirrors the safety contract of `reset_retired_rings()`
+— **not safe under live traffic**; only call after confirming the
+original claimant is gone, otherwise a slow-but-alive writer could
+still finish its memcpy and release-store `Set` while a new claim
+is concurrently reusing the slot, producing torn bytes.
+
+At `SharedRegion::create()` time the creator is the single writer
+and no concurrent reader can observe the region yet (the `magic`
+sentinel is published last), so `cfg.schema` is written directly
+and `schema_state` is stamped `Set` with a relaxed store. The
+state machine only matters for late claims against an already-live
+region.
+
+### Scope
+
+- **Not on the hot path.** Readers consult the descriptor at
+  connect time (a handful of times per process lifetime), never on
+  `send` / `receive`. The 512 B blob lives on its own cache lines
+  and never shares a line with `free_top` or any ring header.
+- **Orthogonal to `config_hash`.** Schema presence/absence does not
+  participate in the geometry hash, so a typed publisher can share
+  a region with an untyped subscriber as long as the channel
+  geometry matches. Users opt in to schema enforcement on their
+  own terms.
+- **Library is policy-agnostic.** `try_claim_schema()` returning
+  `false` is not an error — it just says "someone else got there
+  first, here's what they wrote, you decide." The library never
+  throws on schema grounds.
+
+Version bumped `3 → 4` because the `Header` binary layout grew by
+the two new fields: one cache line for `schema_state` (a
+`uint32_t` atomic padded to 64 B by `alignas(CACHE_LINE)`) plus
+eight cache lines for `schema_data` (512 B). Pre-v4 binaries are
+rejected at `open()` by the existing version check.
 
 
 ## Treiber Free Stack
@@ -878,7 +987,7 @@ pitfall of lock-free CAS loops: between a thread's read and its CAS, other
 threads may change a value away and back, making the CAS succeed on stale
 state.
 
-KickMsg avoids ABA by ensuring that **every CAS target is effectively
+Kickmsg avoids ABA by ensuring that **every CAS target is effectively
 monotonic** -- it can never return to a previously observed value:
 
 ```

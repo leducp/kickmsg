@@ -1,6 +1,7 @@
 #ifndef KICKMSG_NODE_H
 #define KICKMSG_NODE_H
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,8 +31,43 @@ namespace kickmsg
         Node(std::string const& name, std::string const& prefix = "kickmsg");
 
         // --- PubSub (topic-centric, 1-to-N by convention) ---
+        //
+        // Strict variants assume a fixed startup order:
+        //   advertise() creates the region (publisher must arrive first),
+        //   subscribe() opens an existing one (subscriber arrives later).
+        //
+        // The *_or_* variants relax that: either side may be the first to
+        // materialize the region, mirroring join_broadcast()'s behavior.
+        // Useful when startup order is unknown — e.g. a listener service
+        // starting before its data source.
+        //
+        // These variants take `cfg` by reference with NO default: either
+        // side of the relaxed-order protocol may end up being the creator,
+        // so both sides must agree on the channel geometry the creator
+        // will stamp into the header (create_or_open's config_hash check
+        // enforces that agreement on the open branch).
+        //
+        // Idempotency: calling advertise_or_join / subscribe_or_create
+        // twice on the same topic from the same Node returns a second
+        // independent Publisher/Subscriber handle that wraps the SAME
+        // underlying region (emplace_or_reuse dedupes the SharedRegion).
+        // The freshly-opened SharedRegion from the second call is
+        // discarded.  Two Publisher handles on the same topic from the
+        // same Node are NOT designed for concurrent use from separate
+        // threads — use one handle per thread instead.
+        //
+        // NOTE on cfg.schema: only the *creator* of the region bakes
+        // cfg.schema into the header.  On the open branch (region already
+        // exists) cfg.schema is IGNORED and the existing region's schema
+        // is preserved — schema is orthogonal to channel geometry and
+        // never part of the create_or_open config-mismatch check.  Use
+        // try_claim_topic_schema() afterwards to publish a descriptor
+        // regardless of which side ended up creating the region.
         Publisher  advertise(char const* topic, channel::Config const& cfg = {});
         Subscriber subscribe(char const* topic);
+
+        Publisher  advertise_or_join(char const* topic, channel::Config const& cfg);
+        Subscriber subscribe_or_create(char const* topic, channel::Config const& cfg);
 
         // --- Broadcast (N-to-N shared channel) ---
         BroadcastHandle join_broadcast(char const* channel, channel::Config const& cfg = {});
@@ -39,6 +75,35 @@ namespace kickmsg
         // --- Mailbox (N-to-1, max_subscribers=1) ---
         Subscriber create_mailbox(char const* tag, channel::Config const& cfg = {});
         Publisher  open_mailbox(char const* owner_node, char const* tag);
+
+        // --- Unlink helpers -----------------------------------------------
+        //
+        // Thin wrappers that call SharedMemory::unlink() with the same name
+        // formatting used by advertise / subscribe / join_broadcast /
+        // create_mailbox.  Safe to call whether or not this node currently
+        // holds a region for that name — unlink is a filesystem-level
+        // operation on the SHM entry, independent of in-process handles.
+
+        void unlink_topic(char const* topic) const;
+        void unlink_broadcast(char const* channel) const;
+        /// Unlink the mailbox owned by `owner_node` (defaults to this node).
+        void unlink_mailbox(char const* tag, char const* owner_node = nullptr) const;
+
+        // --- Optional payload schema descriptor ---
+        //
+        // The library never interprets schema bytes — these accessors just
+        // forward to the SharedRegion backing the topic. Mismatch policy
+        // is entirely the caller's.
+
+        /// Read the schema descriptor of a topic this node has joined.
+        /// Returns nullopt if no schema is published or this node hasn't
+        /// joined the topic.
+        std::optional<SchemaInfo> topic_schema(char const* topic) const;
+
+        /// Atomically claim the schema slot on a topic this node has joined.
+        /// Returns true if this call published the schema, false if someone
+        /// else got there first (read back with topic_schema()).
+        bool try_claim_topic_schema(char const* topic, SchemaInfo const& info);
 
         std::string const& name()   const { return name_; }
         std::string const& prefix() const { return prefix_; }
@@ -48,8 +113,30 @@ namespace kickmsg
         std::string make_broadcast_name(char const* channel) const;
         std::string make_mailbox_name(char const* owner, char const* tag) const;
 
+        // Lifetime: the returned pointer is only valid until the next
+        // mutation of regions_.  A caller MUST NOT hold the pointer
+        // across an emplace_back/emplace_or_reuse call — vector realloc
+        // would move the SharedRegion object (the mmap stays put, but
+        // the SharedRegion handle would dangle).
+        SharedRegion*       find_region(std::string const& shm_name);
+        SharedRegion const* find_region(std::string const& shm_name) const;
+
+        /// Dedup-aware insertion: if a region with `shm_name` is already
+        /// held by this node, returns the existing one (discarding `region`);
+        /// otherwise appends and returns the newly-held region.  Two
+        /// SharedRegion objects for the same mmap would double-unmap on
+        /// destruction, so callers of the idempotent SharedRegion factory
+        /// methods (open / create_or_open) route through this helper.
+        SharedRegion& emplace_or_reuse(std::string const& shm_name,
+                                       SharedRegion&&     region);
+
         std::string name_;
         std::string prefix_;
+        // Linear search by SharedRegion::name() — a Node typically holds
+        // a handful of regions, so O(N) lookup is negligible.  mmap
+        // addresses captured by Publisher/Subscriber stay valid when
+        // emplace_back reallocates the vector (handles point into the
+        // mapped pages, not into the SharedRegion object).
         std::vector<SharedRegion> regions_;
     };
 }

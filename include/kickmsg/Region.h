@@ -1,8 +1,8 @@
 #ifndef KICKMSG_REGION_H
 #define KICKMSG_REGION_H
 
+#include <optional>
 #include <string>
-#include <vector>
 
 #include "kickmsg/types.h"
 #include "kickmsg/os/SharedMemory.h"
@@ -26,6 +26,12 @@ namespace kickmsg
 
         static SharedRegion open(char const* name);
 
+        /// Create the region if it doesn't exist, otherwise open the
+        /// existing one.  On the open branch, cfg.schema is IGNORED —
+        /// schema is orthogonal to channel geometry and doesn't
+        /// participate in the config-hash mismatch check.  Use
+        /// try_claim_schema() afterwards to publish a descriptor
+        /// regardless of which side ended up creating the region.
         static SharedRegion create_or_open(char const* name, channel::Type type,
                                            channel::Config const& cfg,
                                            char const* creator_name = "");
@@ -40,6 +46,49 @@ namespace kickmsg
 
         channel::Type channel_type() const { return header()->channel_type; }
 
+        /// The shared-memory name this region was created or opened with.
+        /// Empty for a default-constructed SharedRegion (before create/open).
+        std::string const& name() const { return name_; }
+
+        /// Read the payload schema descriptor if one has been published.
+        ///
+        /// Returns nullopt when the schema slot is still Unset, or while a
+        /// concurrent claim is mid-write (Claiming).  The library never
+        /// interprets the bytes: callers apply their own mismatch policy
+        /// against the returned SchemaInfo (identity / layout / version /
+        /// name / algo tags).
+        std::optional<SchemaInfo> schema() const;
+
+        /// Atomically publish a schema descriptor to the region.
+        ///
+        /// Returns true if this call claimed the slot (Unset → Claiming →
+        /// Set), false if some other claimant got there first — in which
+        /// case the caller should read back with schema() and apply its
+        /// own mismatch policy.  When another claim is mid-write, this
+        /// call briefly yields until the state settles or a small bounded
+        /// budget is exhausted; if the state is still Claiming at that
+        /// point (likely a crashed claimant), this call still returns
+        /// false and the operator should use reset_schema_claim() to
+        /// recover the wedged slot.
+        ///
+        /// Safe under live traffic and across processes; only reachable
+        /// at connect-time scale (not on the hot path).
+        bool try_claim_schema(SchemaInfo const& info);
+
+        /// Recover a schema slot wedged in the Claiming state by a
+        /// crashed claimant (CAS'd Unset → Claiming then died before the
+        /// release-store of Set).  Atomically CASes Claiming → Unset so a
+        /// new claim can proceed; returns true if the reset actually
+        /// happened, false if the state was not Claiming.
+        ///
+        /// NOT safe under live traffic.  Only call after confirming the
+        /// crashed claimant is gone: a slow-but-alive writer could still
+        /// be mid-memcpy into schema_data and would then release-store
+        /// Set, racing a new claim into torn bytes.  Mirrors the safety
+        /// contract of reset_retired_rings() — a deliberate post-crash
+        /// action, not a routine maintenance call.
+        bool reset_schema_claim();
+
         /// Lightweight read-only health check. Safe under live traffic.
         /// Counts locked entries and ring states without any writes.
         ///
@@ -50,12 +99,18 @@ namespace kickmsg
         ///  - draining_rings > 0: usually transient (subscriber tearing down),
         ///    persistent counts may indicate a stuck teardown
         ///  - live_rings: normal occupancy
+        ///  - schema_stuck: a claimant crashed between Unset → Claiming and
+        ///    the Set release-store.  Every future try_claim_schema() will
+        ///    return false after its bounded wait until an operator calls
+        ///    reset_schema_claim() (only safe after confirming the original
+        ///    claimant is gone).
         struct HealthReport
         {
             uint32_t locked_entries;   ///< Entries stuck at LOCKED_SEQUENCE
             uint32_t retired_rings;    ///< Free rings with stale in_flight > 0
             uint32_t draining_rings;   ///< Draining rings with in_flight > 0
             uint32_t live_rings;       ///< Active subscriber rings
+            bool     schema_stuck;     ///< schema_state wedged at Claiming (crashed claimant)
         };
         HealthReport diagnose();
 
@@ -93,6 +148,16 @@ namespace kickmsg
         std::size_t reclaim_orphaned_slots();
 
     private:
+        /// Stamp channel geometry, creator metadata, optional schema, and
+        /// finally MAGIC into an already-mapped region.  Shared between
+        /// create() and create_or_open()'s creator branch so the two paths
+        /// never diverge on layout or ordering.
+        void stamp_new_region(channel::Type type, channel::Config const& cfg,
+                              char const* creator_name, std::size_t total_size,
+                              std::size_t sub_rings_offset, std::size_t pool_offset,
+                              std::size_t ring_stride,     std::size_t slot_stride,
+                              uint16_t    creator_len);
+
         SharedMemory shm_;
         std::string  name_;
     };

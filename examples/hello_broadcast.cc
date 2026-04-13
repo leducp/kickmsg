@@ -1,5 +1,5 @@
 /// @file hello_broadcast.cc
-/// @brief KickMsg N-to-N broadcast with multiple nodes.
+/// @brief Kickmsg N-to-N broadcast with multiple nodes.
 ///
 /// Four nodes join a "chat" broadcast channel. Each node can both
 /// publish and receive. Demonstrates:

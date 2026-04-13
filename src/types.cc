@@ -1,4 +1,5 @@
 #include "kickmsg/types.h"
+#include "kickmsg/Hash.h"
 
 namespace kickmsg
 {
@@ -37,31 +38,43 @@ namespace kickmsg
     }
 
     // FNV-1a hash of config fields, used to detect parameter mismatches
-    // when opening an existing region.
+    // when opening an existing region.  Chained through hash::fnv1a_64()
+    // so the hashed byte sequence (and therefore the resulting value) is
+    // identical to a single fnv1a_64 over the concatenation of the same
+    // raw field bytes in the same order — do NOT reorder these fields
+    // without bumping VERSION, since existing regions on disk are hashed
+    // with this ordering.
     uint64_t compute_config_hash(channel::Type type, channel::Config const& cfg)
     {
-        constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
-        constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
-
-        auto mix = [&](uint64_t h, auto const& val) -> uint64_t
-        {
-            auto const* p = reinterpret_cast<uint8_t const*>(&val);
-            for (std::size_t i = 0; i < sizeof(val); ++i)
-            {
-                h ^= p[i];
-                h *= FNV_PRIME;
-            }
-            return h;
-        };
-
-        uint64_t h = FNV_OFFSET;
-        h = mix(h, type);
-        h = mix(h, cfg.max_subscribers);
-        h = mix(h, cfg.sub_ring_capacity);
-        h = mix(h, cfg.pool_size);
-        h = mix(h, cfg.max_payload_size);
-        h = mix(h, cfg.commit_timeout);
+        uint64_t h;
+        h = hash::fnv1a_64(&type,                  sizeof(type));
+        h = hash::fnv1a_64(&cfg.max_subscribers,   sizeof(cfg.max_subscribers),   h);
+        h = hash::fnv1a_64(&cfg.sub_ring_capacity, sizeof(cfg.sub_ring_capacity), h);
+        h = hash::fnv1a_64(&cfg.pool_size,         sizeof(cfg.pool_size),         h);
+        h = hash::fnv1a_64(&cfg.max_payload_size,  sizeof(cfg.max_payload_size),  h);
+        h = hash::fnv1a_64(&cfg.commit_timeout,    sizeof(cfg.commit_timeout),    h);
         return h;
+    }
+
+    namespace schema
+    {
+        uint32_t diff(SchemaInfo const& a, SchemaInfo const& b)
+        {
+            uint32_t d = Equal;
+            if (a.identity      != b.identity)      d |= Identity;
+            if (a.layout        != b.layout)        d |= Layout;
+            if (a.version       != b.version)       d |= Version;
+            // Compare name up to the full 128-byte slot: strncmp stops at
+            // the first NUL so trailing zero padding doesn't register as a
+            // diff, but a non-terminated stray byte inside the slot still
+            // does (better to flag than to silently drop).
+            if (std::strncmp(a.name, b.name, sizeof(a.name)) != 0) d |= Name;
+            if (a.identity_algo != b.identity_algo) d |= IdentityAlgo;
+            if (a.layout_algo   != b.layout_algo)   d |= LayoutAlgo;
+            // Intentionally NOT compared: flags, reserved[] — see Diff
+            // doc in types.h for rationale (forward compatibility).
+            return d;
+        }
     }
 
     void treiber_push(std::atomic<uint64_t>& top, SlotHeader* slot, uint32_t slot_idx)

@@ -1,8 +1,8 @@
-# KickMsg
+# Kickmsg
 
 Lock-free shared-memory messaging library for inter-process communication.
 
-KickMsg provides MPMC publish/subscribe over shared memory with zero-copy receive, per-subscriber ring isolation, and crash resilience — all without locks or kernel-mediated synchronization on the hot path.
+Kickmsg provides MPMC publish/subscribe over shared memory with zero-copy receive, per-subscriber ring isolation, and crash resilience — all without locks or kernel-mediated synchronization on the hot path.
 
 ## Features
 
@@ -75,6 +75,28 @@ auto view = sub.try_receive_view();
 auto sample = sub.receive(100ms);
 // blocks via futex until data arrives or timeout
 ```
+
+### Optional payload schema descriptor
+
+```cpp
+// Bake a schema descriptor into the region at creation.
+kickmsg::SchemaInfo info{};
+info.identity = my_identity_hash();   // user-defined bytes
+info.layout   = my_layout_hash();     // user-defined bytes
+std::snprintf(info.name, sizeof(info.name), "my/Pose");
+info.version  = 2;
+
+kickmsg::channel::Config cfg;
+cfg.schema = info;
+auto region = kickmsg::SharedRegion::create("/pose_topic", kickmsg::channel::PubSub, cfg);
+
+// Any process can read it back and decide what to do on mismatch.
+auto schema = region.schema();
+if (schema and schema->version != 2) { /* user-defined policy */ }
+```
+
+The library stores the descriptor in the header but never interprets it — users
+choose how to compute identity/layout fingerprints and how to react to mismatches.
 
 ### Health diagnostics and crash recovery
 
@@ -152,6 +174,8 @@ target_link_libraries(my_app PRIVATE kickmsg)
 | Linux | `shm_open` / `mmap` | `SYS_futex` |
 | macOS | `shm_open` / `mmap` | `__ulock_wait` / `__ulock_wake` |
 | Windows | `CreateFileMapping` / `MapViewOfFile` | `WaitOnAddress` / `WakeByAddressAll` |
+
+Actively validated on Linux x86-64, Linux ARM64 (Raspberry Pi 4B, 12 h continuous stress), and Darwin ARM64 (Apple Silicon) via `scripts/validate.sh`.
 
 ## Architecture
 
