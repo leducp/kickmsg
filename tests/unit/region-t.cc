@@ -4,7 +4,10 @@
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
+#include <atomic>
 #include <cstring>
+#include <thread>
+#include <vector>
 #ifdef _WIN32
 #include <process.h>
 #define getpid _getpid
@@ -474,4 +477,297 @@ TEST_F(RegionTest, CollectGarbageDoesNotReclaimLiveSlots)
     }
 
     EXPECT_EQ(region.reclaim_orphaned_slots(), 0u);
+}
+
+// --- Payload schema descriptor (opt-in, off the hot path) -----------------
+
+namespace
+{
+    kickmsg::SchemaInfo make_schema(char const* name, uint32_t version,
+                                    uint8_t identity_fill, uint8_t layout_fill)
+    {
+        kickmsg::SchemaInfo s{};
+        std::fill(s.identity.begin(), s.identity.end(), identity_fill);
+        std::fill(s.layout.begin(),   s.layout.end(),   layout_fill);
+        std::snprintf(s.name, sizeof(s.name), "%s", name);
+        s.version       = version;
+        s.identity_algo = 1;  // user-defined (e.g. sha256)
+        s.layout_algo   = 2;  // user-defined (e.g. fletcher-512)
+        s.flags         = 0;
+        return s;
+    }
+}
+
+TEST_F(RegionTest, SchemaLayoutIsFiveHundredTwelveBytes)
+{
+    // Binary ABI guard: this struct lives in shared memory.
+    static_assert(sizeof(kickmsg::SchemaInfo) == 512,
+                  "SchemaInfo must stay 512 bytes");
+    EXPECT_EQ(sizeof(kickmsg::SchemaInfo), 512u);
+}
+
+TEST_F(RegionTest, SchemaUnsetByDefault)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    EXPECT_FALSE(region.schema().has_value());
+}
+
+TEST_F(RegionTest, SchemaBakedAtCreate)
+{
+    auto cfg = default_cfg();
+    cfg.schema = make_schema("my/Pose", 3, 0xAB, 0xCD);
+
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "my/Pose");
+    EXPECT_EQ(got->version, 3u);
+    EXPECT_EQ(got->identity[0],  0xAB);
+    EXPECT_EQ(got->identity[63], 0xAB);
+    EXPECT_EQ(got->layout[0],    0xCD);
+    EXPECT_EQ(got->layout[63],   0xCD);
+    EXPECT_EQ(got->identity_algo, 1u);
+    EXPECT_EQ(got->layout_algo,   2u);
+
+    // Reserved bytes must be zero so future readers can distinguish
+    // "field not set by legacy writer" from "field set to some value".
+    for (uint8_t byte : got->reserved)
+    {
+        EXPECT_EQ(byte, 0u);
+    }
+}
+
+TEST_F(RegionTest, SchemaClaimOnUnsetRegion)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    EXPECT_FALSE(region.schema().has_value());
+
+    auto info = make_schema("my/Twist", 1, 0x11, 0x22);
+    EXPECT_TRUE(region.try_claim_schema(info));
+
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "my/Twist");
+    EXPECT_EQ(got->version, 1u);
+    EXPECT_EQ(got->identity[0], 0x11);
+    EXPECT_EQ(got->layout[0],   0x22);
+}
+
+TEST_F(RegionTest, SchemaClaimRejectsSecondClaimant)
+{
+    auto cfg = default_cfg();
+    cfg.schema = make_schema("my/Pose", 1, 0xAA, 0xBB);
+
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    // Second process tries to claim a *different* schema — library just
+    // reports "not the claimant", it never throws.  User picks the policy.
+    auto other = make_schema("other/Pose", 2, 0x00, 0x00);
+    EXPECT_FALSE(region.try_claim_schema(other));
+
+    // Original schema is preserved.
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "my/Pose");
+    EXPECT_EQ(got->version, 1u);
+    EXPECT_EQ(got->identity[0], 0xAA);
+}
+
+TEST_F(RegionTest, SchemaReadersAcrossRegionHandles)
+{
+    // Mimic the cross-process flow: one handle claims, a second handle
+    // opens the same region and must observe the claim.
+    auto cfg = default_cfg();
+    auto r1  = kickmsg::SharedRegion::create(
+                   SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    EXPECT_TRUE(r1.try_claim_schema(make_schema("shared/Type", 7, 0x55, 0x66)));
+
+    auto r2 = kickmsg::SharedRegion::open(SHM_NAME);
+    auto got = r2.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "shared/Type");
+    EXPECT_EQ(got->version, 7u);
+}
+
+TEST_F(RegionTest, SchemaConcurrentClaimsOneWins)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    constexpr int N = 8;
+    std::atomic<int>          winner_count{0};
+    std::vector<std::thread>  threads;
+    std::atomic<bool>         start{false};
+
+    for (int i = 0; i < N; ++i)
+    {
+        threads.emplace_back([&, i]()
+        {
+            while (not start.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            auto info = make_schema("racer", static_cast<uint32_t>(i),
+                                    static_cast<uint8_t>(i),
+                                    static_cast<uint8_t>(i));
+            if (region.try_claim_schema(info))
+            {
+                winner_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    EXPECT_EQ(winner_count.load(), 1)
+        << "Exactly one try_claim_schema() must report success";
+
+    // All other racers observe the winner's schema through schema().
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "racer");
+}
+
+TEST_F(RegionTest, SchemaReaderDuringClaimingReturnsNullopt)
+{
+    // Invariant: schema() must return nullopt unless state == Set.
+    // We force the Claiming state directly (the real transition is too
+    // brief to observe deterministically from another thread) and confirm
+    // readers don't see torn payload bytes.
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto* h = region.header();
+
+    // Simulate a claim that reached Claiming but hasn't stored Set yet.
+    h->schema_state.store(kickmsg::schema::Claiming,
+                          std::memory_order_release);
+
+    EXPECT_FALSE(region.schema().has_value());
+
+    // A follow-up Set makes the payload visible.
+    auto info = make_schema("done/Type", 1, 0x01, 0x02);
+    std::memcpy(&h->schema_data, &info, sizeof(info));
+    h->schema_state.store(kickmsg::schema::Set, std::memory_order_release);
+
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "done/Type");
+}
+
+TEST_F(RegionTest, SchemaResetRecoversWedgedClaimingState)
+{
+    // Crash scenario: a claimant CAS'd Unset → Claiming and died before
+    // the release-store of Set.  Every try_claim_schema() caller will
+    // observe Claiming and return false after bounded yields.
+    // reset_schema_claim() is the operator-driven recovery.
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto* h = region.header();
+
+    // Wedge the slot in Claiming.
+    h->schema_state.store(kickmsg::schema::Claiming,
+                          std::memory_order_release);
+
+    // A fresh claim returns false (wedged, not its fault).
+    auto pending = make_schema("retry/Type", 1, 0x00, 0x00);
+    EXPECT_FALSE(region.try_claim_schema(pending));
+
+    // Operator confirms the original claimant is gone, resets the slot.
+    EXPECT_TRUE(region.reset_schema_claim());
+    // Second call is a no-op — state is already Unset.
+    EXPECT_FALSE(region.reset_schema_claim());
+
+    // Subsequent claim now succeeds.
+    auto recovered = make_schema("recovered/Type", 2, 0xEE, 0xFF);
+    EXPECT_TRUE(region.try_claim_schema(recovered));
+
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "recovered/Type");
+    EXPECT_EQ(got->version, 2u);
+}
+
+TEST_F(RegionTest, SchemaResetIsNoOpWhenNotClaiming)
+{
+    // reset_schema_claim must leave Unset and Set states untouched.
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    // Unset: no-op.
+    EXPECT_FALSE(region.reset_schema_claim());
+    EXPECT_FALSE(region.schema().has_value());
+
+    // Set: must not wipe a valid schema.
+    ASSERT_TRUE(region.try_claim_schema(
+                    make_schema("kept/Type", 1, 0xAB, 0xCD)));
+    EXPECT_FALSE(region.reset_schema_claim());
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "kept/Type");
+}
+
+TEST_F(RegionTest, SchemaCreateOrOpenIgnoresOpenerSchemaWhenCreatorHadNone)
+{
+    // Separation of concerns, open-branch path: if the creator leaves
+    // schema unset and a later opener passes cfg.schema, that schema is
+    // silently ignored (use try_claim_schema to publish it instead).
+    auto cfg = default_cfg();
+    // Note: cfg.schema intentionally left empty.
+    auto existing = kickmsg::SharedRegion::create(
+                        SHM_NAME, kickmsg::channel::PubSub, cfg, "creator");
+    ASSERT_FALSE(existing.schema().has_value());
+
+    auto opener_cfg = default_cfg();
+    opener_cfg.schema = make_schema("opener/Type", 1, 0x11, 0x22);
+
+    auto opened = kickmsg::SharedRegion::create_or_open(
+                      SHM_NAME, kickmsg::channel::PubSub, opener_cfg, "opener");
+
+    // Opener's cfg.schema was discarded — slot is still Unset.
+    EXPECT_FALSE(opened.schema().has_value());
+}
+
+TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
+{
+    // Separation of concerns: schema presence is orthogonal to channel
+    // geometry, so create_or_open() from a different Config::schema must
+    // NOT trip the config mismatch check.
+    auto cfg = default_cfg();
+    cfg.schema = make_schema("creator/Type", 1, 0xAA, 0xBB);
+
+    auto existing = kickmsg::SharedRegion::create(
+                        SHM_NAME, kickmsg::channel::PubSub, cfg, "creator");
+
+    auto other_cfg = default_cfg();
+    other_cfg.schema = make_schema("opener/Type", 2, 0xCC, 0xDD);
+
+    // Must succeed — geometry matches, schema differs but is ignored on open.
+    auto opened = kickmsg::SharedRegion::create_or_open(
+                      SHM_NAME, kickmsg::channel::PubSub, other_cfg, "opener");
+
+    // Opener observes the creator's schema, not its own — library doesn't
+    // overwrite or enforce anything.
+    auto got = opened.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "creator/Type");
 }

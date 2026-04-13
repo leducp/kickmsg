@@ -1,5 +1,7 @@
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 #ifdef _WIN32
 #include <process.h>
 #define getpid _getpid
@@ -73,6 +75,20 @@ namespace kickmsg
         h->created_at_ns     = static_cast<uint64_t>(kickmsg::since_epoch().count());
         h->creator_name_len  = creator_len;
         std::memcpy(header_creator_name(h), creator_name, creator_len);
+
+        // Optional payload schema: publish directly before the magic store.
+        // No claim state machine needed at creation because (a) we are the
+        // only writer — no concurrent claimant can race — and (b) the
+        // release-store of MAGIC below carries all preceding writes,
+        // including the memcpy into schema_data and this relaxed store of
+        // schema_state, across to any reader that acquire-loads MAGIC.
+        // The relaxed is therefore correct; do NOT "fix" it to release in
+        // isolation — MAGIC is the sole publication fence for this region.
+        if (cfg.schema.has_value())
+        {
+            std::memcpy(&h->schema_data, &*cfg.schema, sizeof(SchemaInfo));
+            h->schema_state.store(schema::Set, std::memory_order_relaxed);
+        }
 
         h->free_top = tagged_pack(0, INVALID_SLOT);
 
@@ -296,6 +312,72 @@ namespace kickmsg
         }
 
         return reset;
+    }
+
+    std::optional<SchemaInfo> SharedRegion::schema() const
+    {
+        auto const* h     = header();
+        uint32_t    state = h->schema_state.load(std::memory_order_acquire);
+        if (state != schema::Set)
+        {
+            // Unset or a claim is mid-write — no stable payload to return.
+            return std::nullopt;
+        }
+        SchemaInfo out;
+        std::memcpy(&out, &h->schema_data, sizeof(SchemaInfo));
+        return out;
+    }
+
+    bool SharedRegion::try_claim_schema(SchemaInfo const& info)
+    {
+        auto*    h        = header();
+        uint32_t expected = schema::Unset;
+
+        // Acq_rel on success: acquire so any prior claim's Set is visible on
+        // retry paths; release so our pre-CAS zeroing (none here) is ordered
+        // before subsequent writes to schema_data (still fine: Claiming is
+        // only visible once CAS wins, and the payload write happens-before
+        // the Set release-store below).
+        if (h->schema_state.compare_exchange_strong(
+                expected, schema::Claiming,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+        {
+            std::memcpy(&h->schema_data, &info, sizeof(SchemaInfo));
+            // Release: pairs with the acquire in schema() so a reader that
+            // observes Set sees the fully-written schema_data payload.
+            h->schema_state.store(schema::Set, std::memory_order_release);
+            return true;
+        }
+
+        // Someone else won the claim.  If they're mid-write, wait briefly
+        // for the state to settle at Set so a follow-up schema() read is
+        // meaningful — but bound the wait: a claimant that crashed between
+        // CAS→Claiming and store→Set leaves the slot wedged.  Operators
+        // recover such a wedge with reset_schema_claim().
+        constexpr int MAX_YIELDS = 1024;
+        for (int i = 0; i < MAX_YIELDS and expected == schema::Claiming; ++i)
+        {
+            std::this_thread::yield();
+            expected = h->schema_state.load(std::memory_order_acquire);
+        }
+        return false;
+    }
+
+    bool SharedRegion::reset_schema_claim()
+    {
+        // Force a wedged Claiming state back to Unset so a new claim can
+        // proceed.  Analogous to reset_retired_rings(): a deliberate
+        // post-crash action, NOT safe under live traffic.  Only call after
+        // confirming the original claimant is gone; otherwise a slow-but-
+        // alive writer could finish its memcpy into schema_data and then
+        // release-store Set, while a new claimant is concurrently using
+        // the slot — producing torn bytes.
+        uint32_t expected = schema::Claiming;
+        return header()->schema_state.compare_exchange_strong(
+            expected, schema::Unset,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed);
     }
 
     std::size_t SharedRegion::reclaim_orphaned_slots()

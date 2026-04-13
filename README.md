@@ -76,6 +76,28 @@ auto sample = sub.receive(100ms);
 // blocks via futex until data arrives or timeout
 ```
 
+### Optional payload schema descriptor
+
+```cpp
+// Bake a schema descriptor into the region at creation.
+kickmsg::SchemaInfo info{};
+info.identity = my_identity_hash();   // user-defined bytes
+info.layout   = my_layout_hash();     // user-defined bytes
+std::snprintf(info.name, sizeof(info.name), "my/Pose");
+info.version  = 2;
+
+kickmsg::channel::Config cfg;
+cfg.schema = info;
+auto region = kickmsg::SharedRegion::create("/pose_topic", kickmsg::channel::PubSub, cfg);
+
+// Any process can read it back and decide what to do on mismatch.
+auto schema = region.schema();
+if (schema and schema->version != 2) { /* user-defined policy */ }
+```
+
+The library stores the descriptor in the header but never interprets it — users
+choose how to compute identity/layout fingerprints and how to react to mismatches.
+
 ### Health diagnostics and crash recovery
 
 ```cpp

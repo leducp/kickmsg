@@ -116,6 +116,85 @@ TEST_F(NodeTest, MailboxPattern)
     EXPECT_EQ(std::string(static_cast<char const*>(msg->data()), msg->len()), reply);
 }
 
+// --- Schema descriptor through the Node API -------------------------------
+
+namespace
+{
+    kickmsg::SchemaInfo make_node_schema(char const* name, uint32_t version,
+                                         uint8_t identity_fill)
+    {
+        kickmsg::SchemaInfo s{};
+        std::fill(s.identity.begin(), s.identity.end(), identity_fill);
+        std::snprintf(s.name, sizeof(s.name), "%s", name);
+        s.version       = version;
+        s.identity_algo = 1;
+        return s;
+    }
+}
+
+TEST_F(NodeTest, TopicSchemaBakedViaAdvertise)
+{
+    track("/test_imu");
+
+    auto cfg = small_cfg();
+    cfg.schema = make_node_schema("app/Imu", 2, 0xAA);
+
+    kickmsg::Node pub_node("driver", "test");
+    auto pub = pub_node.advertise("imu", cfg);
+
+    kickmsg::Node sub_node("logger", "test");
+    auto sub = sub_node.subscribe("imu");
+
+    auto got = sub_node.topic_schema("imu");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "app/Imu");
+    EXPECT_EQ(got->version, 2u);
+    EXPECT_EQ(got->identity[0], 0xAA);
+}
+
+TEST_F(NodeTest, TopicSchemaReturnsNulloptForUnknownTopic)
+{
+    // Guard on find_region: unknown topic produces nullopt, not a throw
+    // or segfault.  Also covers the default-constructed SchemaInfo path.
+    kickmsg::Node node("orphan", "test");
+    EXPECT_FALSE(node.topic_schema("never_joined").has_value());
+}
+
+TEST_F(NodeTest, TryClaimTopicSchemaLateBinding)
+{
+    // Late-arrival flow: subscriber creates the region, publisher arrives
+    // and claims the schema via the Node API.
+    track("/test_telemetry");
+
+    auto cfg = small_cfg();
+
+    kickmsg::Node listener("listener", "test");
+    auto sub = listener.subscribe_or_create("telemetry", cfg);
+    EXPECT_FALSE(listener.topic_schema("telemetry").has_value());
+
+    kickmsg::Node driver("driver", "test");
+    auto pub = driver.advertise_or_join("telemetry", cfg);
+
+    auto info = make_node_schema("app/Telemetry", 1, 0xCC);
+    EXPECT_TRUE(driver.try_claim_topic_schema("telemetry", info));
+
+    auto observed = listener.topic_schema("telemetry");
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_STREQ(observed->name, "app/Telemetry");
+
+    // Second claimant on the same topic is rejected; first claim stands.
+    auto other = make_node_schema("other/Type", 99, 0xDD);
+    EXPECT_FALSE(driver.try_claim_topic_schema("telemetry", other));
+    EXPECT_STREQ(driver.topic_schema("telemetry")->name, "app/Telemetry");
+}
+
+TEST_F(NodeTest, TryClaimTopicSchemaUnknownTopicIsFalse)
+{
+    kickmsg::Node node("orphan", "test");
+    auto info = make_node_schema("stray/Type", 1, 0x00);
+    EXPECT_FALSE(node.try_claim_topic_schema("never_joined", info));
+}
+
 TEST_F(NodeTest, MailboxMultipleWriters)
 {
     track("/test_owner_mbx_inbox");
