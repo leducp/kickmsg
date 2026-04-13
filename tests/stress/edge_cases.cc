@@ -61,7 +61,8 @@ bool run_single_slot_ring()
 
     bool ok = true;
 
-    std::printf("  Elapsed: %ld ms, total published: %" PRIu64 "\n", elapsed_ms, total_sent);
+    std::printf("  Elapsed: %" PRId64 " ms, total published: %" PRIu64 "\n",
+                elapsed_ms, total_sent);
 
     for (auto const& r : sub_results)
     {

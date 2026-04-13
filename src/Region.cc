@@ -14,49 +14,67 @@
 
 namespace kickmsg
 {
-    SharedRegion SharedRegion::create(char const* name, channel::Type type,
-                                     channel::Config const& cfg,
-                                     char const* creator_name)
+    namespace
     {
-        if (type != channel::PubSub and type != channel::Broadcast)
+        void validate_config(channel::Type type, channel::Config const& cfg)
         {
-            throw std::runtime_error("Unsupported channel type");
+            if (type != channel::PubSub and type != channel::Broadcast)
+            {
+                throw std::runtime_error("Unsupported channel type");
+            }
+            if (not is_power_of_two(cfg.sub_ring_capacity))
+            {
+                throw std::runtime_error("sub_ring_capacity must be a power of 2");
+            }
+            if (cfg.pool_size == 0)
+            {
+                throw std::runtime_error("pool_size must be > 0");
+            }
+            if (cfg.max_subscribers == 0)
+            {
+                throw std::runtime_error("max_subscribers must be > 0");
+            }
+            if (cfg.max_payload_size == 0)
+            {
+                throw std::runtime_error("max_payload_size must be > 0");
+            }
         }
-        if (not is_power_of_two(cfg.sub_ring_capacity))
+
+        struct RegionLayout
         {
-            throw std::runtime_error("sub_ring_capacity must be a power of 2");
-        }
-        if (cfg.pool_size == 0)
+            std::size_t header_size;
+            std::size_t ring_stride;
+            std::size_t slot_stride;
+            std::size_t sub_rings_offset;
+            std::size_t pool_offset;
+            std::size_t total_size;
+            uint16_t    creator_len;
+        };
+
+        RegionLayout compute_layout(channel::Config const& cfg, char const* creator_name)
         {
-            throw std::runtime_error("pool_size must be > 0");
+            RegionLayout layout;
+            layout.creator_len      = static_cast<uint16_t>(std::strlen(creator_name));
+            layout.header_size      = align_up(sizeof(Header) + layout.creator_len, CACHE_LINE);
+            layout.ring_stride      = align_up(
+                sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
+            layout.slot_stride      = align_up(sizeof(SlotHeader) + cfg.max_payload_size, CACHE_LINE);
+            layout.sub_rings_offset = layout.header_size;
+            layout.pool_offset      = layout.sub_rings_offset + cfg.max_subscribers * layout.ring_stride;
+            layout.total_size       = layout.pool_offset + cfg.pool_size * layout.slot_stride;
+            return layout;
         }
-        if (cfg.max_subscribers == 0)
-        {
-            throw std::runtime_error("max_subscribers must be > 0");
-        }
-        if (cfg.max_payload_size == 0)
-        {
-            throw std::runtime_error("max_payload_size must be > 0");
-        }
+    }
 
-        uint16_t    creator_len     = static_cast<uint16_t>(std::strlen(creator_name));
-        std::size_t header_size     = align_up(sizeof(Header) + creator_len, CACHE_LINE);
+    void SharedRegion::stamp_new_region(channel::Type type, channel::Config const& cfg,
+                                        char const* creator_name, std::size_t total_size,
+                                        std::size_t sub_rings_offset, std::size_t pool_offset,
+                                        std::size_t ring_stride,     std::size_t slot_stride,
+                                        uint16_t    creator_len)
+    {
+        std::memset(base(), 0, total_size);
 
-        std::size_t ring_stride     = align_up(
-            sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
-        std::size_t slot_stride     = align_up(sizeof(SlotHeader) + cfg.max_payload_size, CACHE_LINE);
-
-        std::size_t sub_rings_offset = header_size;
-        std::size_t pool_offset      = sub_rings_offset + cfg.max_subscribers * ring_stride;
-        std::size_t total_size       = pool_offset + cfg.pool_size * slot_stride;
-
-        SharedRegion region;
-        region.name_ = name;
-        region.shm_.create(name, total_size);
-
-        std::memset(region.base(), 0, total_size);
-
-        auto* h = region.header();
+        auto* h = header();
         h->version           = VERSION;
         h->channel_type      = type;
         h->total_size        = total_size;
@@ -94,14 +112,14 @@ namespace kickmsg
 
         for (uint32_t i = 0; i < cfg.pool_size; ++i)
         {
-            auto* slot = slot_at(region.base(), h, i);
+            auto* slot = slot_at(base(), h, i);
             slot->refcount = 0;
             treiber_push(h->free_top, slot, i);
         }
 
         for (uint32_t i = 0; i < cfg.max_subscribers; ++i)
         {
-            auto* ring = sub_ring_at(region.base(), h, i);
+            auto* ring = sub_ring_at(base(), h, i);
             ring->state_flight = ring::make_packed(ring::Free);
             ring->write_pos    = 0;
             ring->has_waiter   = 0;
@@ -110,6 +128,22 @@ namespace kickmsg
         // Write magic LAST with release: create_or_open() polls magic with
         // acquire, so all preceding init stores are visible once magic == MAGIC.
         h->magic.store(MAGIC, std::memory_order_release);
+    }
+
+    SharedRegion SharedRegion::create(char const* name, channel::Type type,
+                                     channel::Config const& cfg,
+                                     char const* creator_name)
+    {
+        validate_config(type, cfg);
+        RegionLayout layout = compute_layout(cfg, creator_name);
+
+        SharedRegion region;
+        region.name_ = name;
+        region.shm_.create(name, layout.total_size);
+        region.stamp_new_region(type, cfg, creator_name,
+                                layout.total_size, layout.sub_rings_offset,
+                                layout.pool_offset, layout.ring_stride,
+                                layout.slot_stride, layout.creator_len);
         return region;
     }
 
@@ -136,21 +170,27 @@ namespace kickmsg
                                               channel::Config const& cfg,
                                               char const* creator_name)
     {
-        uint16_t    creator_len     = static_cast<uint16_t>(std::strlen(creator_name));
-        std::size_t header_size     = align_up(sizeof(Header) + creator_len, CACHE_LINE);
-        std::size_t ring_stride     = align_up(
-            sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
-        std::size_t slot_stride     = align_up(sizeof(SlotHeader) + cfg.max_payload_size, CACHE_LINE);
-        std::size_t sub_rings_offset = header_size;
-        std::size_t pool_offset      = sub_rings_offset + cfg.max_subscribers * ring_stride;
-        std::size_t total_size       = pool_offset + cfg.pool_size * slot_stride;
+        validate_config(type, cfg);
+        RegionLayout layout = compute_layout(cfg, creator_name);
 
-        SharedMemory probe;
-        if (probe.try_create(name, total_size))
+        // Try to be the creator.  On success, try_create leaves the
+        // SharedMemory fully mapped — we stamp the header directly rather
+        // than closing and re-entering SharedMemory::create, which would
+        // require either O_TRUNC (rejected on Darwin) or shm_unlink +
+        // recreate (introduces a tiny race window where a concurrent
+        // caller could see the name missing or point to a different
+        // object than the one they initially observed).
+        SharedRegion region;
+        region.name_ = name;
+        if (region.shm_.try_create(name, layout.total_size))
         {
-            probe.close();
-            return create(name, type, cfg, creator_name);
+            region.stamp_new_region(type, cfg, creator_name,
+                                    layout.total_size, layout.sub_rings_offset,
+                                    layout.pool_offset, layout.ring_stride,
+                                    layout.slot_stride, layout.creator_len);
+            return region;
         }
+        region.name_.clear();  // we didn't create; fall through to open loop
 
         uint64_t expected_hash = compute_config_hash(type, cfg);
 

@@ -93,17 +93,22 @@ namespace kickmsg
 
     bool SharedMemory::try_create(std::string const& name, std::size_t size)
     {
-        int fd = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
-        if (fd < 0)
+        // Keep the fd and do the full setup (ftruncate + mmap) inline.
+        // We must NOT close the fd and call create() — create() would
+        // shm_unlink the name (to sidestep Darwin's O_TRUNC quirk) and
+        // recreate a different object, racing any concurrent caller that
+        // observed the original name between our close and create's CAS.
+        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
+        if (fd_ < 0)
         {
             if (errno == EEXIST)
             {
+                fd_ = INVALID_SHM_HANDLE;
                 return false;
             }
             throw_system_error("SharedMemory: shm_open(try_create)");
         }
-        ::close(fd);
-        create(name, size);
+        map(size);
         return true;
     }
 

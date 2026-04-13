@@ -25,7 +25,16 @@ namespace kickmsg
     constexpr uint64_t    LOCKED_SEQUENCE = UINT64_MAX;
     constexpr std::size_t CACHE_LINE      = 64;
 
-    constexpr microseconds DEFAULT_COMMIT_TIMEOUT = 100ms;
+    // A healthy commit (memcpy + atomic release-store) finishes in a few
+    // microseconds; even under moderate CAS contention it stays well under
+    // a millisecond.  10 ms is therefore ~1000× a normal commit — enough
+    // to absorb routine preemption without falsely evicting a live
+    // publisher, while still recovering from a real crash fast enough to
+    // avoid stalling subscribers.  Applications running under severe
+    // oversubscription (threads ≫ cores) may want to raise this; hard
+    // real-time setups may want to lower it.  Override via
+    // channel::Config::commit_timeout.
+    constexpr microseconds DEFAULT_COMMIT_TIMEOUT = 10ms;
 
     /// Optional payload schema descriptor.
     ///

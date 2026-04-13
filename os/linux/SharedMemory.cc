@@ -79,17 +79,21 @@ namespace kickmsg
 
     bool SharedMemory::try_create(std::string const& name, std::size_t size)
     {
-        int fd = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
-        if (fd < 0)
+        // Keep the fd and do the full setup (ftruncate + mmap) inline.
+        // SharedRegion::create_or_open consumes the resulting mapping
+        // directly — there's no reason to close here and re-enter create(),
+        // and the old round-trip pattern caused a subtle race on Darwin.
+        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
+        if (fd_ < 0)
         {
             if (errno == EEXIST)
             {
+                fd_ = INVALID_SHM_HANDLE;
                 return false;
             }
             throw_system_error("SharedMemory.cc: shm_open(try_create)");
         }
-        ::close(fd);
-        create(name, size);
+        map(size);
         return true;
     }
 

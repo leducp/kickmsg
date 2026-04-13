@@ -175,6 +175,8 @@ target_link_libraries(my_app PRIVATE kickmsg)
 | macOS | `shm_open` / `mmap` | `__ulock_wait` / `__ulock_wake` |
 | Windows | `CreateFileMapping` / `MapViewOfFile` | `WaitOnAddress` / `WakeByAddressAll` |
 
+Actively validated on Linux x86-64, Linux ARM64 (Raspberry Pi 4B, 12 h continuous stress), and Darwin ARM64 (Apple Silicon) via `scripts/validate.sh`.
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design: shared-memory layout, concurrency model, publish/subscribe flows, crash resilience, garbage collection, and ABA safety analysis.

@@ -148,6 +148,16 @@ namespace kickmsg
         std::size_t reclaim_orphaned_slots();
 
     private:
+        /// Stamp channel geometry, creator metadata, optional schema, and
+        /// finally MAGIC into an already-mapped region.  Shared between
+        /// create() and create_or_open()'s creator branch so the two paths
+        /// never diverge on layout or ordering.
+        void stamp_new_region(channel::Type type, channel::Config const& cfg,
+                              char const* creator_name, std::size_t total_size,
+                              std::size_t sub_rings_offset, std::size_t pool_offset,
+                              std::size_t ring_stride,     std::size_t slot_stride,
+                              uint16_t    creator_len);
+
         SharedMemory shm_;
         std::string  name_;
     };

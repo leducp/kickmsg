@@ -77,7 +77,8 @@ bool run_stress_test(TestConfig const& tc)
     }
     std::printf("  Config: %d pub, %d sub, %s\n",
                 tc.num_publishers, tc.num_subscribers, mode_label);
-    std::printf("  Elapsed: %ld ms, total published: %" PRIu64 "\n", elapsed_ms, total_sent);
+    std::printf("  Elapsed: %" PRId64 " ms, total published: %" PRIu64 "\n",
+                elapsed_ms, total_sent);
     std::printf("  %-6s %10s %10s %10s %10s %10s\n",
                 "sub", "received", "lost", "corrupt", "bad_pid", "reorder");
 
