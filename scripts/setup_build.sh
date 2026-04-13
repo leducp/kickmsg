@@ -101,25 +101,24 @@ load_buildconfig
 
 if [ -f "$CONFIG_FILE" ]; then
     step "Reading build configuration"
-    for key in $(echo "${!CONFIG[@]}" | tr ' ' '\n' | sort); do
-        info "  $key = ${CONFIG[$key]}"
+    for key in "${OPT_NAMES[@]}"; do
+        info "  $key = $(config_get "$key")"
     done
 else
     info "No .buildconfig found, using defaults (run scripts/configure.sh to customize)"
 fi
 
-# Map .buildconfig values to Conan -o flags
+# Map .buildconfig values to Conan -o flags / CMake -D flags.
 to_conan_bool() { [[ "$1" == "ON" ]] && echo "True" || echo "False"; }
 
 CONAN_OPTIONS=""
-for key in "${!OPT_CONAN_FLAGS[@]}"; do
-    CONAN_OPTIONS+=" -o &:${OPT_CONAN_FLAGS[$key]}=$(to_conan_bool "${CONFIG[$key]}")"
-done
-
-# Map .buildconfig values to CMake -D flags
 CMAKE_OPTIONS=""
-for key in "${!OPT_CMAKE_FLAGS[@]}"; do
-    CMAKE_OPTIONS+=" -D${OPT_CMAKE_FLAGS[$key]}=${CONFIG[$key]}"
+for key in "${OPT_NAMES[@]}"; do
+    value=$(config_get "$key")
+    cmake_flag=$(opt_cmake_flag "$key")
+    conan_flag=$(opt_conan_flag "$key")
+    [ -n "$cmake_flag" ] && CMAKE_OPTIONS+=" -D${cmake_flag}=${value}"
+    [ -n "$conan_flag" ] && CONAN_OPTIONS+=" -o &:${conan_flag}=$(to_conan_bool "$value")"
 done
 
 # Compiler detection & profile generation
@@ -189,12 +188,11 @@ if [ -n "$CROSS_TARGET" ]; then
       -e "s|@SYSTEM_NAME@|${SYSTEM_NAME}|g" \
       -e "s|@BINARY_PATH_CC@|$(command -v $CROSS_CC)|g" \
       -e "s|@BINARY_PATH_CXX@|$(command -v $CROSS_CXX)|g" \
+      -e "s|@ARCH_FLAGS@|${CROSS_ARCH_FLAGS}|g" \
       "$TEMPLATE_CMAKE_TOOLCHAIN" > "$OUTPUT_CMAKE_TOOLCHAIN"
 
     cat >> "$OUTPUT_CMAKE_TOOLCHAIN" <<CROSS_EOF
 set(CMAKE_SYSTEM_PROCESSOR ${SYSTEM_PROCESSOR})
-set(CMAKE_C_FLAGS_INIT "${CROSS_ARCH_FLAGS}")
-set(CMAKE_CXX_FLAGS_INIT "${CROSS_ARCH_FLAGS}")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
@@ -204,42 +202,56 @@ CROSS_EOF
     CONAN_PROFILE_ARGS="-pr:h $OUTPUT_CONAN_PROFILE -pr:b $OUTPUT_BUILD_PROFILE"
 
 else
+    # ── Native build ────────────────────────────────────────────────────
     step "Detecting native compiler"
     source "$PROJECT_DIR/tools/setup/detect_compiler.sh"
 
-    detect_conan_arch() {
-        local machine
-        machine=$(uname -m)
-        case "$machine" in
-            x86_64)             echo "x86_64" ;;
-            aarch64|arm64)      echo "armv8" ;;
-            armv7l)             echo "armv7hf" ;;
-            i686|i386)          echo "x86" ;;
-            *)
-                error "Unknown architecture: $machine"
-                exit 1
-                ;;
-        esac
-    }
+    conan profile detect --force > /dev/null 2>&1
+    ARCH_NAME=$(conan profile show -cx host | grep "arch=" | cut -d'=' -f2)
 
-    ARCH_NAME=$(detect_conan_arch)
-    info "Architecture: $(uname -m) -> Conan arch: $ARCH_NAME"
+    info "Architecture for Conan: $ARCH_NAME"
+
+    OS=$(uname -s)
+    if [[ "$OS" == "Darwin" ]]; then
+        OS_NAME="Macos"
+        COMPILER_NAME="apple-clang"
+        LIBCXX_NAME="libc++"
+        SYSTEM_NAME="Darwin"
+        ARCH_NAME="armv8\|x86_64"
+    else
+        OS_NAME="Linux"
+        COMPILER_NAME="gcc"
+        LIBCXX_NAME="libstdc++11"
+        SYSTEM_NAME="Linux"
+    fi
+
+    ARCH_FLAGS=""
 
     sed \
-      -e "s|@SYSTEM_NAME@|Linux|g" \
+      -e "s|@SYSTEM_NAME@|${SYSTEM_NAME}|g" \
       -e "s|@BINARY_PATH_CC@|$(command -v $GREATEST_CC)|g" \
       -e "s|@BINARY_PATH_CXX@|$(command -v $GREATEST_CXX)|g" \
+      -e "s|@ARCH_FLAGS@|${ARCH_FLAGS}|g" \
       "$TEMPLATE_CMAKE_TOOLCHAIN" > "$OUTPUT_CMAKE_TOOLCHAIN"
 
     sed \
-      -e "s|@OS_NAME@|Linux|g" \
+      -e "s|@OS_NAME@|${OS_NAME}|g" \
       -e "s|@ARCH_NAME@|${ARCH_NAME}|g" \
-      -e "s|@COMPILER_NAME@|gcc|g" \
-      -e "s|@LIBCXX_NAME@|libstdc++11|g" \
+      -e "s|@COMPILER_NAME@|${COMPILER_NAME}|g" \
+      -e "s|@LIBCXX_NAME@|${LIBCXX_NAME}|g" \
       -e "s|@MAJOR_VERSION@|${GREATEST_VERSION}|g" \
       -e "s|@BINARY_PATH_CC@|$(command -v $GREATEST_CC)|g" \
       -e "s|@BINARY_PATH_CXX@|$(command -v $GREATEST_CXX)|g" \
       "$TEMPLATE_CONAN_PROFILE" > "$OUTPUT_CONAN_PROFILE"
+
+    if [[ "$OS" == "Darwin" ]]; then
+        echo "OSX_ARCH_VARIANTS=x86_64;arm64" >> "$OUTPUT_CONAN_PROFILE"
+
+        echo "" >> "$OUTPUT_CONAN_PROFILE"
+        echo "[platform_tool_requires]" >> "$OUTPUT_CONAN_PROFILE"
+        
+    fi
+    cat "$OUTPUT_CONAN_PROFILE"
 
     CONAN_PROFILE_ARGS="-pr $OUTPUT_CONAN_PROFILE -pr:b $OUTPUT_CONAN_PROFILE"
 fi
