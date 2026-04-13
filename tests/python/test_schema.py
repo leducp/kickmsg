@@ -52,9 +52,9 @@ def test_schema_diff_detects_mismatch(shm_name, small_cfg):
     assert got is not None
 
     d = kickmsg.schema.diff(got, expected_v2)
-    assert d & int(kickmsg.schema.Diff.Version)
-    assert not (d & int(kickmsg.schema.Diff.Identity))
-    assert not (d & int(kickmsg.schema.Diff.Name))
+    assert d & kickmsg.schema.Diff.Version
+    assert not (d & kickmsg.schema.Diff.Identity)
+    assert not (d & kickmsg.schema.Diff.Name)
 
 
 def test_schema_reset_recovers_wedged_claiming(shm_name, small_cfg):

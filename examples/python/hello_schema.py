@@ -50,7 +50,7 @@ def main() -> int:
     got = bad.topic_schema(topic)
     expected_v1 = make_imu_schema(version=1)
     d = kickmsg.schema.diff(got, expected_v1)
-    if d & int(kickmsg.schema.Diff.Version):
+    if d & kickmsg.schema.Diff.Version:
         print("[bad_sub]   version mismatch (observed v%d, expected v1) — refusing"
               % got.version)
 

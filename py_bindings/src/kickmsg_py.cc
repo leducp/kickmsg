@@ -8,10 +8,10 @@
 ///     SchemaInfo             — payload schema descriptor
 ///     HealthReport           — SharedRegion::diagnose() result
 ///     SharedRegion           — factory methods + schema/health/repair
-///     Publisher              — send(bytes) and allocate()/publish() zero-copy
+///     Publisher              — send(bytes) + allocate() → AllocatedSlot
+///     AllocatedSlot          — writable zero-copy handle + .publish()
 ///     Subscriber             — try_receive / receive (GIL release) / *_view
-///     SampleRef              — copy-based sample (bytes)
-///     SampleView             — zero-copy sample (buffer protocol)
+///     SampleView             — read-only zero-copy sample (buffer protocol)
 ///     BroadcastHandle        — NamedTuple-like (pub, sub)
 ///     Node                   — high-level topic / broadcast / mailbox
 ///     schema (submodule)
@@ -21,16 +21,40 @@
 ///       fnv1a_64(data[, seed])
 ///       identity_from_fnv1a(descriptor)
 ///
-/// Zero-copy contract:
-///   - Publisher.allocate(len) returns a writable memoryview that points
-///     directly into a shared-memory slot.  The user fills it (memcpy,
-///     numpy.copyto, cv2.imencode, etc.), then calls Publisher.publish().
-///     The memoryview is valid only between allocate() and publish().
-///   - SampleView supports the buffer protocol as a read-only memoryview
-///     pointing into the same shared-memory slot.  The slot stays pinned
-///     while the SampleView is alive; release the pin by deleting the
-///     SampleView or exiting its `with` block.
+/// Zero-copy contract (lifetime-safe via the Python buffer protocol):
+///
+///   slot = pub.allocate(N)      → AllocatedSlot.  memoryview(slot) is a
+///                                 writable view into the SHM slot.  The
+///                                 memoryview pins the slot, which pins
+///                                 the Publisher, which pins the mmap —
+///                                 so retained memoryviews stay valid
+///                                 (at the mmap level) as long as Python
+///                                 holds them.
+///   slot.publish()              → commits.  NEW memoryview(slot) after
+///                                 this raises BufferError.  Memoryviews
+///                                 obtained BEFORE publish remain pointer-
+///                                 valid but writing through them after
+///                                 publish would corrupt in-flight
+///                                 subscribers — user contract: don't.
+///
+///   view = sub.try_receive_view() → SampleView.  memoryview(view) is a
+///                                 read-only view into the SHM slot.  The
+///                                 memoryview pins the SampleView, which
+///                                 pins the slot's refcount and the mmap.
+///   view.release()              → drops the pin.  NEW memoryview(view)
+///                                 after this raises BufferError.
+///
+///   Equivalent context-manager form (preferred for short scopes):
+///       with sub.try_receive_view() as view:
+///           mv = memoryview(view)
+///           ... use mv ...
+///       # pin released on block exit, even on exception
+///
+/// The pinning is enforced by Py_buffer::obj = self + Py_INCREF inside
+/// the buffer-protocol getbuffer slot, so it works with numpy.asarray(),
+/// torch.frombuffer(), and any other consumer that respects the protocol.
 
+#include <cerrno>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -50,33 +74,121 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
+namespace kickmsg
+{
+    // Python-only wrapper around a Publisher reservation.  Holds the slot
+    // pointer + length returned by Publisher::allocate(), exposes the
+    // writable buffer protocol so `memoryview(slot)` points directly into
+    // the shared-memory slot (zero-copy), and has a .publish() method
+    // that commits via the Publisher.
+    //
+    // Lifetime: the Py_buffer obtained through buffer protocol pins this
+    // AllocatedSlot alive (view->obj = self; Py_INCREF), which in turn
+    // pins the Publisher (via nb::keep_alive<1, 2> on the constructor),
+    // which pins the SharedRegion mmap.  A memoryview retained past
+    // `.publish()` stays technically valid as a pointer — but any NEW
+    // memoryview(slot) after publish is refused with BufferError so
+    // accidental reuse is caught.
+    struct PyAllocatedSlot
+    {
+        Publisher*  publisher;
+        void*       ptr;
+        std::size_t len;
+        bool        published;
+
+        PyAllocatedSlot(Publisher& p, void* data, std::size_t n)
+            : publisher{&p}, ptr{data}, len{n}, published{false}
+        {
+        }
+    };
+}
+
 namespace
 {
-    // Helper: build a read-only memoryview over raw bytes (no copy).
-    nb::object memview_readonly(void const* ptr, std::size_t len)
+    // Buffer protocol for Subscriber::SampleView (read-only zero-copy).
+    // Sets view->obj = self + Py_INCREF so the resulting memoryview pins
+    // the SampleView alive, which transitively pins the slot refcount
+    // and the mmap.
+    int sv_getbuffer(PyObject* self, Py_buffer* view, int /*flags*/) noexcept
     {
-        PyObject* obj = PyMemoryView_FromMemory(
-            reinterpret_cast<char*>(const_cast<void*>(ptr)),
-            static_cast<Py_ssize_t>(len), PyBUF_READ);
-        if (obj == nullptr)
+        using SV = kickmsg::Subscriber::SampleView;
+        auto* sv = nb::inst_ptr<SV>(nb::handle(self));
+
+        if (not sv->valid())
         {
-            throw nb::python_error();
+            PyErr_SetString(PyExc_BufferError,
+                "SampleView is no longer valid (pin already released)");
+            view->obj = nullptr;
+            return -1;
         }
-        return nb::steal(obj);
+
+        view->buf        = const_cast<void*>(sv->data());
+        view->obj        = self;
+        Py_INCREF(self);
+        view->len        = static_cast<Py_ssize_t>(sv->len());
+        view->itemsize   = 1;
+        view->readonly   = 1;
+        view->ndim       = 1;
+        view->format     = nullptr;          // defaults to "B" (raw bytes)
+        view->shape      = &view->len;       // borrow: lives in the Py_buffer
+        view->strides    = &view->itemsize;
+        view->suboffsets = nullptr;
+        view->internal   = nullptr;
+        return 0;
     }
 
-    // Helper: build a writable memoryview over raw bytes (no copy).
-    nb::object memview_writable(void* ptr, std::size_t len)
+    void sv_releasebuffer(PyObject* /*self*/, Py_buffer* /*view*/) noexcept
     {
-        PyObject* obj = PyMemoryView_FromMemory(
-            reinterpret_cast<char*>(ptr),
-            static_cast<Py_ssize_t>(len), PyBUF_WRITE);
-        if (obj == nullptr)
-        {
-            throw nb::python_error();
-        }
-        return nb::steal(obj);
+        // Nothing to free: shape/strides borrow from the Py_buffer itself,
+        // and Py_DECREF(view->obj) is handled by CPython's memoryview.
     }
+
+    PyType_Slot sv_slots[] = {
+        { Py_bf_getbuffer,     reinterpret_cast<void*>(sv_getbuffer)     },
+        { Py_bf_releasebuffer, reinterpret_cast<void*>(sv_releasebuffer) },
+        { 0, nullptr }
+    };
+
+    // Buffer protocol for PyAllocatedSlot (writable zero-copy).  Refuses
+    // new buffer requests once .publish() has been called so stale writes
+    // don't corrupt messages that are already in flight to subscribers.
+    int as_getbuffer(PyObject* self, Py_buffer* view, int /*flags*/) noexcept
+    {
+        auto* slot = nb::inst_ptr<kickmsg::PyAllocatedSlot>(nb::handle(self));
+
+        if (slot->published)
+        {
+            PyErr_SetString(PyExc_BufferError,
+                "AllocatedSlot has already been published; its buffer is "
+                "no longer writable");
+            view->obj = nullptr;
+            return -1;
+        }
+
+        view->buf        = slot->ptr;
+        view->obj        = self;
+        Py_INCREF(self);
+        view->len        = static_cast<Py_ssize_t>(slot->len);
+        view->itemsize   = 1;
+        view->readonly   = 0;                // writable
+        view->ndim       = 1;
+        view->format     = nullptr;
+        view->shape      = &view->len;
+        view->strides    = &view->itemsize;
+        view->suboffsets = nullptr;
+        view->internal   = nullptr;
+        return 0;
+    }
+
+    void as_releasebuffer(PyObject* /*self*/, Py_buffer* /*view*/) noexcept
+    {
+    }
+
+    PyType_Slot as_slots[] = {
+        { Py_bf_getbuffer,     reinterpret_cast<void*>(as_getbuffer)     },
+        { Py_bf_releasebuffer, reinterpret_cast<void*>(as_releasebuffer) },
+        { 0, nullptr }
+    };
 
     // Convert SchemaInfo.name (fixed-size NUL-terminated char array) to string.
     std::string schema_name_str(kickmsg::SchemaInfo const& s)
@@ -135,7 +247,7 @@ namespace kickmsg
                 {
                     if (b.size() != s.identity.size())
                     {
-                        throw std::runtime_error(
+                        throw nb::value_error(
                             "SchemaInfo.identity must be exactly 64 bytes");
                     }
                     std::memcpy(s.identity.data(), b.c_str(), s.identity.size());
@@ -148,7 +260,7 @@ namespace kickmsg
                 {
                     if (b.size() != s.layout.size())
                     {
-                        throw std::runtime_error(
+                        throw nb::value_error(
                             "SchemaInfo.layout must be exactly 64 bytes");
                     }
                     std::memcpy(s.layout.data(), b.c_str(), s.layout.size());
@@ -238,9 +350,9 @@ namespace kickmsg
                 { return SharedRegion::create_or_open(name, type, cfg, creator.c_str()); },
                 "name"_a, "type"_a, "cfg"_a, "creator"_a = std::string{""},
                 nb::rv_policy::move)
-            .def("name",          &SharedRegion::name)
-            .def("channel_type",  &SharedRegion::channel_type)
-            .def("schema",        &SharedRegion::schema)
+            .def_prop_ro("name",         &SharedRegion::name)
+            .def_prop_ro("channel_type", &SharedRegion::channel_type)
+            .def("schema",               &SharedRegion::schema)
             .def("try_claim_schema",   &SharedRegion::try_claim_schema,   "info"_a)
             .def("reset_schema_claim", &SharedRegion::reset_schema_claim)
             .def("diagnose",               &SharedRegion::diagnose)
@@ -252,65 +364,100 @@ namespace kickmsg
         m.def("unlink_shm", [](std::string const& name) { SharedMemory::unlink(name); },
               "name"_a, "Unlink a shared-memory entry by name (no-op if absent).");
 
-        // -------------------------------------------------------------------
-        // SampleRef — byte-copy sample.
-        // Returns a bytes copy of the payload (the buffer is subscriber-local
-        // and reused across try_receive() calls, so copying out is the only
-        // way to keep the bytes beyond the next receive).
-        // -------------------------------------------------------------------
-
-        nb::class_<Subscriber::SampleRef>(m, "SampleRef")
-            .def("data",
-                [](Subscriber::SampleRef const& s) -> nb::bytes
-                {
-                    return nb::bytes(reinterpret_cast<char const*>(s.data()),
-                                     s.len());
-                },
-                "Return the payload as a bytes object (copies out of the "
-                "subscriber-local buffer).")
-            .def("len",      &Subscriber::SampleRef::len)
-            .def("ring_pos", &Subscriber::SampleRef::ring_pos);
+        // SampleRef (the C++ byte-copy sample) is not bound directly —
+        // try_receive() / receive() auto-convert it to `bytes` at the
+        // Python boundary.  Users who want ring-position information
+        // can use try_receive_view() / receive_view() which return
+        // SampleView (bound below).
 
         // -------------------------------------------------------------------
         // SampleView — zero-copy, pins the slot.
-        // Buffer protocol via memoryview(view).  The view holds a refcount
-        // pin on the slot; the pin is released when the view is destroyed.
+        //
+        // Supports the Python buffer protocol: `memoryview(view)` returns
+        // a read-only memoryview pointing directly at shared memory (no
+        // copy).  The memoryview pins the SampleView alive — so retaining
+        // a memoryview beyond the SampleView's Python reference keeps the
+        // slot pinned and the mmap valid until the memoryview is released.
+        // That makes the zero-copy path lifetime-safe by construction.
         // -------------------------------------------------------------------
 
-        nb::class_<Subscriber::SampleView>(m, "SampleView")
-            .def("data",
-                [](Subscriber::SampleView const& v) -> nb::object
-                {
-                    if (not v.valid())
-                    {
-                        return nb::none();
-                    }
-                    return memview_readonly(v.data(), v.len());
-                },
-                "Return a read-only memoryview pointing directly at the "
-                "pinned shared-memory slot (zero-copy).  Valid while this "
-                "SampleView is alive.")
-            .def("len",      &Subscriber::SampleView::len)
-            .def("ring_pos", &Subscriber::SampleView::ring_pos)
-            .def("valid",    &Subscriber::SampleView::valid)
+        nb::class_<Subscriber::SampleView>(m, "SampleView",
+            nb::type_slots(sv_slots))
+            // __len__ so `len(view)` works; ring_pos / valid as properties
+            // (no-arg accessors, Pythonic).
+            .def("__len__",
+                [](Subscriber::SampleView const& v) -> std::size_t
+                { return v.len(); })
+            .def_prop_ro("ring_pos", &Subscriber::SampleView::ring_pos)
+            .def_prop_ro("valid",    &Subscriber::SampleView::valid)
             .def("release",
                 [](Subscriber::SampleView& v)
                 {
-                    // Destroy-in-place by move-assigning a default-constructed
-                    // view: the release() private helper fires in the
-                    // destructor of the temporary.
+                    // Move-assign a default-constructed view: the old
+                    // state's release() fires via the move-assignment,
+                    // dropping the pin.  Subsequent memoryview(view)
+                    // calls fail with BufferError (see sv_getbuffer).
                     v = Subscriber::SampleView{};
                 },
-                "Release the slot pin early (equivalent to deleting the view).")
-            // Note on context-manager support: initial attempts at
-            // __enter__/__exit__ bindings produced nanobind dispatch
-            // errors due to the interaction between the returned
-            // reference and nanobind's per-argument type matching.
-            // Users who want `with` semantics can implement a tiny
-            // Python wrapper calling .release() — or rely on Python's
-            // GC to release the pin when the SampleView goes out of
-            // scope.
-            ;
+                "Release the slot pin early.  Idempotent; after this, any "
+                "NEW memoryview(view) call raises BufferError.  Memoryviews "
+                "obtained before .release() remain valid as pointers but "
+                "should not be used (the pin is gone).")
+            // Context-manager support: `with view:` releases the pin on
+            // block exit.
+            //
+            // __enter__ returns self with reference_internal rv_policy so
+            // nanobind resolves to the existing Python wrapper rather
+            // than constructing a second one around the same C++ object
+            // (which would double-release on exit).
+            //
+            // __exit__ uses nb::args to accept the three positional
+            // arguments Python's `with` statement passes (exc_type,
+            // exc_value, traceback) — explicit `(nb::object, nb::object,
+            // nb::object)` triggers a dispatch error in nanobind's
+            // multi-arg resolution (nb::args sidesteps it).
+            .def("__enter__",
+                [](Subscriber::SampleView& v) -> Subscriber::SampleView&
+                { return v; },
+                nb::rv_policy::reference_internal)
+            .def("__exit__",
+                [](Subscriber::SampleView& v, nb::args /*exc_info*/)
+                { v = Subscriber::SampleView{}; });
+
+        // -------------------------------------------------------------------
+        // AllocatedSlot — handle returned by Publisher.allocate().
+        //
+        // Supports the writable buffer protocol: `memoryview(slot)` or
+        // `numpy.asarray(slot)` gets you a zero-copy writable view of the
+        // reserved shared-memory slot.  Fill it in place, then call
+        // `slot.publish()` to commit.  After publish, any NEW
+        // memoryview(slot) call raises BufferError.
+        //
+        // keep_alive<1, 2>: keep the Publisher (arg 2) alive while this
+        // slot (self, arg 1) is alive — the slot points into the
+        // Publisher's mmap and must not outlive it.
+        // -------------------------------------------------------------------
+
+        nb::class_<PyAllocatedSlot>(m, "AllocatedSlot",
+            nb::type_slots(as_slots))
+            .def("publish",
+                [](PyAllocatedSlot& s) -> std::size_t
+                {
+                    if (s.published)
+                    {
+                        throw nb::value_error(
+                            "AllocatedSlot.publish() called more than once");
+                    }
+                    s.published = true;
+                    return s.publisher->publish();
+                },
+                "Commit the reserved slot.  Returns the number of rings "
+                "the sample was delivered to.  After this call, any NEW "
+                "memoryview(slot) fails with BufferError.")
+            .def("__len__",
+                [](PyAllocatedSlot const& s) -> std::size_t { return s.len; })
+            .def_prop_ro("published",
+                [](PyAllocatedSlot const& s) -> bool { return s.published; });
 
         // -------------------------------------------------------------------
         // Publisher
@@ -324,30 +471,61 @@ namespace kickmsg
             .def(nb::init<SharedRegion&>(), "region"_a,
                  nb::keep_alive<1, 2>())
             .def("send",
-                [](Publisher& p, nb::bytes const& data) -> int32_t
-                { return p.send(data.c_str(), data.size()); },
+                [](Publisher& p, nb::bytes const& data) -> std::size_t
+                {
+                    int32_t rc = p.send(data.c_str(), data.size());
+                    if (rc >= 0)
+                    {
+                        return static_cast<std::size_t>(rc);
+                    }
+                    // C++ returns negative errno-style codes; translate to
+                    // Python exceptions so callers don't silently drop
+                    // messages by ignoring a "falsy" negative return.
+                    int err = -rc;
+                    if (err == EMSGSIZE)
+                    {
+                        throw nb::value_error(
+                            "message too large: exceeds max_payload_size");
+                    }
+                    if (err == EAGAIN)
+                    {
+                        PyErr_SetString(PyExc_BlockingIOError,
+                            "slot pool exhausted; try again after "
+                            "subscribers drain");
+                        throw nb::python_error();
+                    }
+                    // Any other negative rc: generic OSError with errno.
+                    PyErr_SetFromErrno(PyExc_OSError);
+                    throw nb::python_error();
+                },
                 "data"_a,
-                "Copy `data` into a slot and publish.  Returns bytes written "
-                "or a negative errno-style code.")
+                "Copy `data` into a slot and publish (atomic convenience).  "
+                "Returns the number of bytes written.  Raises ValueError if "
+                "the message exceeds max_payload_size, BlockingIOError if "
+                "the slot pool is exhausted, OSError on other failures.")
             .def("allocate",
-                [](Publisher& p, std::size_t len) -> nb::object
+                [](Publisher& p, std::size_t len) -> std::optional<PyAllocatedSlot>
                 {
                     void* ptr = p.allocate(len);
                     if (ptr == nullptr)
                     {
-                        return nb::none();
+                        return std::nullopt;
                     }
-                    return memview_writable(ptr, len);
+                    return PyAllocatedSlot{p, ptr, len};
                 },
                 "len"_a,
-                "Reserve a slot of `len` bytes and return a writable memoryview "
-                "pointing directly at it.  Fill the view, then call publish().  "
-                "Returns None if the pool is exhausted.")
-            .def("publish",
-                [](Publisher& p) -> std::size_t { return p.publish(); },
-                "Commit the slot reserved by the last allocate() call.  "
-                "Returns the number of rings the sample was delivered to.")
-            .def("dropped", &Publisher::dropped);
+                // keep_alive<0, 1>: the returned AllocatedSlot (arg 0)
+                // must pin the Publisher (arg 1 = self).  Memoryviews
+                // obtained from the slot in turn pin the AllocatedSlot
+                // (via Py_buffer::obj), so the full chain is
+                // memoryview → AllocatedSlot → Publisher → SharedRegion.
+                nb::keep_alive<0, 1>(),
+                "Reserve a slot of `len` bytes and return an AllocatedSlot.  "
+                "Use memoryview(slot) or numpy.asarray(slot) to fill it "
+                "in place (zero-copy), then call slot.publish().  Returns "
+                "None if the pool is exhausted.")
+            .def_prop_ro("dropped", &Publisher::dropped,
+                "Per-ring delivery drops (CAS contention or pool exhaustion).");
 
         // -------------------------------------------------------------------
         // Subscriber
@@ -405,16 +583,31 @@ namespace kickmsg
                 [](Subscriber& s, int64_t timeout_ns)
                     -> std::optional<Subscriber::SampleView>
                 {
-                    nb::gil_scoped_release release;
-                    return s.receive_view(nanoseconds{timeout_ns});
+                    // Scope the GIL release tightly around the blocking
+                    // wait, matching receive() above.  The C++ return value
+                    // is pure C++ (no Python state), so strictly speaking
+                    // the GIL only needs to be released for the futex
+                    // wait itself — but keeping the scope explicit avoids
+                    // any future-footgun if the Python-conversion path
+                    // ever touches CPython state before reacquisition.
+                    std::optional<Subscriber::SampleView> result;
+                    {
+                        nb::gil_scoped_release release;
+                        result = s.receive_view(nanoseconds{timeout_ns});
+                    }
+                    return result;
                 },
                 "timeout_ns"_a,
                 nb::rv_policy::move,
                 nb::keep_alive<0, 1>(),
                 "Blocking zero-copy receive.  Releases the GIL.  Returns a "
                 "SampleView or None on timeout.")
-            .def("lost",            &Subscriber::lost)
-            .def("drain_timeouts",  &Subscriber::drain_timeouts);
+            .def_prop_ro("lost",           &Subscriber::lost,
+                "Messages the subscriber's ring overflowed past — the "
+                "publisher evicted them before this subscriber drained.")
+            .def_prop_ro("drain_timeouts", &Subscriber::drain_timeouts,
+                "Count of times the subscriber gave up waiting for an "
+                "in-flight publisher during teardown.");
 
         // -------------------------------------------------------------------
         // BroadcastHandle
@@ -483,7 +676,7 @@ namespace kickmsg
             .def("topic_schema",           &Node::topic_schema,           "topic"_a)
             .def("try_claim_topic_schema", &Node::try_claim_topic_schema,
                  "topic"_a, "info"_a)
-            .def("name",   &Node::name)
-            .def("prefix", &Node::prefix);
+            .def_prop_ro("name",   &Node::name)
+            .def_prop_ro("prefix", &Node::prefix);
     }
 }

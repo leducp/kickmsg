@@ -1,17 +1,20 @@
 """Zero-copy camera-frame publishing — the use case the Python bindings'
-Publisher.allocate / Subscriber.try_receive_view path was designed for.
+AllocatedSlot / SampleView buffer-protocol path was designed for.
 
 Shows how to:
-  1. Reserve a slot directly in shared memory via Publisher.allocate(size)
-     and fill it in-place (no intermediate buffer).  Here we simulate a
-     camera frame with a byte pattern; in a real pipeline you'd:
-       - cv2.imdecode / numpy.copyto into the slot, or
+  1. Reserve a slot directly in shared memory via Publisher.allocate(size),
+     then obtain a writable memoryview with `memoryview(slot)` and fill it
+     in-place (no intermediate buffer).  In a real pipeline you'd:
+       - numpy.copyto(np.asarray(slot).reshape(H, W, 3), frame), or
        - DMA from a V4L2 buffer into the slot, or
        - render directly into the slot.
+     Then call `slot.publish()` to commit.
   2. Receive it zero-copy on the other side via Subscriber.try_receive_view
-     and read the bytes through a read-only memoryview — no copy either.
+     and `memoryview(view)` — read-only, no copy either.  The memoryview
+     pins the SampleView alive so the slot stays valid until every
+     consumer releases the view.
 
-For a real camera, swap the `fill_frame` lines for your actual capture.
+For a real camera, swap `fill_frame` for your actual capture.
 """
 
 from __future__ import annotations
@@ -48,34 +51,31 @@ def main() -> int:
     sub = viewer.subscribe("frames")
 
     for i in range(3):
-        # Zero-copy capture: get a writable memoryview into the SHM slot,
-        # fill it in place, publish.  Nothing is copied on the publish side.
-        buf = pub.allocate(frame_bytes)
-        if buf is None:
+        # Zero-copy capture: reserve a slot, write directly into SHM via
+        # a memoryview, publish.  Nothing is copied on the publish side.
+        slot = pub.allocate(frame_bytes)
+        if slot is None:
             print(f"frame {i}: pool exhausted, dropping")
             continue
-        fill_frame(buf, height, width)
-        pub.publish()
+        fill_frame(memoryview(slot), height, width)
+        slot.publish()
         print(f"Published frame {i} ({width}x{height} RGB, {frame_bytes} B zero-copy)")
 
     for i in range(3):
         view = sub.try_receive_view()
         if view is None:
             break
-        try:
-            mv = view.data()
-            # Spot-check: no memcpy performed on the receive side either.
-            print(f"Received frame {i}: {view.len()} B, "
+        # `with` releases the pin on block exit, even on exception.
+        # Without this, the slot stays pinned until the SampleView and
+        # every derived memoryview are GC'd — the pool could run dry.
+        with view:
+            mv = memoryview(view)  # read-only, zero-copy
+            print(f"Received frame {i}: {len(view)} B, "
                   f"pixel[0,0]=RGB({mv[0]},{mv[1]},{mv[2]}), "
                   f"pixel[{height-1},{width-1}]="
                   f"RGB({mv[(height-1)*width*3 + (width-1)*3]},"
                   f"{mv[(height-1)*width*3 + (width-1)*3 + 1]},"
                   f"{mv[(height-1)*width*3 + (width-1)*3 + 2]})")
-        finally:
-            # Drop the slot pin as soon as we're done reading.  Without
-            # this, the slot stays pinned until the SampleView is GC'd,
-            # and the pool could run dry.
-            view.release()
 
     camera.unlink_topic("frames")
     print("Done.")

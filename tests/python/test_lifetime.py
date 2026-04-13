@@ -49,7 +49,7 @@ def test_sample_view_gc_releases_pin(shm_name, small_cfg):
     pub.send(b"ephemeral")
     view = sub.try_receive_view()
     assert view is not None
-    _ = bytes(view.data())
+    _ = bytes(memoryview(view))
 
     # Drop the reference — Python GC should run SampleView's C++ dtor,
     # which in turn drops the slot pin.
