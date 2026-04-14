@@ -468,7 +468,7 @@ namespace kickmsg
                 {
                     treiber_push(header_->free_top, slot, slot_idx);
                 }
-                e.slot_idx.store(INVALID_SLOT, std::memory_order_seq_cst);
+                e.slot_idx.store(INVALID_SLOT, std::memory_order_release);
             }
         }
 

@@ -461,7 +461,7 @@ namespace kickmsg
                 // Skip uncommitted and locked entries.
                 if (seq >= pos + 1 and seq != LOCKED_SEQUENCE)
                 {
-                    uint32_t idx = e.slot_idx;
+                    uint32_t idx = e.slot_idx.load(std::memory_order_relaxed);
                     if (idx < h->pool_size)
                     {
                         referenced[idx] = true;
