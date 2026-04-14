@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import kickmsg
 
 
@@ -27,7 +29,7 @@ def test_receive_with_timeout_returns_none(shm_name, small_cfg):
     region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
     sub = kickmsg.Subscriber(region)
     # 10 ms timeout, no publisher — must return None without throwing.
-    got = sub.receive(10_000_000)
+    got = sub.receive(timedelta(milliseconds=10))
     assert got is None
 
 
@@ -36,7 +38,7 @@ def test_receive_with_timeout_delivers(shm_name, small_cfg):
     pub = kickmsg.Publisher(region)
     sub = kickmsg.Subscriber(region)
     pub.send(b"payload")
-    got = sub.receive(100_000_000)  # 100 ms
+    got = sub.receive(timedelta(milliseconds=100))
     assert got == b"payload"
 
 
@@ -58,6 +60,18 @@ def test_send_larger_than_max_payload_raises(shm_name, small_cfg):
     oversize = b"x" * (small_cfg.max_payload_size + 1)
     with pytest.raises(ValueError, match="max_payload_size"):
         pub.send(oversize)
+
+
+def test_subscriber_iteration(shm_name, small_cfg):
+    region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
+    pub = kickmsg.Publisher(region)
+    sub = kickmsg.Subscriber(region)
+    for i in range(5):
+        pub.send(f"msg-{i}".encode())
+    received = list(sub)
+    assert len(received) == 5
+    assert received[0] == b"msg-0"
+    assert received[4] == b"msg-4"
 
 
 def test_send_pool_exhausted_raises(shm_name, small_cfg):

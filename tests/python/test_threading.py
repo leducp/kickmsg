@@ -5,6 +5,7 @@ Subscriber.receive(timeout) must not stall a concurrent producer thread.
 from __future__ import annotations
 
 import threading
+from datetime import timedelta
 
 import kickmsg
 
@@ -23,7 +24,7 @@ def test_blocking_receive_does_not_stall_other_thread(shm_name, small_cfg):
         # 500 ms is plenty — GIL release lets the producer thread publish
         # immediately; the futex wakes us up on commit; total wall time
         # should be milliseconds, not approaching the timeout.
-        got = sub.receive(500_000_000)
+        got = sub.receive(timedelta(milliseconds=500))
         if got is not None:
             received.append(got)
 

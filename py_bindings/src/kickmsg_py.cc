@@ -61,6 +61,7 @@
 #include <string>
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 
@@ -225,13 +226,20 @@ namespace kickmsg
             .def_rw("sub_ring_capacity", &channel::Config::sub_ring_capacity)
             .def_rw("pool_size",         &channel::Config::pool_size)
             .def_rw("max_payload_size",  &channel::Config::max_payload_size)
-            .def_prop_rw("commit_timeout_us",
-                [](channel::Config const& c) -> int64_t
-                { return c.commit_timeout.count(); },
-                [](channel::Config& c, int64_t us)
-                { c.commit_timeout = microseconds{us}; },
-                "Commit timeout in microseconds.")
-            .def_rw("schema", &channel::Config::schema);
+            .def_prop_rw("commit_timeout",
+                [](channel::Config const& c) -> microseconds
+                { return c.commit_timeout; },
+                [](channel::Config& c, microseconds us)
+                { c.commit_timeout = us; },
+                "Commit timeout as a timedelta (microsecond resolution).")
+            .def_rw("schema", &channel::Config::schema)
+            .def("__repr__", [](channel::Config const& c)
+            {
+                return std::string{"Config(max_subscribers="} +
+                       std::to_string(c.max_subscribers) +
+                       ", pool_size=" + std::to_string(c.pool_size) +
+                       ", max_payload_size=" + std::to_string(c.max_payload_size) + ")";
+            });
 
         // -------------------------------------------------------------------
         // SchemaInfo + schema submodule (Diff / diff)
@@ -359,7 +367,14 @@ namespace kickmsg
             .def("repair_locked_entries", &SharedRegion::repair_locked_entries)
             .def("reset_retired_rings",   &SharedRegion::reset_retired_rings)
             .def("reclaim_orphaned_slots",&SharedRegion::reclaim_orphaned_slots)
-            .def("unlink",        &SharedRegion::unlink);
+            .def("unlink",        &SharedRegion::unlink)
+            .def("__repr__", [](SharedRegion const& r)
+            {
+                std::string type_str =
+                    (r.channel_type() == channel::PubSub) ? "PubSub" : "Broadcast";
+                return std::string{"SharedRegion(name='"} + r.name() +
+                       "', type=" + type_str + ")";
+            });
 
         m.def("unlink_shm", [](std::string const& name) { SharedMemory::unlink(name); },
               "name"_a, "Unlink a shared-memory entry by name (no-op if absent).");
@@ -422,7 +437,12 @@ namespace kickmsg
                 nb::rv_policy::reference_internal)
             .def("__exit__",
                 [](Subscriber::SampleView& v, nb::args /*exc_info*/)
-                { v = Subscriber::SampleView{}; });
+                { v = Subscriber::SampleView{}; })
+            .def("__repr__", [](Subscriber::SampleView const& v)
+            {
+                return std::string{"SampleView(len="} + std::to_string(v.len()) +
+                       ", valid=" + (v.valid() ? "True" : "False") + ")";
+            });
 
         // -------------------------------------------------------------------
         // AllocatedSlot — handle returned by Publisher.allocate().
@@ -457,7 +477,12 @@ namespace kickmsg
             .def("__len__",
                 [](PyAllocatedSlot const& s) -> std::size_t { return s.len; })
             .def_prop_ro("published",
-                [](PyAllocatedSlot const& s) -> bool { return s.published; });
+                [](PyAllocatedSlot const& s) -> bool { return s.published; })
+            .def("__repr__", [](PyAllocatedSlot const& s)
+            {
+                return std::string{"AllocatedSlot(len="} + std::to_string(s.len) +
+                       ", published=" + (s.published ? "True" : "False") + ")";
+            });
 
         // -------------------------------------------------------------------
         // Publisher
@@ -525,7 +550,12 @@ namespace kickmsg
                 "in place (zero-copy), then call slot.publish().  Returns "
                 "None if the pool is exhausted.")
             .def_prop_ro("dropped", &Publisher::dropped,
-                "Per-ring delivery drops (CAS contention or pool exhaustion).");
+                "Per-ring delivery drops (CAS contention or pool exhaustion).")
+            .def("__repr__", [](Publisher const& p)
+            {
+                return std::string{"Publisher(dropped="} +
+                       std::to_string(p.dropped()) + ")";
+            });
 
         // -------------------------------------------------------------------
         // Subscriber
@@ -551,12 +581,12 @@ namespace kickmsg
                 "Non-blocking receive.  Returns bytes on success, None if "
                 "no message is available.")
             .def("receive",
-                [](Subscriber& s, int64_t timeout_ns) -> nb::object
+                [](Subscriber& s, nanoseconds timeout) -> nb::object
                 {
                     std::optional<Subscriber::SampleRef> sample;
                     {
                         nb::gil_scoped_release release;
-                        sample = s.receive(nanoseconds{timeout_ns});
+                        sample = s.receive(timeout);
                     }
                     if (not sample.has_value())
                     {
@@ -566,8 +596,8 @@ namespace kickmsg
                         reinterpret_cast<char const*>(sample->data()),
                         sample->len());
                 },
-                "timeout_ns"_a,
-                "Blocking receive with timeout.  Releases the GIL while "
+                "timeout"_a,
+                "Blocking receive with timeout (timedelta).  Releases the GIL while "
                 "waiting.  Returns bytes on success, None on timeout.")
             // keep_alive<0, 1>: the returned SampleView (arg 0) must keep
             // the Subscriber (arg 1 = self) alive — the view dereferences
@@ -580,7 +610,7 @@ namespace kickmsg
                 "Non-blocking zero-copy receive.  Returns a SampleView (pins "
                 "the slot) or None.")
             .def("receive_view",
-                [](Subscriber& s, int64_t timeout_ns)
+                [](Subscriber& s, nanoseconds timeout)
                     -> std::optional<Subscriber::SampleView>
                 {
                     // Scope the GIL release tightly around the blocking
@@ -593,21 +623,37 @@ namespace kickmsg
                     std::optional<Subscriber::SampleView> result;
                     {
                         nb::gil_scoped_release release;
-                        result = s.receive_view(nanoseconds{timeout_ns});
+                        result = s.receive_view(timeout);
                     }
                     return result;
                 },
-                "timeout_ns"_a,
+                "timeout"_a,
                 nb::rv_policy::move,
                 nb::keep_alive<0, 1>(),
-                "Blocking zero-copy receive.  Releases the GIL.  Returns a "
+                "Blocking zero-copy receive (timedelta timeout).  Releases the GIL.  Returns a "
                 "SampleView or None on timeout.")
             .def_prop_ro("lost",           &Subscriber::lost,
                 "Messages the subscriber's ring overflowed past — the "
                 "publisher evicted them before this subscriber drained.")
             .def_prop_ro("drain_timeouts", &Subscriber::drain_timeouts,
                 "Count of times the subscriber gave up waiting for an "
-                "in-flight publisher during teardown.");
+                "in-flight publisher during teardown.")
+            .def("__repr__", [](Subscriber const& s)
+            {
+                return std::string{"Subscriber(lost="} + std::to_string(s.lost()) +
+                       ", drain_timeouts=" + std::to_string(s.drain_timeouts()) + ")";
+            })
+            .def("__iter__", [](Subscriber& s) -> Subscriber& { return s; },
+                 nb::rv_policy::reference)
+            .def("__next__", [](Subscriber& s) -> nb::bytes
+            {
+                auto sample = s.try_receive();
+                if (!sample.has_value())
+                {
+                    throw nb::stop_iteration();
+                }
+                return nb::bytes(reinterpret_cast<char const*>(sample->data()), sample->len());
+            });
 
         // -------------------------------------------------------------------
         // BroadcastHandle
@@ -622,7 +668,11 @@ namespace kickmsg
                 nb::rv_policy::reference_internal)
             .def_prop_ro("sub",
                 [](BroadcastHandle& h) -> Subscriber& { return h.sub; },
-                nb::rv_policy::reference_internal);
+                nb::rv_policy::reference_internal)
+            .def("__repr__", [](BroadcastHandle const& /*h*/)
+            {
+                return std::string{"BroadcastHandle(pub=Publisher, sub=Subscriber)"};
+            });
 
         // -------------------------------------------------------------------
         // Node
@@ -677,6 +727,11 @@ namespace kickmsg
             .def("try_claim_topic_schema", &Node::try_claim_topic_schema,
                  "topic"_a, "info"_a)
             .def_prop_ro("name",   &Node::name)
-            .def_prop_ro("prefix", &Node::prefix);
+            .def_prop_ro("prefix", &Node::prefix)
+            .def("__repr__", [](Node const& n)
+            {
+                return std::string{"Node(name='"} + n.name() +
+                       "', prefix='" + n.prefix() + "')";
+            });
     }
 }
