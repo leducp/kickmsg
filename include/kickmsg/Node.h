@@ -129,15 +129,6 @@ namespace kickmsg
         SharedRegion*       find_region(std::string const& shm_name);
         SharedRegion const* find_region(std::string const& shm_name) const;
 
-        /// Dedup-aware insertion: if a region with `shm_name` is already
-        /// held by this node, returns the existing one (discarding `region`);
-        /// otherwise appends and returns the newly-held region.  Two
-        /// SharedRegion objects for the same mmap would double-unmap on
-        /// destruction, so callers of the idempotent SharedRegion factory
-        /// methods (open / create_or_open) route through this helper.
-        SharedRegion& emplace_or_reuse(std::string const& shm_name,
-                                       SharedRegion&&     region);
-
         std::string name_;
         std::string prefix_;
         // Keyed by SHM name for O(1) lookup.  A telemetry node on a
