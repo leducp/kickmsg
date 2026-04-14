@@ -94,10 +94,22 @@ namespace kickmsg
 
     void SharedMemory::open(std::string const& name)
     {
+        if (not try_open(name))
+        {
+            throw_last_error("SharedMemory: OpenFileMappingA(open)");
+        }
+    }
+
+    bool SharedMemory::try_open(std::string const& name)
+    {
         fd_ = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
         if (fd_ == INVALID_SHM_HANDLE)
         {
-            throw_last_error("SharedMemory: OpenFileMappingA()");
+            if (GetLastError() == ERROR_FILE_NOT_FOUND)
+            {
+                return false;
+            }
+            throw_last_error("SharedMemory: OpenFileMappingA(try_open)");
         }
 
         address_ = MapViewOfFile(fd_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
@@ -118,6 +130,7 @@ namespace kickmsg
             throw_last_error("SharedMemory: VirtualQuery()");
         }
         size_ = info.RegionSize;
+        return true;
     }
 
     void SharedMemory::close()

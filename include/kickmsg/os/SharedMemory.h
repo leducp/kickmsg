@@ -41,6 +41,11 @@ namespace kickmsg
         /// Open an existing shared-memory region (read/write).
         void open(std::string const& name);
 
+        /// Attempt to open an existing shared-memory region.
+        /// Returns true if opened, false if it does not exist (ENOENT).
+        /// Throws on other errors (permission denied, etc.).
+        bool try_open(std::string const& name);
+
         /// Unmap and close the handle.
         void close();
 

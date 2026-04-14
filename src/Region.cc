@@ -196,13 +196,12 @@ namespace kickmsg
 
         for (int i = 0; i < 200; ++i)
         {
-            try
+            SharedMemory shm;
+            if (shm.try_open(name))
             {
-                SharedMemory shm;
-                shm.open(name);
-
                 auto* h = static_cast<Header*>(shm.address());
-                if (h->magic.load(std::memory_order_acquire) == MAGIC and h->version == VERSION)
+                if (h->magic.load(std::memory_order_acquire) == MAGIC
+                    and h->version == VERSION)
                 {
                     if (h->config_hash != expected_hash)
                     {
@@ -214,16 +213,10 @@ namespace kickmsg
                     region.shm_  = std::move(shm);
                     return region;
                 }
-
-                shm.close();
+                // SHM exists but magic/version not ready yet — creator
+                // is still mid-init.  Close and retry.
             }
-            catch (std::runtime_error const&)
-            {
-                throw;
-            }
-            catch (...)
-            {
-            }
+            // try_open returned false (ENOENT) or magic not ready → retry.
             kickmsg::sleep(10ms);
         }
 

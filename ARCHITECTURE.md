@@ -347,19 +347,25 @@ would also be unsafe: `commit_timeout` is a heuristic, not proof
 of death. A slow-but-alive publisher could still execute its
 pending `fetch_sub`, causing the same underflow.
 
-**After a publisher crash, the operator must call
-`repair_locked_entries()` for poisoned ring entries and
-`reset_retired_rings()` for stuck ring headers.** These are
-explicit recovery steps, not silent self-repair — crashes should
-be visible to the operator.
+**Publisher self-repair**: when a publisher times out on a stuck
+entry, it heals the entry in place (3 stores, ~10 ns) so the next
+publisher at that position succeeds without timeout. This handles
+both Case A (LOCKED_SEQUENCE) and Case B (stale entry >1 wrap behind).
+The operator primitives `repair_locked_entries()` and
+`reset_retired_rings()` remain available for defense-in-depth and
+health monitoring, but most crash residue is now self-healed by
+publishers on the hot path.
 
 **Ordering invariant**: the subscriber captures `write_pos` BEFORE
-the CAS to Live, not after. Once the ring is Live, publishers can
-immediately `fetch_add(write_pos)`, racing with the subscriber's
-read. Capturing first guarantees `start_pos_ <= any position a
-publisher can claim after seeing Live`. Without this ordering, the
-subscriber's `drain_unconsumed` window `[start_pos_, wp)` can miss
-entries committed between the CAS and the read — a refcount leak.
+the CAS to Live, not after (`Subscriber.cc`: `write_pos.load(acquire)`
+then `state_flight.compare_exchange_strong(Free, Live, acq_rel)`).
+Once the ring is Live, publishers can immediately
+`fetch_add(write_pos)`, racing with the subscriber's read. Capturing
+first guarantees `start_pos_ <= any position a publisher can claim
+after seeing Live`. Without this ordering, the subscriber's
+`drain_unconsumed` window `[start_pos_, wp)` can miss entries
+committed between the CAS and the read — a refcount leak.
+**Anyone editing the Subscriber constructor must preserve this order.**
 
 A newly joined subscriber may miss a small number of in-flight
 publishes during the visibility window right after attachment:
@@ -398,10 +404,10 @@ Publisher
    |
    |-- CAS admission on             Atomically verify state==Live and
    |   state_flight (acq_rel):      increment in_flight in one CAS.
-   |     old + IN_FLIGHT_ONE        All ordering is on a single variable,
-   |                                so acquire/release is sufficient
-   |     if state changed to        (no seq_cst, no Dekker protocol).
-   |     non-Live during CAS:       CAS fails, excess++, continue.
+   |     old + IN_FLIGHT_ONE        Packed state_flight: single-variable
+   |                                CAS atomically checks state AND bumps
+   |     if state changed to        in_flight. acquire/release is sufficient
+   |     non-Live during CAS:       (no seq_cst, no cross-variable ordering).
    |       excess++, continue
    |
    |-- fetch_add(write_pos, 1)     Claim position 42. Unconditional:
@@ -439,8 +445,19 @@ Publisher
    |   |     prev_seq nor LOCKED     publisher. excess++, give up
    |   |                             on this ring.
    |   |
-   |   | Lock failure:              Do NOT release old_slot — between
-   |   |   excess++, continue       capture and now, the entry may have
+   |   | Lock failure:
+   |   |   state_flight.fetch_sub   Release admission — this ring's
+   |   |     (IN_FLIGHT_ONE, rel.)  in_flight was incremented during the
+   |   |                             CAS admission step above. Must be
+   |   |                             decremented on every exit path,
+   |   |                             otherwise the subscriber destructor
+   |   |                             spin-waits on in_flight forever.
+   |   |   Self-repair:             If the entry is stuck (LOCKED or
+   |   |     if LOCKED or stale:    >1 wrap stale), advance it so the
+   |   |       store INVALID_SLOT   NEXT publisher at this position
+   |   |       store seq = expected succeeds without timeout.
+   |   |   excess++, continue       Do NOT release old_slot — between
+   |   |                             capture and now, the entry may have
    |   |                             been overwritten. old_slot could
    |   |                             belong to a newer generation. The
    |   |                             unreleased ref is a bounded leak
@@ -474,6 +491,17 @@ Publisher
    |
    '-- if has_waiter:               Conditional wake: skip the syscall
          futex_wake_all(write_pos)  when no subscriber is blocking.
+                                    has_waiter uses relaxed ordering on
+                                    both sides (publisher load, subscriber
+                                    store). This can race: the publisher
+                                    may not see has_waiter=1 if the
+                                    subscriber just set it. But the race
+                                    is benign — futex_wait(write_pos, cur)
+                                    checks *addr != expected atomically
+                                    in the kernel; if write_pos already
+                                    advanced, it returns immediately.
+                                    Worst case: one unnecessary round-trip
+                                    through futex (not a lost wake).
 
 5. Batch excess: fetch_sub(excess) on slot refcount.
    One atomic RMW for all non-delivered rings, instead of N
@@ -1023,9 +1051,12 @@ write_pos (rings)       Monotonically increasing 64-bit counter. Only goes
 
 state (subscriber)      One-way state machine: Free → Live → Draining → Free.
                         Publishers only deliver to Live rings. The
-                        Dekker admission (in_flight++ then state check)
-                        ensures no publisher misses a Live → Draining
-                        transition.
+                        packed state_flight design (state + in_flight
+                        in a single uint32) eliminates cross-variable
+                        ordering concerns: the publisher's CAS atomically
+                        verifies state==Live AND increments in_flight in
+                        one operation (acq_rel). No Dekker protocol or
+                        seq_cst needed.
 
 refcount (pinning)      CAS from rc to rc+1 only when rc > 0. Even if
                         intermediate transitions bring it back to the same

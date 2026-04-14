@@ -20,23 +20,23 @@ endif()
 # --- Platform-specific OS sources ---
 if(WIN32)
     set(OS_SOURCES
-        os/windows/Time.cc
-        os/windows/Futex.cc
-        os/windows/SharedMemory.cc
+        src/os/windows/Time.cc
+        src/os/windows/Futex.cc
+        src/os/windows/SharedMemory.cc
     )
     set(OS_LIBRARIES synchronization)
 elseif(APPLE)
     set(OS_SOURCES
-        os/darwin/Time.cc
-        os/darwin/Futex.cc
-        os/darwin/SharedMemory.cc
+        src/os/darwin/Time.cc
+        src/os/darwin/Futex.cc
+        src/os/darwin/SharedMemory.cc
     )
     set(OS_LIBRARIES pthread)
 else()
     set(OS_SOURCES
-        os/linux/Time.cc
-        os/linux/Futex.cc
-        os/linux/SharedMemory.cc
+        src/os/linux/Time.cc
+        src/os/linux/Futex.cc
+        src/os/linux/SharedMemory.cc
     )
     set(OS_LIBRARIES rt pthread)
 endif()

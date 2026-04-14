@@ -1,3 +1,5 @@
+// macOS uses POSIX shared memory (same as Linux).
+// shm_open / ftruncate / mmap are available on all supported macOS versions.
 #include "kickmsg/os/SharedMemory.h"
 
 #include <cerrno>
@@ -51,8 +53,8 @@ namespace kickmsg
         if (::ftruncate(fd_, static_cast<off_t>(size)) < 0)
         {
             ::close(fd_);
-            fd_ = -1;
-            throw_system_error("SharedMemory.cc: ftruncate()");
+            fd_ = INVALID_SHM_HANDLE;
+            throw_system_error("SharedMemory: ftruncate()");
         }
 
         address_ = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
@@ -60,8 +62,8 @@ namespace kickmsg
         {
             address_ = nullptr;
             ::close(fd_);
-            fd_ = -1;
-            throw_system_error("SharedMemory.cc: mmap()");
+            fd_ = INVALID_SHM_HANDLE;
+            throw_system_error("SharedMemory: mmap()");
         }
 
         size_ = size;
@@ -69,10 +71,27 @@ namespace kickmsg
 
     void SharedMemory::create(std::string const& name, std::size_t size)
     {
-        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+        // macOS has two shm_open / ftruncate quirks that the original
+        // `O_CREAT | O_TRUNC` Linux pattern trips over:
+        //   1. shm_open(O_CREAT|O_TRUNC) on an existing SHM object
+        //      returns EINVAL — Linux accepts it, Darwin rejects it.
+        //   2. ftruncate() can only be called once per SHM object; a
+        //      second call on the same object returns EINVAL.
+        // Unlink-then-exclusive-create sidesteps both: the subsequent
+        // shm_open sees a name that either didn't exist or was just
+        // detached, and the following ftruncate is always the first
+        // sizing call on a fresh object.
+        //
+        // This function is called by SharedRegion::create() (the strict
+        // factory where the caller intends exclusive ownership).  The
+        // race-prone caller SharedRegion::create_or_open() was refactored
+        // to NOT re-enter this function after its try_create probe — it
+        // stamps the header directly on the probe's mapping.
+        ::shm_unlink(name.c_str());
+        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
         if (fd_ < 0)
         {
-            throw_system_error("SharedMemory.cc: shm_open(create)");
+            throw_system_error("SharedMemory: shm_open(create)");
         }
         map(size);
     }
@@ -80,9 +99,10 @@ namespace kickmsg
     bool SharedMemory::try_create(std::string const& name, std::size_t size)
     {
         // Keep the fd and do the full setup (ftruncate + mmap) inline.
-        // SharedRegion::create_or_open consumes the resulting mapping
-        // directly — there's no reason to close here and re-enter create(),
-        // and the old round-trip pattern caused a subtle race on Darwin.
+        // We must NOT close the fd and call create() — create() would
+        // shm_unlink the name (to sidestep Darwin's O_TRUNC quirk) and
+        // recreate a different object, racing any concurrent caller that
+        // observed the original name between our close and create's CAS.
         fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
         if (fd_ < 0)
         {
@@ -91,7 +111,7 @@ namespace kickmsg
                 fd_ = INVALID_SHM_HANDLE;
                 return false;
             }
-            throw_system_error("SharedMemory.cc: shm_open(try_create)");
+            throw_system_error("SharedMemory: shm_open(try_create)");
         }
         map(size);
         return true;
@@ -99,18 +119,31 @@ namespace kickmsg
 
     void SharedMemory::open(std::string const& name)
     {
+        if (not try_open(name))
+        {
+            throw_system_error("SharedMemory: shm_open(open)");
+        }
+    }
+
+    bool SharedMemory::try_open(std::string const& name)
+    {
         fd_ = ::shm_open(name.c_str(), O_RDWR, 0);
         if (fd_ < 0)
         {
-            throw_system_error("SharedMemory.cc: shm_open(open)");
+            if (errno == ENOENT)
+            {
+                fd_ = INVALID_SHM_HANDLE;
+                return false;
+            }
+            throw_system_error("SharedMemory: shm_open(try_open)");
         }
 
         struct stat st{};
         if (::fstat(fd_, &st) < 0)
         {
             ::close(fd_);
-            fd_ = -1;
-            throw_system_error("SharedMemory.cc: fstat()");
+            fd_ = INVALID_SHM_HANDLE;
+            throw_system_error("SharedMemory: fstat()");
         }
 
         size_ = static_cast<std::size_t>(st.st_size);
@@ -119,9 +152,10 @@ namespace kickmsg
         {
             address_ = nullptr;
             ::close(fd_);
-            fd_ = -1;
-            throw_system_error("SharedMemory.cc: mmap()");
+            fd_ = INVALID_SHM_HANDLE;
+            throw_system_error("SharedMemory: mmap()");
         }
+        return true;
     }
 
     void SharedMemory::close()
@@ -134,7 +168,7 @@ namespace kickmsg
         if (fd_ != INVALID_SHM_HANDLE)
         {
             ::close(fd_);
-            fd_ = -1;
+            fd_ = INVALID_SHM_HANDLE;
         }
         size_ = 0;
     }
