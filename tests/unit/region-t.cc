@@ -280,6 +280,72 @@ TEST_F(RegionTest, RepairLockedEntryUnblocksPublishing)
     EXPECT_GT(received, 0);
 }
 
+TEST_F(RegionTest, RepairStaleEntryFromCrashedPublisherBeforeCasLock)
+{
+    // Case B: publisher claimed write_pos (fetch_add) but crashed before
+    // CAS-locking the entry.  The entry still has the committed sequence
+    // from the previous wrap.  After more than one full wrap, the entry
+    // is detectably stale (> 1 ring revolution behind) and
+    // repair_locked_entries() should advance it.
+
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 4;    // capacity = 4
+    cfg.pool_size         = 16;
+    cfg.max_payload_size  = 8;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    // Fill the ring once: publish 4 messages (pos 0-3), consuming all.
+    for (int i = 0; i < 4; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+        auto s = sub.try_receive();
+        ASSERT_TRUE(s.has_value());
+    }
+
+    // Entry at idx=0 now has seq=1 (committed for pos=0).
+    auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* entries = kickmsg::ring_entries(ring);
+
+    // Simulate: a publisher claimed pos=4 (fetch_add) targeting idx=0,
+    // then crashed before the CAS lock.  The entry stays at seq=1.
+    // Advance write_pos past pos=4 by TWO more full wraps so the entry
+    // becomes > 1 wrap stale.
+    // write_pos after the 4 real publishes is 4.  Set it to 4 + 2*cap = 12.
+    ring->write_pos.store(12, std::memory_order_release);
+    // Don't touch entries — they keep their old sequences.  Entry idx=0
+    // has seq=1, but expected seq at pos=8 (the slot in the scan window)
+    // is 9.  (pos=8 maps to idx=0 because 8 & 3 = 0.)  1 + 4 < 9 → stale.
+
+    auto report = region.diagnose();
+    EXPECT_GT(report.locked_entries, 0u)
+        << "diagnose() should detect the stale entry (Case B)";
+
+    std::size_t repaired = region.repair_locked_entries();
+    EXPECT_GT(repaired, 0u)
+        << "repair_locked_entries() should advance the stale entry";
+
+    // After repair, the entry at idx=0 should have seq = expected.
+    // The expected pos for idx=0 in the window [12-4, 12) = [8, 12) is pos=8.
+    uint64_t seq0 = entries[0].sequence.load(std::memory_order_acquire);
+    EXPECT_EQ(seq0, 9u)  // pos=8 → expected = 8 + 1 = 9
+        << "Stale entry should be advanced to pos + 1";
+
+    // Publishing should now succeed past the repaired slot.
+    for (int i = 0; i < 8; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(100 + i);
+        ASSERT_GE(pub.send(&val, sizeof(val)), 0)
+            << "Publishing failed at iteration " << i
+            << " — repaired entry may still be stuck";
+    }
+}
+
 TEST_F(RegionTest, RepairLockedEntryAtPositionZero)
 {
     // Edge case: crash at pos=0 where prev_seq was 0.

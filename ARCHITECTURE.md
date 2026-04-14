@@ -678,16 +678,30 @@ After refcount pre-set, during     Refcount was set to max_subs but
                                    are never released. The slot is
                                    permanently leaked.
 
-After CAS on write_pos, before     Entry is uncommitted (sequence
-  sequence store (the dangerous    never written). Next publisher at
-  window)                          the same ring position waits up to
-                                   commit_timeout, then overwrites
-                                   the entry with its own data. The
-                                   ring entry itself is NOT leaked
-                                   (it is overwritten). The pool slot
+After CAS on write_pos, before     Two sub-cases depending on whether
+  sequence store (the dangerous    the publisher reached the CAS lock:
+  window)
+                                   Case A — crash after CAS lock
+                                   (entry stuck at LOCKED_SEQUENCE):
+                                   Next publisher at this position
+                                   waits commit_timeout and drops.
+                                   repair_locked_entries() advances
+                                   the entry to the expected sequence.
+
+                                   Case B — crash before CAS lock
+                                   (entry still at the previous
+                                   cycle's committed sequence):
+                                   Next publisher at this position
+                                   also waits commit_timeout and drops.
+                                   repair_locked_entries() detects the
+                                   entry is more than one full wrap
+                                   behind and advances it.
+
+                                   In both cases, the pool slot
                                    referenced by the crashed entry
-                                   cannot be safely released (slot_idx
-                                   may be garbage), so it is leaked.
+                                   may be garbage — it is marked
+                                   INVALID_SLOT by the repair, and
+                                   recovered by reclaim_orphaned_slots.
                                    Subscriber sees a gap (lost msg).
 
 After sequence store               No issue. Entry is committed.
@@ -715,8 +729,14 @@ publisher is mid-commit on that entry and will release shortly.
 
 On timeout (returns `INVALID_SLOT`), the publisher:
 1. Skips `release_slot()` (the old `slot_idx` may be garbage)
-2. Overwrites the entry with its own data via the two-phase commit
-3. The ring resumes normal operation
+2. Attempts the CAS lock — if it fails, the publisher **self-repairs**
+   the stuck entry in place (stores `INVALID_SLOT` + the expected
+   sequence) so the next publisher at this position succeeds without
+   paying the timeout.  Self-repair handles both Case A (LOCKED) and
+   Case B (stale), costs ~10 ns on top of the already-spent timeout,
+   and is safe under live traffic (idempotent stores).
+3. Drops delivery for this ring and moves to the next subscriber ring.
+   The ring resumes normal operation on the next wrap.
 
 The timeout is configurable per channel via `channel::Config::commit_timeout`
 (default: 100 ms). The tradeoff:

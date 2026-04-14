@@ -145,7 +145,7 @@ namespace kickmsg
             start_pos_       = other.start_pos_;
             read_pos_        = other.read_pos_;
             lost_            = other.lost_;
-            drain_timeouts_ += other.drain_timeouts_;
+            drain_timeouts_  = other.drain_timeouts_;
             recv_buf_        = std::move(other.recv_buf_);
 
             other.ring_idx_ = UINT32_MAX;

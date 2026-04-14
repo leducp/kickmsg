@@ -265,8 +265,13 @@ namespace kickmsg
             }
             for (uint64_t pos = start; pos < wp; ++pos)
             {
-                auto& e = entries[pos & h->sub_ring_mask];
-                if (e.sequence.load(std::memory_order_acquire) == LOCKED_SEQUENCE)
+                auto&    e   = entries[pos & h->sub_ring_mask];
+                uint64_t seq = e.sequence.load(std::memory_order_acquire);
+
+                // Case A: explicitly locked, never committed.
+                // Case B: more than one full wrap behind — stale from a
+                //         publisher that crashed before the CAS lock.
+                if (seq == LOCKED_SEQUENCE or seq + cap < pos + 1)
                 {
                     ++report.locked_entries;
                 }
@@ -313,22 +318,40 @@ namespace kickmsg
             }
             for (uint64_t pos = start; pos < wp; ++pos)
             {
-                auto&    e   = entries[pos & h->sub_ring_mask];
-                uint64_t seq = e.sequence.load(std::memory_order_acquire);
+                auto&    e        = entries[pos & h->sub_ring_mask];
+                uint64_t seq      = e.sequence.load(std::memory_order_acquire);
+                uint64_t expected = pos + 1;
 
                 if (seq == LOCKED_SEQUENCE)
                 {
-                    // The crashed publisher may have written garbage into
-                    // slot_idx/payload_len. Mark the entry as having no
+                    // Case A: publisher CAS'd Unset → LOCKED_SEQUENCE then
+                    // crashed before the release-store of (pos + 1).  The
+                    // crashed publisher may have written garbage into
+                    // slot_idx/payload_len.  Mark the entry as having no
                     // valid slot so subscribers skip it and future evictions
                     // don't release a stale index.
                     e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
                     e.payload_len.store(0, std::memory_order_relaxed);
-
-                    // Commit with the sequence future publishers expect:
-                    // pos + 1 (not prev_seq). A publisher wrapping to this
-                    // position will CAS(pos + 1 → LOCKED), which now succeeds.
-                    e.sequence.store(pos + 1, std::memory_order_release);
+                    e.sequence.store(expected, std::memory_order_release);
+                    ++repaired;
+                }
+                else if (seq + cap < expected)
+                {
+                    // Case B: publisher claimed write_pos (fetch_add) then
+                    // crashed before the CAS lock.  The entry still carries
+                    // its committed sequence from a previous wrap — more
+                    // than one full ring revolution behind.  No live
+                    // publisher can be mid-commit for longer than one wrap
+                    // (the commit path is a few instructions between
+                    // fetch_add and the CAS), so > 1 wrap behind is
+                    // definitively stale.
+                    //
+                    // slot_idx may reference a still-live slot from the
+                    // previous cycle; mark INVALID_SLOT to avoid a double
+                    // release.
+                    e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
+                    e.payload_len.store(0, std::memory_order_relaxed);
+                    e.sequence.store(expected, std::memory_order_release);
                     ++repaired;
                 }
             }
