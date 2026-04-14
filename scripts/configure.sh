@@ -23,7 +23,7 @@ Options:
   --show                  Show current configuration and exit
   -h, --help              Show this help message and exit
 
-Features: ${!OPT_DEFAULTS[*]}
+Features: ${OPT_NAMES[*]}
 
 Examples:
   $0 build --with=unit_tests
@@ -82,19 +82,19 @@ for action in "${ACTIONS[@]}"; do
             exit 0
             ;;
         with:all)
-            for key in "${!CONFIG[@]}"; do
-                CONFIG[$key]=ON
+            for name in "${OPT_NAMES[@]}"; do
+                config_set "$name" ON
             done
             ;;
         without:all)
-            for key in "${!CONFIG[@]}"; do
-                CONFIG[$key]=OFF
+            for name in "${OPT_NAMES[@]}"; do
+                config_set "$name" OFF
             done
             ;;
         with:*)
             key="${action#with:}"
-            if [[ -v "OPT_DEFAULTS[$key]" ]]; then
-                CONFIG[$key]=ON
+            if opt_is_known "$key"; then
+                config_set "$key" ON
             else
                 error "Unknown feature: $key"
                 exit 1
@@ -102,8 +102,8 @@ for action in "${ACTIONS[@]}"; do
             ;;
         without:*)
             key="${action#without:}"
-            if [[ -v "OPT_DEFAULTS[$key]" ]]; then
-                CONFIG[$key]=OFF
+            if opt_is_known "$key"; then
+                config_set "$key" OFF
             else
                 error "Unknown feature: $key"
                 exit 1

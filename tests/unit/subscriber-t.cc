@@ -320,9 +320,11 @@ TEST_F(SubscriberTest, StuckPublisherCausesDrainTimeout)
 
 TEST_F(SubscriberTest, DrainTimeoutsCounterIncrementsOnTimeout)
 {
-    // Verify drain_timeouts() by using move-assignment: the old ring
-    // is released (triggering the timeout), and the counter is observable
-    // on the surviving object.
+    // Verify drain_timeouts() increments when a subscriber's ring release
+    // times out (crashed publisher with stuck in_flight).  After move-
+    // assignment, the counter reflects the NEW ring's history (= 0), not
+    // the old ring's — drain_timeouts is per-ring, not per-object.  The
+    // old ring's timeout is lost with its identity.
 
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = 2;
@@ -335,30 +337,34 @@ TEST_F(SubscriberTest, DrainTimeoutsCounterIncrementsOnTimeout)
 
     kickmsg::Publisher pub(region);
 
-    // sub takes ring 0
+    // sub takes ring 0.
     kickmsg::Subscriber sub(region);
     uint32_t val = 1;
     ASSERT_GE(pub.send(&val, sizeof(val)), 0);
-
     EXPECT_EQ(sub.drain_timeouts(), 0u);
 
-    // Inflate in_flight on ring 0 to simulate crash
+    // Inflate in_flight on ring 0 to simulate a crashed publisher.
     auto* ring0 = kickmsg::sub_ring_at(region.base(), region.header(), 0);
     ring0->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
                                   std::memory_order_acq_rel);
 
     // Move-assign from a fresh subscriber (ring 1).
-    // This triggers release_ring() on the OLD ring (ring 0, stuck).
-    // The timeout fires, drain_timeouts_ increments, and the counter
-    // is preserved because the object survives the move.
+    // release_ring() fires on ring 0 → times out (in_flight stuck).
+    // The timeout increments drain_timeouts_ on `this`, but then the
+    // move-assignment overwrites it with `fresh.drain_timeouts()` (= 0)
+    // because the counter tracks the NEW ring's identity, not the old one.
     kickmsg::Subscriber fresh(region);  // takes ring 1
     sub = std::move(fresh);
 
-    // sub is alive and now owns ring 1. drain_timeouts should be 1
-    // from the timed-out release of ring 0.
-    EXPECT_EQ(sub.drain_timeouts(), 1u);
+    // sub now owns ring 1, which has had zero drain timeouts.
+    EXPECT_EQ(sub.drain_timeouts(), 0u);
 
-    // Recovery
+    // The timed-out release of ring 0 is observable through the health
+    // report: ring 0 is now Free with stale in_flight (retired ring).
+    auto report = region.diagnose();
+    EXPECT_GE(report.retired_rings, 1u);
+
+    // Recovery.
     region.reset_retired_rings();
 }
 

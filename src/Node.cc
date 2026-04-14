@@ -8,12 +8,13 @@ namespace kickmsg
     {
     }
 
-    // Called by the *_or_* variants and by subscribe / open_mailbox to
-    // avoid registering two SharedRegion objects for the same SHM: two
-    // regions pointing at the same mmap would double-unmap on destruction
-    // and silently invalidate each other's mapping.  Strict advertise()
-    // doesn't need this because SharedRegion::create() itself rejects a
-    // pre-existing SHM entry.
+    // Shared insertion helper.  For idempotent factories (open,
+    // create_or_open), duplicate calls on the same SHM name return the
+    // existing region instead of double-mapping the mmap — two
+    // SharedRegion objects for the same mmap would double-unmap on
+    // destruction and corrupt each other's state.  Strict factories
+    // (create, create_mailbox) never hit this path because
+    // SharedRegion::create rejects a pre-existing SHM entry.
     SharedRegion& Node::emplace_or_reuse(std::string const& shm_name,
                                          SharedRegion&&     region)
     {
@@ -21,16 +22,17 @@ namespace kickmsg
         {
             return *existing;
         }
-        regions_.emplace_back(std::move(region));
-        return regions_.back();
+        auto [it, _] = regions_.emplace(shm_name, std::move(region));
+        return it->second;
     }
 
     Publisher Node::advertise(char const* topic, channel::Config const& cfg)
     {
         auto shm_name = make_topic_name(topic);
-        regions_.emplace_back(
+        auto [it, _]  = regions_.emplace(
+            shm_name,
             SharedRegion::create(shm_name.c_str(), channel::PubSub, cfg, name_.c_str()));
-        return Publisher(regions_.back());
+        return Publisher(it->second);
     }
 
     Subscriber Node::subscribe(char const* topic)
@@ -76,9 +78,10 @@ namespace kickmsg
         channel::Config mbx_cfg = cfg;
         mbx_cfg.max_subscribers = 1;
         auto shm_name = make_mailbox_name(name_.c_str(), tag);
-        regions_.emplace_back(
+        auto [it, _]  = regions_.emplace(
+            shm_name,
             SharedRegion::create(shm_name.c_str(), channel::PubSub, mbx_cfg, name_.c_str()));
-        return Subscriber(regions_.back());
+        return Subscriber(it->second);
     }
 
     Publisher Node::open_mailbox(char const* owner_node, char const* tag)
@@ -146,25 +149,21 @@ namespace kickmsg
 
     SharedRegion* Node::find_region(std::string const& shm_name)
     {
-        for (auto& region : regions_)
+        auto it = regions_.find(shm_name);
+        if (it == regions_.end())
         {
-            if (region.name() == shm_name)
-            {
-                return &region;
-            }
+            return nullptr;
         }
-        return nullptr;
+        return &it->second;
     }
 
     SharedRegion const* Node::find_region(std::string const& shm_name) const
     {
-        for (auto const& region : regions_)
+        auto it = regions_.find(shm_name);
+        if (it == regions_.end())
         {
-            if (region.name() == shm_name)
-            {
-                return &region;
-            }
+            return nullptr;
         }
-        return nullptr;
+        return &it->second;
     }
 }

@@ -1,0 +1,116 @@
+[build-system]
+requires = ["scikit-build-core>=0.5.0", "nanobind>=1.3.2", "conan"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "kickmsg"
+version = "0.0.0"
+description = "Lock-free shared-memory messaging library for inter-process communication."
+readme = {file = "README.md", content-type = "text/markdown"}
+license = { text = "CeCILL-C" }
+maintainers = [
+  {name = "Philippe Leduc", email = "philippe.leduc@mailfence.com"}
+]
+
+[tool.scikit-build]
+minimum-version = "0.11"
+cmake.version = ">=3.30"
+ninja.make-fallback = true
+wheel.cmake = true
+editable.verbose = true
+
+[tool.scikit-build.cmake.define]
+CMAKE_INSTALL_RPATH_USE_LINK_PATH = true
+CMAKE_BUILD_WITH_INSTALL_RPATH = true
+CMAKE_INSTALL_RPATH = '$ORIGIN'
+CMAKE_INTERPROCEDURAL_OPTIMIZATION = true
+BUILD_UNIT_TESTS  = "OFF"
+BUILD_EXAMPLES    = "OFF"
+BUILD_BENCHMARKS  = "OFF"
+# Linker flags for strip + dead-code elimination are GNU-ld-only, so they
+# live in py_bindings/CMakeLists.txt guarded by NOT APPLE (ld64 doesn't
+# support --gc-sections / --strip-all).
+
+[tool.cibuildwheel]
+# https://github.com/pypa/cibuildwheel/blob/main/docs/options.md
+build-verbosity = 1
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+build = ["cp310-*", "cp311-*", "cp312-*"]
+skip = ["cp310-musllinux*", "cp311-musllinux*", "cp312-musllinux*"]
+
+[[tool.cibuildwheel.overrides]]
+# nanobind does not support Stable ABI for Python < 3.12 - Linux
+select = "cp3{10,11}-*linux*"
+config-settings = { "cmake.define.CMAKE_CI_BUILD" = true, "cmake.define.CMAKE_FIND_ROOT_PATH" = "/tmp/kickmsg_build_config", "cmake.define.CMAKE_TOOLCHAIN_FILE" = "/tmp/kickmsg_build_config/toolchain.cmake" }
+repair-wheel-command = [
+  "auditwheel repair --zip-compression-level=9 -w {dest_dir} {wheel}"
+]
+
+[[tool.cibuildwheel.overrides]]
+# nanobind does not support Stable ABI for Python < 3.12 - macOS
+select = "cp3{10,11}-macosx*"
+config-settings = { "cmake.define.CMAKE_CI_BUILD" = true, "cmake.define.CMAKE_OSX_DEPLOYMENT_TARGET" = "11.0", "cmake.define.CMAKE_FIND_ROOT_PATH" = "/tmp/kickmsg_build_config", "cmake.define.CMAKE_TOOLCHAIN_FILE" = "/tmp/kickmsg_build_config/toolchain.cmake" }
+repair-wheel-command = [
+  "delocate-wheel -w {dest_dir} {wheel}"
+]
+
+[tool.cibuildwheel.config-settings]
+"wheel.py-api" = "cp312"
+
+[tool.cibuildwheel.config-settings.cmake.define]
+CMAKE_CI_BUILD = true
+CMAKE_FIND_ROOT_PATH = "/tmp/kickmsg_build_config"
+CMAKE_TOOLCHAIN_FILE = "/tmp/kickmsg_build_config/toolchain.cmake"
+
+[tool.cibuildwheel.linux]
+before-all = [
+  'pipx install conan',
+  './scripts/setup_build.sh /tmp/kickmsg_build_config',
+  'source tools/setup/version.sh && sed -i "s/0\.0\.0/${VERSION}/g" pyproject.toml'
+]
+repair-wheel-command = [
+  "auditwheel repair --zip-compression-level=9 -w {dest_dir} {wheel}",
+  "pipx run abi3audit --strict --report {wheel}",
+]
+
+[tool.cibuildwheel.macos]
+# universal2 → single wheel that runs on both x86_64 and Apple Silicon.
+# 11.0 = Big Sur — earliest macOS that supports Apple Silicon natively,
+# so it's the correct floor for universal2 wheels.  BSD sed uses `-i ''`
+# (empty backup extension) where GNU sed uses `-i` bare.
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+archs = ["universal2"]
+
+before-all = [
+  "pipx install conan",
+  "./scripts/setup_build.sh /tmp/kickmsg_build_config",
+  "source tools/setup/version.sh && sed -i '' \"s/0\\.0\\.0/${VERSION}/g\" pyproject.toml"
+]
+
+repair-wheel-command = [
+  "delocate-wheel -w {dest_dir} {wheel}",
+  "pipx run abi3audit --strict --report {wheel}"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = [
+    ".venv",
+    "build",
+    "build_*",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "B", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

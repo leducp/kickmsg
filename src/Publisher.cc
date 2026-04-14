@@ -167,6 +167,23 @@ namespace kickmsg
             }
             if (not locked)
             {
+                // Self-repair: if the entry is stuck (LOCKED_SEQUENCE from
+                // a crashed publisher, or stale from a publisher that
+                // crashed before the CAS lock), advance it so the NEXT
+                // publisher at this position succeeds without timeout.
+                // Cost: three stores (~10 ns) after an already-expensive
+                // timeout (~10 ms).  Always the right thing — leaving the
+                // entry stuck just punishes the next publisher for the
+                // same crash.
+                uint64_t seq = e.sequence.load(std::memory_order_acquire);
+                uint64_t expected = pos + 1;
+                if (seq == LOCKED_SEQUENCE or seq + capacity < expected)
+                {
+                    e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
+                    e.payload_len.store(0, std::memory_order_relaxed);
+                    e.sequence.store(expected, std::memory_order_release);
+                }
+
                 ++dropped_;
                 ++excess;
                 ring->state_flight.fetch_sub(ring::IN_FLIGHT_ONE,

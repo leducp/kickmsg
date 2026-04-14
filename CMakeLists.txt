@@ -82,3 +82,8 @@ if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED CONFIG)
     add_subdirectory(benchmarks)
 endif()
+
+# --- Python bindings (built only when invoked via scikit-build-core) ---
+if(SKBUILD)
+    add_subdirectory(py_bindings)
+endif()
