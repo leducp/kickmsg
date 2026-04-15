@@ -3,6 +3,7 @@ add_executable(kickmsg_unit
     unit/region-t.cc
     unit/publisher-t.cc
     unit/subscriber-t.cc
+    unit/naming-t.cc
     unit/node-t.cc
 )
 target_link_libraries(kickmsg_unit PRIVATE kickmsg GTest::gmock_main)

@@ -294,6 +294,39 @@ TEST_F(NodeTest, SubscribeOrCreateTwiceReusesSameRegion)
     EXPECT_STREQ(schema_view->name, "shared/Type");
 }
 
+TEST_F(NodeTest, RosStyleTopicNamesAreSanitizedIntoShmPath)
+{
+    // End-to-end check that Node feeds topic/namespace through
+    // sanitize_shm_component: ROS-style absolute paths with interior '/'
+    // must round-trip into a POSIX-valid "/<prefix>_robot.arm.joint1"
+    // region, reachable by a peer that passes the same raw topic string.
+    track("/test.ns_robot.arm.joint1");
+
+    kickmsg::Node pub_node("drv", "/test/ns");
+    auto pub = pub_node.advertise("/robot/arm/joint1", small_cfg());
+
+    kickmsg::Node sub_node("log", "/test/ns");
+    auto sub = sub_node.subscribe("/robot/arm/joint1");
+
+    uint32_t val = 7;
+    ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+    auto got = sub.try_receive();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(std::memcmp(got->data(), &val, sizeof(val)), 0);
+
+    // Also confirm Node::name() / prefix() return the sanitized form so
+    // callers can log/introspect the actual identifiers in use.
+    EXPECT_EQ(pub_node.prefix(), "test.ns");
+    EXPECT_EQ(pub_node.name(),   "drv");
+}
+
+TEST_F(NodeTest, EmptyTopicNameThrows)
+{
+    kickmsg::Node node("n", "test");
+    EXPECT_THROW(node.advertise("", small_cfg()), std::invalid_argument);
+    EXPECT_THROW(node.advertise("/",  small_cfg()), std::invalid_argument);
+}
+
 TEST_F(NodeTest, MailboxMultipleWriters)
 {
     track("/test_owner_mbx_inbox");
