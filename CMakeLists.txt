@@ -45,6 +45,7 @@ endif()
 add_library(kickmsg STATIC
     src/types.cc
     src/Hash.cc
+    src/Naming.cc
     src/Publisher.cc
     src/Subscriber.cc
     src/Region.cc

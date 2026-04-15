@@ -28,6 +28,14 @@ namespace kickmsg
     class Node
     {
     public:
+        // Name components (node name, namespace/prefix, topic, channel,
+        // owner, tag) are sanitized into a POSIX-shm-compatible form:
+        // leading '/' is stripped, interior '/' becomes '.', and any char
+        // outside [A-Za-z0-9._-] becomes '_'. This lets callers pass
+        // ROS-style paths like "/robot/arm/joint1" directly — the region
+        // ends up at "/<prefix>_robot.arm.joint1" in /dev/shm, still
+        // human-readable (no hashing). A component that sanitizes to the
+        // empty string throws std::invalid_argument.
         Node(std::string const& name, std::string const& prefix = "kickmsg");
 
         // Explicit non-copyable / move-only.  Node already holds SharedRegion

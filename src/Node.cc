@@ -1,10 +1,12 @@
 #include "kickmsg/Node.h"
 
+#include "kickmsg/Naming.h"
+
 namespace kickmsg
 {
     Node::Node(std::string const& name, std::string const& prefix)
-        : name_{name}
-        , prefix_{prefix}
+        : name_{sanitize_shm_component(name, "node")}
+        , prefix_{sanitize_shm_component(prefix, "namespace")}
     {
     }
 
@@ -136,17 +138,22 @@ namespace kickmsg
 
     std::string Node::make_topic_name(char const* topic) const
     {
-        return "/" + prefix_ + "_" + topic;
+        // prefix_ is pre-sanitized in the ctor; topic is user-supplied on
+        // each call and may be a ROS-style "/a/b/c" path.
+        return "/" + prefix_ + "_" + sanitize_shm_component(topic, "topic");
     }
 
     std::string Node::make_broadcast_name(char const* channel) const
     {
-        return "/" + prefix_ + "_broadcast_" + channel;
+        return "/" + prefix_ + "_broadcast_"
+             + sanitize_shm_component(channel, "channel");
     }
 
     std::string Node::make_mailbox_name(char const* owner, char const* tag) const
     {
-        return "/" + prefix_ + "_" + owner + "_mbx_" + tag;
+        return "/" + prefix_ + "_"
+             + sanitize_shm_component(owner, "mailbox owner") + "_mbx_"
+             + sanitize_shm_component(tag, "mailbox tag");
     }
 
     SharedRegion* Node::find_region(std::string const& shm_name)
