@@ -118,6 +118,49 @@ class HealthReport:
 
     def __repr__(self) -> str: ...
 
+class RingStats:
+    @property
+    def state(self) -> int:
+        """Ring state as raw int: 0=Free, 1=Live, 2=Draining."""
+
+    @property
+    def in_flight(self) -> int: ...
+
+    @property
+    def write_pos(self) -> int: ...
+
+    @property
+    def dropped_count(self) -> int: ...
+
+    @property
+    def lost_count(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
+class RegionStats:
+    @property
+    def rings(self) -> list[RingStats]: ...
+
+    @property
+    def total_writes(self) -> int: ...
+
+    @property
+    def total_drops(self) -> int: ...
+
+    @property
+    def total_losses(self) -> int: ...
+
+    @property
+    def live_rings(self) -> int: ...
+
+    @property
+    def pool_free(self) -> int: ...
+
+    @property
+    def pool_size(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
 class SharedRegion:
     @staticmethod
     def create(name: str, type: ChannelType, cfg: Config, creator: str = '') -> SharedRegion: ...
@@ -141,6 +184,9 @@ class SharedRegion:
     def reset_schema_claim(self) -> bool: ...
 
     def diagnose(self) -> HealthReport: ...
+
+    def stats(self) -> RegionStats:
+        """Runtime counter snapshot (per-ring + aggregate). Safe under live traffic."""
 
     def repair_locked_entries(self) -> int: ...
 

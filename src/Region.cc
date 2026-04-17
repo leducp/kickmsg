@@ -120,9 +120,11 @@ namespace kickmsg
         for (uint32_t i = 0; i < cfg.max_subscribers; ++i)
         {
             auto* ring = sub_ring_at(base(), h, i);
-            ring->state_flight = ring::make_packed(ring::Free);
-            ring->write_pos    = 0;
-            ring->has_waiter   = 0;
+            ring->state_flight  = ring::make_packed(ring::Free);
+            ring->write_pos     = 0;
+            ring->has_waiter    = 0;
+            ring->dropped_count = 0;
+            ring->lost_count    = 0;
         }
 
         // Write magic LAST with release: create_or_open() polls magic with
@@ -447,6 +449,63 @@ namespace kickmsg
             expected, schema::Unset,
             std::memory_order_acq_rel,
             std::memory_order_relaxed);
+    }
+
+    RegionStats SharedRegion::stats() const
+    {
+        auto const* b = base();
+        auto const* h = header();
+
+        RegionStats out{};
+        out.pool_size = h->pool_size;
+        out.rings.reserve(h->max_subs);
+
+        for (uint64_t i = 0; i < h->max_subs; ++i)
+        {
+            // sub_ring_at needs a non-const base*/header*, but the operation
+            // is read-only — const_cast is safe here.
+            auto* ring = sub_ring_at(const_cast<void*>(b),
+                                     h, static_cast<uint32_t>(i));
+            uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
+
+            RingStats rs{};
+            rs.state         = static_cast<uint32_t>(ring::get_state(packed));
+            rs.in_flight     = ring::get_in_flight(packed);
+            rs.write_pos     = ring->write_pos.load(std::memory_order_acquire);
+            rs.dropped_count = ring->dropped_count.load(std::memory_order_relaxed);
+            rs.lost_count    = ring->lost_count.load(std::memory_order_relaxed);
+
+            if (rs.state == ring::Live)
+            {
+                ++out.live_rings;
+                out.total_writes += rs.write_pos;
+            }
+            out.total_drops  += rs.dropped_count;
+            out.total_losses += rs.lost_count;
+
+            out.rings.push_back(rs);
+        }
+
+        // Approximate free-slot count: walk the Treiber stack from the head,
+        // bounded by pool_size so a concurrent push/pop storm can't fool us
+        // into an unbounded loop.  Under churn we can undercount (a slot
+        // being popped mid-walk) or overcount (a slot's next_free pointing
+        // to a just-pushed node we've already counted) — acceptable for a
+        // diagnostic view.
+        uint64_t top = h->free_top.load(std::memory_order_acquire);
+        uint32_t idx = tagged_idx(top);
+        uint64_t count = 0;
+        uint64_t const limit = h->pool_size;
+        while (idx != INVALID_SLOT and count <= limit)
+        {
+            if (idx >= h->pool_size) break;
+            auto* slot = slot_at(const_cast<void*>(b), h, idx);
+            idx = slot->next_free.load(std::memory_order_relaxed);
+            ++count;
+        }
+        out.pool_free = count;
+
+        return out;
     }
 
     std::size_t SharedRegion::reclaim_orphaned_slots()

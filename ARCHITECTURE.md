@@ -264,6 +264,15 @@ the two new fields: one cache line for `schema_state` (a
 eight cache lines for `schema_data` (512 B). Pre-v4 binaries are
 rejected at `open()` by the existing version check.
 
+Version bumped `4 → 5` for the cross-process runtime counters
+added to `SubRingHeader` (`dropped_count`, `lost_count` — see the
+Subscriber Ring section for their layout and semantics). The
+fields fit inside the existing `write_pos` cache-line padding, so
+`sizeof(SubRingHeader)` is unchanged, but the in-memory meaning of
+the bytes following `has_waiter` changed — v4 and v5 cannot share
+a region. Pre-v5 binaries are rejected at `open()` by the existing
+version check.
+
 
 ## Treiber Free Stack
 
@@ -325,11 +334,28 @@ Ring[0]
 - **has_waiter** (atomic uint32): set by the subscriber before blocking
   on `futex_wait`, cleared after. Publishers skip the `futex_wake_all`
   syscall when no subscriber is sleeping.
+- **dropped_count** (atomic uint64): cumulative count of publisher
+  delivery drops on this ring — incremented whenever the two-phase
+  commit CAS lock fails and the publisher falls through to the self-
+  repair / drop path. Cross-process visible; the per-Publisher
+  `dropped()` accessor reports the same events but counted per
+  instance.
+- **lost_count** (atomic uint64): cumulative count of subscriber
+  losses on this ring — bumped on every `++lost_` site (drain-ahead
+  skip, stale-overwrite, invalid-slot, unpinnable, seqlock miss).
+  Cross-process visible; `Subscriber::lost()` reports the same events
+  per instance.
 - **Sequence number** is monotonically increasing (`pos + 1`), used as a
   seqlock for data consistency validation and as a commit barrier between
   publishers (see Publish Flow below).
 - Stale entries (sequence < subscriber's expected) are detected and
   reported as lost messages.
+
+`write_pos`, `has_waiter`, `dropped_count`, `lost_count` all share one
+cache line: the hot path already owns this line when incrementing
+`write_pos`, so bumping the counters on a rare drop/loss adds no new
+coherency traffic.  Different rings target different lines (128 B
+stride), so publishers/subscribers on distinct rings never contend.
 
 ### Subscriber join and visibility window
 

@@ -185,6 +185,7 @@ namespace kickmsg
                 }
 
                 ++dropped_;
+                ring->dropped_count.fetch_add(1, std::memory_order_relaxed);
                 ++excess;
                 ring->state_flight.fetch_sub(ring::IN_FLIGHT_ONE,
                                              std::memory_order_release);

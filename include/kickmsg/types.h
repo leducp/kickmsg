@@ -20,7 +20,7 @@ namespace kickmsg
         "Kickmsg requires lock-free 32-bit atomics.");
 
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
-    constexpr uint32_t    VERSION         = 4;
+    constexpr uint32_t    VERSION         = 5;
     constexpr uint32_t    INVALID_SLOT    = UINT32_MAX;
     constexpr uint64_t    LOCKED_SEQUENCE = UINT64_MAX;
     constexpr std::size_t CACHE_LINE      = 64;
@@ -240,15 +240,23 @@ namespace kickmsg
     /// Per-subscriber ring header in shared memory.
     /// state_flight packs ring state and in_flight publisher count into one
     /// atomic, enabling single-CAS admission without cross-variable fences.
-    /// write_pos and has_waiter share a cache line: the publisher writes
-    /// write_pos then reads has_waiter, the subscriber reads write_pos then
-    /// writes has_waiter — both access the same line, one cache miss each.
+    /// write_pos, has_waiter, dropped_count, lost_count share a cache line:
+    /// the hot path already owns this line when incrementing write_pos, so
+    /// the extra fetch_add on a drop/loss path introduces no new cache-
+    /// coherency traffic.  Writers on different rings target different
+    /// lines (128 B stride), so no cross-ring false sharing either.
     struct SubRingHeader
     {
         alignas(CACHE_LINE) std::atomic<uint32_t> state_flight; ///< Packed [in_flight:30 | state:2]
         alignas(CACHE_LINE) std::atomic<uint64_t> write_pos;    ///< Monotonically increasing position counter
         std::atomic<uint32_t> has_waiter;                       ///< Set by subscriber before futex_wait
+        std::atomic<uint64_t> dropped_count;                    ///< Cumulative publisher drops on this ring (all publishers)
+        std::atomic<uint64_t> lost_count;                       ///< Cumulative subscriber losses on this ring (all subscribers)
     };
+    static_assert(sizeof(SubRingHeader) == 2 * CACHE_LINE,
+        "SubRingHeader must stay 2 cache lines — the counter fields fit in "
+        "the existing write_pos line padding; expanding this struct requires "
+        "reconsidering ring-stride math in Region.cc");
 
     /// Slot header: prepended to each payload buffer in the pool.
     /// Packed to guarantee binary layout across compilers.

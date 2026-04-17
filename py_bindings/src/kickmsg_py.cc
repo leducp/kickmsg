@@ -7,7 +7,8 @@
 ///     Config                 — channel::Config
 ///     SchemaInfo             — payload schema descriptor
 ///     HealthReport           — SharedRegion::diagnose() result
-///     SharedRegion           — factory methods + schema/health/repair
+///     RingStats / RegionStats — SharedRegion::stats() result
+///     SharedRegion           — factory methods + schema/health/repair/stats
 ///     Publisher              — send(bytes) + allocate() → AllocatedSlot
 ///     AllocatedSlot          — writable zero-copy handle + .publish()
 ///     Subscriber             — try_receive / receive (GIL release) / *_view
@@ -64,6 +65,7 @@
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "kickmsg/Node.h"
 #include "kickmsg/Publisher.h"
@@ -340,6 +342,48 @@ namespace kickmsg
             });
 
         // -------------------------------------------------------------------
+        // RingStats / RegionStats — runtime counter snapshot via stats()
+        // -------------------------------------------------------------------
+
+        nb::class_<RingStats>(m, "RingStats")
+            .def_ro("state",         &RingStats::state)
+            .def_ro("in_flight",     &RingStats::in_flight)
+            .def_ro("write_pos",     &RingStats::write_pos)
+            .def_ro("dropped_count", &RingStats::dropped_count)
+            .def_ro("lost_count",    &RingStats::lost_count)
+            .def("__repr__", [](RingStats const& r)
+            {
+                char const* state_name =
+                    r.state == ring::Free     ? "Free"     :
+                    r.state == ring::Live     ? "Live"     :
+                    r.state == ring::Draining ? "Draining" : "?";
+                return std::string{"RingStats(state="} + state_name +
+                       ", in_flight=" + std::to_string(r.in_flight) +
+                       ", write_pos=" + std::to_string(r.write_pos) +
+                       ", dropped=" + std::to_string(r.dropped_count) +
+                       ", lost=" + std::to_string(r.lost_count) + ")";
+            });
+
+        nb::class_<RegionStats>(m, "RegionStats")
+            .def_ro("rings",        &RegionStats::rings)
+            .def_ro("total_writes", &RegionStats::total_writes)
+            .def_ro("total_drops",  &RegionStats::total_drops)
+            .def_ro("total_losses", &RegionStats::total_losses)
+            .def_ro("live_rings",   &RegionStats::live_rings)
+            .def_ro("pool_free",    &RegionStats::pool_free)
+            .def_ro("pool_size",    &RegionStats::pool_size)
+            .def("__repr__", [](RegionStats const& s)
+            {
+                return std::string{"RegionStats(live_rings="} +
+                       std::to_string(s.live_rings) +
+                       ", total_writes=" + std::to_string(s.total_writes) +
+                       ", total_drops=" + std::to_string(s.total_drops) +
+                       ", total_losses=" + std::to_string(s.total_losses) +
+                       ", pool_free=" + std::to_string(s.pool_free) +
+                       "/" + std::to_string(s.pool_size) + ")";
+            });
+
+        // -------------------------------------------------------------------
         // SharedRegion
         // -------------------------------------------------------------------
 
@@ -364,6 +408,9 @@ namespace kickmsg
             .def("try_claim_schema",   &SharedRegion::try_claim_schema,   "info"_a)
             .def("reset_schema_claim", &SharedRegion::reset_schema_claim)
             .def("diagnose",               &SharedRegion::diagnose)
+            .def("stats",                  &SharedRegion::stats,
+                 "Runtime counter snapshot (per-ring + aggregate). "
+                 "Safe under live traffic.")
             .def("repair_locked_entries", &SharedRegion::repair_locked_entries)
             .def("reset_retired_rings",   &SharedRegion::reset_retired_rings)
             .def("reclaim_orphaned_slots",&SharedRegion::reclaim_orphaned_slots)
