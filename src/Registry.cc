@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "kickmsg/Naming.h"
 #include "kickmsg/os/Process.h"
@@ -71,17 +72,17 @@ namespace kickmsg
         std::string name = make_shm_name(kmsg_namespace);
         std::size_t bytes = region_size(capacity);
 
-        Registry r;
-        r.name_ = name;
-        if (r.shm_.try_create(name, bytes))
         {
-            r.init_as_creator(capacity);
-            return r;
+            Registry r;
+            r.name_ = name;
+            if (r.shm_.try_create(name, bytes))
+            {
+                r.init_as_creator(capacity);
+                return r;
+            }
         }
-        r.name_.clear();
 
-        // Creator lost — spin-wait for MAGIC to guarantee we don't read
-        // half-initialized bytes.
+        // Spin-wait on MAGIC — the creator publishes it last.
         for (int i = 0; i < 200; ++i)
         {
             SharedMemory shm;
@@ -113,48 +114,88 @@ namespace kickmsg
     }
 
     uint32_t Registry::register_participant(std::string const& shm_name,
+                                            std::string const& topic_name,
                                             channel::Type      channel_type,
+                                            registry::Kind     kind,
                                             registry::Role     role,
                                             std::string const& node_name)
     {
-        auto*    h   = header();
-        auto*    es  = entries();
-        uint32_t cap = h->capacity;
-
-        for (uint32_t i = 0; i < cap; ++i)
+        auto try_claim = [&]() -> uint32_t
         {
-            uint32_t expected = registry::Free;
-            if (not es[i].state.compare_exchange_strong(
-                    expected, registry::Claiming,
-                    std::memory_order_acq_rel,
-                    std::memory_order_relaxed))
+            auto*    h   = header();
+            auto*    es  = entries();
+            uint32_t cap = h->capacity;
+
+            auto copy_field = [](char* dst, std::size_t dst_size,
+                                 std::string const& src)
             {
-                continue;
+                std::memset(dst, 0, dst_size);
+                std::size_t n = std::min(src.size(), dst_size - 1);
+                std::memcpy(dst, src.data(), n);
+            };
+
+            uint64_t my_pid       = current_pid();
+            uint64_t my_starttime = process_starttime(my_pid);
+            uint64_t now_ns       = static_cast<uint64_t>(
+                                        kickmsg::since_epoch().count());
+
+            for (uint32_t i = 0; i < cap; ++i)
+            {
+                uint32_t expected = registry::Free;
+                if (not es[i].state.compare_exchange_strong(
+                        expected, registry::Claiming,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed))
+                {
+                    continue;
+                }
+
+                // pid_starttime must be written before pid's release-store
+                // so a sweeper's acquire-load of pid sees a matching
+                // starttime.
+                es[i].pid_starttime.store(my_starttime, std::memory_order_relaxed);
+                es[i].pid.store(my_pid, std::memory_order_release);
+
+                es[i].generation.fetch_add(1, std::memory_order_relaxed);
+
+                es[i].channel_type.store(static_cast<uint32_t>(channel_type),
+                                         std::memory_order_relaxed);
+                es[i].role.store(static_cast<uint32_t>(role),
+                                 std::memory_order_relaxed);
+                es[i].kind.store(static_cast<uint32_t>(kind),
+                                 std::memory_order_relaxed);
+                es[i].created_at_ns.store(now_ns, std::memory_order_relaxed);
+
+                copy_field(es[i].shm_name,   sizeof(es[i].shm_name),   shm_name);
+                copy_field(es[i].topic_name, sizeof(es[i].topic_name), topic_name);
+                copy_field(es[i].node_name,  sizeof(es[i].node_name),  node_name);
+                std::memset(es[i]._padding, 0, sizeof(es[i]._padding));
+
+                es[i].state.store(registry::Active, std::memory_order_release);
+                return i;
             }
+            return INVALID_SLOT;
+        };
 
-            // Field stores are relaxed; the release-store of Active below
-            // is the publication fence for readers.
-            es[i].channel_type  = static_cast<uint32_t>(channel_type);
-            es[i].role          = static_cast<uint32_t>(role);
-            es[i]._padding1     = 0;
-            es[i].pid           = current_pid();
-            es[i].created_at_ns = static_cast<uint64_t>(
-                                      kickmsg::since_epoch().count());
-
-            std::memset(es[i].shm_name, 0, sizeof(es[i].shm_name));
-            std::size_t n = std::min(shm_name.size(), sizeof(es[i].shm_name) - 1);
-            std::memcpy(es[i].shm_name, shm_name.data(), n);
-
-            std::memset(es[i].node_name, 0, sizeof(es[i].node_name));
-            n = std::min(node_name.size(), sizeof(es[i].node_name) - 1);
-            std::memcpy(es[i].node_name, node_name.data(), n);
-
-            std::memset(es[i]._padding2, 0, sizeof(es[i]._padding2));
-
-            es[i].state.store(registry::Active, std::memory_order_release);
-            return i;
+        uint32_t slot = try_claim();
+        if (slot != INVALID_SLOT)
+        {
+            return slot;
         }
-
+        // Registry full — sweep dead-pid residue and retry.  Bounded to
+        // avoid livelock when many registrants race on a full registry.
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            if (sweep_stale() == 0)
+            {
+                break;
+            }
+            slot = try_claim();
+            if (slot != INVALID_SLOT)
+            {
+                return slot;
+            }
+        }
         return INVALID_SLOT;
     }
 
@@ -170,6 +211,11 @@ namespace kickmsg
         {
             return;
         }
+        // Fields are intentionally not zeroed: a concurrent snapshot may
+        // still be reading them, and partial zeroing before state=Free
+        // would create torn reads that the seqlock can't catch.  The
+        // next claim overwrites every field.
+        es[slot_index].generation.fetch_add(1, std::memory_order_relaxed);
         es[slot_index].state.store(registry::Free, std::memory_order_release);
     }
 
@@ -183,33 +229,100 @@ namespace kickmsg
         out.reserve(cap);
         for (uint32_t i = 0; i < cap; ++i)
         {
-            uint32_t s = es[i].state.load(std::memory_order_acquire);
-            if (s != registry::Active)
+            uint32_t s1 = es[i].state.load(std::memory_order_acquire);
+            if (s1 != registry::Active)
             {
                 continue;
             }
+            uint32_t g1 = es[i].generation.load(std::memory_order_acquire);
 
             Participant p{};
-            p.pid           = es[i].pid;
-            p.created_at_ns = es[i].created_at_ns;
-            p.channel_type  = es[i].channel_type;
-            p.role          = es[i].role;
+            p.pid           = es[i].pid.load(std::memory_order_relaxed);
+            p.pid_starttime = es[i].pid_starttime.load(std::memory_order_relaxed);
+            p.created_at_ns = es[i].created_at_ns.load(std::memory_order_relaxed);
+            p.channel_type  = es[i].channel_type.load(std::memory_order_relaxed);
+            p.role          = es[i].role.load(std::memory_order_relaxed);
+            p.kind          = es[i].kind.load(std::memory_order_relaxed);
             p.shm_name.assign(
                 es[i].shm_name,
                 ::strnlen(es[i].shm_name, sizeof(es[i].shm_name)));
+            p.topic_name.assign(
+                es[i].topic_name,
+                ::strnlen(es[i].topic_name, sizeof(es[i].topic_name)));
             p.node_name.assign(
                 es[i].node_name,
                 ::strnlen(es[i].node_name, sizeof(es[i].node_name)));
 
-            // Seqlock-style recheck: if the slot was dereg'd and reclaimed
-            // while we copied, our fields may mix two tenants.
+            // Seqlock recheck: reject if state changed or generation bumped.
+            uint32_t g2 = es[i].generation.load(std::memory_order_acquire);
             uint32_t s2 = es[i].state.load(std::memory_order_acquire);
-            if (s2 != registry::Active)
+            if (s2 != registry::Active or g1 != g2)
             {
                 continue;
             }
             out.push_back(std::move(p));
         }
+        return out;
+    }
+
+    std::vector<TopicSummary> Registry::list_topics() const
+    {
+        auto raw = snapshot();
+
+        std::unordered_map<std::string, TopicSummary> by_shm;
+        by_shm.reserve(raw.size());
+
+        for (auto const& p : raw)
+        {
+            auto [iter, inserted] = by_shm.try_emplace(p.shm_name);
+            auto& sum = iter->second;
+            if (inserted)
+            {
+                sum.shm_name     = p.shm_name;
+                sum.topic_name   = p.topic_name;
+                sum.channel_type = p.channel_type;
+                sum.kind         = p.kind;
+            }
+
+            bool alive  = process_exists(p.pid);
+            bool is_pub = (p.role == registry::Publisher
+                        or p.role == registry::Both);
+            bool is_sub = (p.role == registry::Subscriber
+                        or p.role == registry::Both);
+
+            if (is_pub)
+            {
+                if (alive)
+                {
+                    sum.producers.push_back(p);
+                }
+                else
+                {
+                    sum.stall_producers.push_back(p);
+                }
+            }
+            if (is_sub)
+            {
+                if (alive)
+                {
+                    sum.consumers.push_back(p);
+                }
+                else
+                {
+                    sum.stall_consumers.push_back(p);
+                }
+            }
+        }
+
+        std::vector<TopicSummary> out;
+        out.reserve(by_shm.size());
+        for (auto& [_, sum] : by_shm)
+        {
+            out.push_back(std::move(sum));
+        }
+        std::sort(out.begin(), out.end(),
+                  [](TopicSummary const& a, TopicSummary const& b)
+                  { return a.shm_name < b.shm_name; });
         return out;
     }
 
@@ -219,27 +332,83 @@ namespace kickmsg
         auto*    es  = entries();
         uint32_t cap = h->capacity;
 
+        // Live PID + matching boot-relative starttime = same process.
+        // If either starttime is 0 (platform doesn't expose it), degrade
+        // to trust-pid-alone.
+        auto is_dead = [](uint64_t pid, uint64_t stored_start) -> bool
+        {
+            if (not process_exists(pid))
+            {
+                return true;
+            }
+            uint64_t live_start = process_starttime(pid);
+            if (stored_start == 0 or live_start == 0)
+            {
+                return false;
+            }
+            return stored_start != live_start;
+        };
+
         uint32_t freed = 0;
         for (uint32_t i = 0; i < cap; ++i)
         {
             uint32_t s = es[i].state.load(std::memory_order_acquire);
-            if (s != registry::Active)
+            if (s != registry::Active and s != registry::Claiming)
             {
                 continue;
             }
-            uint64_t pid = es[i].pid;
-            if (process_exists(pid))
+            // Acquire syncs with register_participant's release-store of
+            // pid, so we see a valid pid even while state==Claiming.
+            uint64_t pid = es[i].pid.load(std::memory_order_acquire);
+            if (pid == 0)
+            {
+                // Registrant hasn't stored its pid yet — reclaiming here
+                // would race with its pending field writes.
+                continue;
+            }
+            uint64_t stored_start = es[i].pid_starttime.load(
+                                        std::memory_order_relaxed);
+            if (not is_dead(pid, stored_start))
             {
                 continue;
             }
-            uint32_t expected = registry::Active;
-            if (es[i].state.compare_exchange_strong(
-                    expected, registry::Free,
+
+            // Phase 1: CAS to Reclaiming to block concurrent registrants
+            // and close the ABA window on a direct state→Free CAS.
+            uint32_t expected = s;
+            if (not es[i].state.compare_exchange_strong(
+                    expected, registry::Reclaiming,
                     std::memory_order_acq_rel,
                     std::memory_order_relaxed))
             {
-                ++freed;
+                continue;
             }
+
+            // Re-verify under our exclusive hold.  A full dereg+register
+            // cycle could have slipped in between our initial pid read
+            // and the CAS above.
+            uint64_t post_pid   = es[i].pid.load(std::memory_order_acquire);
+            uint64_t post_start = es[i].pid_starttime.load(
+                                      std::memory_order_relaxed);
+            if (post_pid != pid or post_start != stored_start or
+                not is_dead(post_pid, post_start))
+            {
+                // Restore via CAS, not blind store: a live tenant may
+                // have legitimately dereg'd (state==Free) and a blind
+                // store of `s` would resurrect the slot.
+                uint32_t reclaiming_expected = registry::Reclaiming;
+                es[i].state.compare_exchange_strong(
+                    reclaiming_expected, s,
+                    std::memory_order_release,
+                    std::memory_order_relaxed);
+                continue;
+            }
+
+            // Phase 2: finalize.  Fields are left untouched — same
+            // reasoning as deregister().
+            es[i].generation.fetch_add(1, std::memory_order_relaxed);
+            es[i].state.store(registry::Free, std::memory_order_release);
+            ++freed;
         }
         return freed;
     }

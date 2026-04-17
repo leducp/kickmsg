@@ -473,7 +473,15 @@ namespace kickmsg
             if (rs.state == ring::Live)
             {
                 ++out.live_rings;
-                out.total_writes += rs.write_pos;
+            }
+            // Max across ALL rings: a Free ring's write_pos is frozen at
+            // whatever value it had when its last subscriber left, so it's
+            // a valid past observation.  Using max (not sum) matches the
+            // "publish events observed by the channel" semantic and stays
+            // monotonic across subscriber churn.
+            if (rs.write_pos > out.total_writes)
+            {
+                out.total_writes = rs.write_pos;
             }
             out.total_drops  += rs.dropped_count;
             out.total_losses += rs.lost_count;
@@ -491,7 +499,7 @@ namespace kickmsg
         uint32_t idx = tagged_idx(top);
         uint64_t count = 0;
         uint64_t const limit = h->pool_size;
-        while (idx != INVALID_SLOT and count <= limit)
+        while (idx != INVALID_SLOT and count < limit)
         {
             if (idx >= h->pool_size) break;
             auto* slot = slot_at(const_cast<void*>(b), h, idx);

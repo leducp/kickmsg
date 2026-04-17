@@ -36,4 +36,10 @@ if(NOT WIN32)
     set_target_properties(kickmsg_crash_test
         PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+    add_executable(kickmsg_registry_stress_test registry_stress_test.cc)
+    target_link_libraries(kickmsg_registry_stress_test PRIVATE kickmsg)
+    set_target_properties(kickmsg_registry_stress_test
+        PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()

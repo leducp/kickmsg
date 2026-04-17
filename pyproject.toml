@@ -12,6 +12,9 @@ maintainers = [
   {name = "Philippe Leduc", email = "philippe.leduc@mailfence.com"}
 ]
 
+[project.scripts]
+kickmsg = "kickmsg._cli:main"
+
 [tool.scikit-build]
 minimum-version = "0.11"
 cmake.version = ">=3.30"

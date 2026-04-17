@@ -29,7 +29,7 @@ namespace kickmsg
     struct RegionStats
     {
         std::vector<RingStats> rings;   ///< One entry per subscriber-ring slot (length == max_subs)
-        uint64_t total_writes;          ///< Sum of write_pos over Live rings
+        uint64_t total_writes;          ///< Max of write_pos across all rings: publish events observed by the channel, monotonic across subscriber churn
         uint64_t total_drops;           ///< Sum of dropped_count across all rings
         uint64_t total_losses;          ///< Sum of lost_count across all rings
         uint64_t live_rings;            ///< Number of rings currently Live

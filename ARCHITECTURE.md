@@ -258,12 +258,6 @@ region.
   first, here's what they wrote, you decide." The library never
   throws on schema grounds.
 
-Version bumped `3 → 4` because the `Header` binary layout grew by
-the two new fields: one cache line for `schema_state` (a
-`uint32_t` atomic padded to 64 B by `alignas(CACHE_LINE)`) plus
-eight cache lines for `schema_data` (512 B). Pre-v4 binaries are
-rejected at `open()` by the existing version check.
-
 Version bumped `4 → 5` for the cross-process runtime counters
 added to `SubRingHeader` (`dropped_count`, `lost_count` — see the
 Subscriber Ring section for their layout and semantics). The
@@ -1237,17 +1231,24 @@ the **participant registry**.
 
 ### What it is
 
-A single dedicated shared-memory region per prefix, at
-`/{prefix}_registry`, holding a fixed-size array of participant
-entries.  Each entry records one `(Node, channel, role)` membership:
+A single dedicated shared-memory region per namespace, at
+`/{namespace}_registry`, holding a fixed-size array of participant
+entries.  Each entry records one `(Node, channel, role)` membership.
+All scalar fields are `std::atomic<T>` so that the seqlock protocol
+between the writer and a concurrent new-tenant claim never involves
+plain non-atomic accesses on the same bytes:
 
-- `pid` — OS process id of the owner
+- `state` — atomic `Free` / `Claiming` / `Active` / `Reclaiming`
+- `generation` — atomic counter bumped on every claim and release (seqlock)
+- `pid` — atomic; OS process id of the owner
+- `pid_starttime` — atomic; opaque OS-specific process start time
+- `channel_type` — atomic; PubSub / Broadcast
+- `role` — atomic; Publisher / Subscriber / Both
+- `kind` — atomic; Pubsub / Broadcast / Mailbox (registry-level intent tag)
+- `topic_name` — user-facing path (leading `/`, interior `/` preserved)
+- `shm_name` — implementation-level POSIX path
 - `node_name` — the `Node` that registered
-- `shm_name` — the channel region this participant is attached to
-- `channel_type` — PubSub / Broadcast
-- `role` — Publisher / Subscriber / Both (broadcast)
-- `created_at_ns` — registration timestamp
-- `state` — atomic `Free` / `Claiming` / `Active`
+- `created_at_ns` — atomic; registration timestamp
 
 A `Node` lazily opens-or-creates the registry on its first
 `advertise` / `subscribe` / `join_broadcast` / `create_mailbox` /
@@ -1267,14 +1268,26 @@ all three targets.
 Free (0) ── CAS ──► Claiming (1) ── release-store ──► Active (2)
    ▲                                                    │
    │                                                    │
-   └────────── deregister: store-release ◄──────────────┘
-                (or sweep_stale: CAS(Active → Free))
+   ├────────── deregister: store-release ◄──────────────┤
+   │                                                    │
+   │            sweep_stale:                            │
+   └── CAS(Reclaiming → Free) ◄── CAS(Active | Claiming → Reclaiming)
 ```
 
 Snapshots acquire-load `state` per slot; only `Active` entries are
 returned.  The `Claiming` state is the publication fence for the
 field bytes — a reader observing `Active` is guaranteed to see all
 the field writes that happened-before the release-store.
+
+`Reclaiming` is the exclusive lock held by `sweep_stale` while it
+verifies the dead-pid condition and finalizes the slot to `Free`.
+It blocks concurrent registrants (they need `Free → Claiming`) and
+prevents ABA on the state CAS: without it, a full `dereg + register`
+cycle on another CPU could restore the slot to `Active` between the
+sweeper's pid check and its CAS, causing the sweeper to stomp a live
+tenant's registration.  `sweep_stale` releases `Reclaiming` back to
+the pre-CAS value if the re-verified pid differs from what it
+observed (ABA detected), so the live tenant is restored.
 
 ### Role upgrade
 
@@ -1288,26 +1301,75 @@ connect time only — zero hot-path cost.
 
 The registry does not track heartbeats.  A crashed process that
 never ran its `Node` destructor leaves its entries stuck at
-`Active` until reclaimed.  Two recovery paths:
+`Active` (or `Claiming`, if it died mid-register) until reclaimed.
+Two recovery paths:
 
 - **Query-time filter**: diagnostic tools probe each entry's pid via
   `process_exists()` and hide dead entries from the user without
   touching the registry.  Non-invasive; safe under live traffic.
-- **`Registry::sweep_stale()`**: iterates active entries and
-  CAS-resets any slot whose owner pid is gone.  Opt-in cleanup for
-  an operator or supervisor sweep; not automatic.
+- **`Registry::sweep_stale()`**: CAS-resets any `Active` or `Claiming`
+  slot whose `pid` is dead.  Opt-in cleanup for an operator or
+  supervisor sweep; also called opportunistically from
+  `register_participant` when the registry is full, so long-running
+  deployments don't silently drop new registrations as crashed-process
+  residue accumulates.
 
-Split deliberately so a concurrent read never rewrites the registry
-under another process's feet.
+The `Claiming` reclaim branch skips slots where `pid == 0`: that state
+is the brief window between the `Free→Claiming` CAS and the
+registrant's first field store.  Claiming the slot in that window
+would stomp a live registrant.  Cost: an early crash (before the pid
+store) leaks one slot until the region is unlinked.
+
+**PID-reuse mitigation.**  `pid_starttime` is captured at register
+time: `/proc/<pid>/stat` on Linux, `sysctl(KERN_PROC_PID)` on Darwin,
+`GetProcessTimes()` on Windows.  Sweep compares the stored starttime
+against the live process's starttime; a PID-reuse after wraparound
+yields a different value and we reclaim.  If the OS returns 0 (the
+process is gone by the time we query), the check degrades to
+PID-alone.
 
 ### Sizing
 
-Default capacity is 1024 slots × 256 B = 256 KB per prefix.  A robot
+Default capacity is 4096 slots × 512 B = 2 MB per namespace.  A robot
 telemetry Node typically holds a few hundred topics; the registry is
 sized for an order of magnitude of headroom above that.  Exhaustion
 is non-fatal: `register_participant` returns `INVALID_SLOT` and the
 Node continues to work without a discovery row — registration is a
 diagnostic nicety, not a correctness dependency.
+
+### Implicit invariants
+
+Load-bearing assumptions for anyone editing the registry:
+
+- **Field order is ABI.**  `sizeof(ParticipantEntry) == 512` and
+  `offsetof(…, _padding) == 368` are statically asserted; any field
+  reorder or resize must update the padding and bump `registry::VERSION`.
+- **State publication fence.**  `state.store(Active, release)` in
+  `register_participant` is the one fence that publishes all field
+  writes that preceded it.  `pid` has its own earlier release-store so
+  `sweep_stale` can acquire-load it while state is still `Claiming`
+  (before the Active fence).  Any new field that needs to be visible
+  during `Claiming` must use its own release/acquire pair.
+- **Generation bump on every mutation.**  `generation` is bumped by
+  `register_participant` *and* by `deregister` *and* by
+  `sweep_stale`'s reclaim path.  A snapshot's seqlock recheck detects
+  only mutations that bump gen — adding a future write-path that
+  modifies fields without bumping gen will cause torn reads.
+- **`touch_registry` must never throw.**  `Node::advertise` and friends
+  treat registration as best-effort.  A failure is logged once per
+  `Node` (latched via `registry_disabled_`) and subsequent calls
+  become no-ops.  Don't change this contract without also changing
+  `Node::advertise`'s error handling.
+- **Role upgrade has a brief visibility gap.**  `touch_registry`
+  upgrades Publisher/Subscriber → Both via `deregister` + re-register
+  (no atomic "change role in place" primitive).  A concurrent
+  `snapshot()` may see this Node absent for ~1 µs during the swap.
+  Callers treating an empty `list_topics` result as "definitely
+  absent" are wrong; the right reading is "absent or in a brief gap."
+- **`Kind` and ring state enums are stringified in two places.**  The
+  native binding's `__repr__` methods and the Python `_KIND_NAME` /
+  ring-state maps in `diagnostics.py` must stay in sync when a new
+  enum value is added.
 
 
 ## Design Tradeoffs

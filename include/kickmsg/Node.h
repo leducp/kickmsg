@@ -148,7 +148,9 @@ namespace kickmsg
         /// to `Both` if this Node already has one with the complementary
         /// role. Registry failures are logged and swallowed.
         void touch_registry(std::string const& shm_name,
+                            std::string const& topic_name,
                             channel::Type      channel_type,
+                            registry::Kind     kind,
                             registry::Role     role);
 
         std::string name_;
@@ -166,6 +168,8 @@ namespace kickmsg
         struct RegistrySlot { uint32_t slot_index; registry::Role role; };
         std::unordered_map<std::string, RegistrySlot> registry_slots_;
         std::optional<Registry> registry_;
+        bool registry_disabled_ = false;  ///< latched on first registry failure
+        bool registry_full_warned_ = false;  ///< latched after first INVALID_SLOT log
     };
 }
 

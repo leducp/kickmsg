@@ -39,6 +39,7 @@ else()
             src/os/darwin/Time.cc
             src/os/darwin/SharedMemory.cc
             src/os/darwin/Futex.cc
+            src/os/darwin/Process.cc
         )
         set(OS_LIBRARIES pthread)
     else()
@@ -46,6 +47,7 @@ else()
             src/os/linux/Time.cc
             src/os/linux/SharedMemory.cc
             src/os/linux/Futex.cc
+            src/os/linux/Process.cc
         )
         set(OS_LIBRARIES rt pthread)
     endif()

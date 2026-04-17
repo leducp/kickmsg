@@ -76,6 +76,7 @@
 #include "kickmsg/Registry.h"
 #include "kickmsg/Subscriber.h"
 #include "kickmsg/Hash.h"
+#include "kickmsg/os/Process.h"
 #include "kickmsg/types.h"
 
 namespace nb = nanobind;
@@ -214,9 +215,12 @@ namespace
 
 namespace kickmsg
 {
-    NB_MODULE(kickmsg, m)
+    // Native module name is `_native`; the outer `kickmsg/__init__.py` does
+    // `from ._native import *` so user-visible import paths (kickmsg.Publisher,
+    // kickmsg.Node, …) are unchanged.
+    NB_MODULE(_native, m)
     {
-        m.doc() = "Kickmsg — lock-free shared-memory IPC";
+        m.doc() = "Kickmsg — lock-free shared-memory IPC (native bindings)";
 
         // -------------------------------------------------------------------
         // Enums & simple types
@@ -357,10 +361,13 @@ namespace kickmsg
             .def_ro("lost_count",    &RingStats::lost_count)
             .def("__repr__", [](RingStats const& r)
             {
-                char const* state_name =
-                    r.state == ring::Free     ? "Free"     :
-                    r.state == ring::Live     ? "Live"     :
-                    r.state == ring::Draining ? "Draining" : "?";
+                char const* state_name = "?";
+                switch (r.state)
+                {
+                    case ring::Free:     state_name = "Free";     break;
+                    case ring::Live:     state_name = "Live";     break;
+                    case ring::Draining: state_name = "Draining"; break;
+                }
                 return std::string{"RingStats(state="} + state_name +
                        ", in_flight=" + std::to_string(r.in_flight) +
                        ", write_pos=" + std::to_string(r.write_pos) +
@@ -439,23 +446,53 @@ namespace kickmsg
             .value("Subscriber", registry::Subscriber)
             .value("Both",       registry::Both);
 
+        nb::enum_<registry::Kind>(m, "Kind")
+            .value("Pubsub",    registry::Pubsub)
+            .value("Broadcast", registry::Broadcast)
+            .value("Mailbox",   registry::Mailbox);
+
         nb::class_<Participant>(m, "Participant")
-            .def_ro("pid",           &Participant::pid)
-            .def_ro("created_at_ns", &Participant::created_at_ns)
-            .def_ro("channel_type",  &Participant::channel_type)
-            .def_ro("role",          &Participant::role)
-            .def_ro("shm_name",      &Participant::shm_name)
-            .def_ro("node_name",     &Participant::node_name)
+            .def_ro("pid",            &Participant::pid)
+            .def_ro("pid_starttime",  &Participant::pid_starttime)
+            .def_ro("created_at_ns",  &Participant::created_at_ns)
+            .def_ro("channel_type",   &Participant::channel_type)
+            .def_ro("role",           &Participant::role)
+            .def_ro("kind",           &Participant::kind)
+            .def_ro("shm_name",       &Participant::shm_name)
+            .def_ro("topic_name",     &Participant::topic_name)
+            .def_ro("node_name",      &Participant::node_name)
             .def("__repr__", [](Participant const& p)
             {
-                char const* role_name =
-                    p.role == registry::Publisher  ? "Publisher"  :
-                    p.role == registry::Subscriber ? "Subscriber" :
-                    p.role == registry::Both       ? "Both"       : "?";
-                return std::string{"Participant(shm='"} + p.shm_name +
+                char const* role_name = "?";
+                switch (p.role)
+                {
+                    case registry::Publisher:  role_name = "Publisher";  break;
+                    case registry::Subscriber: role_name = "Subscriber"; break;
+                    case registry::Both:       role_name = "Both";       break;
+                }
+                return std::string{"Participant(topic='"} + p.topic_name +
                        "', node='" + p.node_name +
                        "', pid=" + std::to_string(p.pid) +
                        ", role=" + role_name + ")";
+            });
+
+        nb::class_<TopicSummary>(m, "TopicSummary")
+            .def_ro("shm_name",        &TopicSummary::shm_name)
+            .def_ro("topic_name",      &TopicSummary::topic_name)
+            .def_ro("channel_type",    &TopicSummary::channel_type)
+            .def_ro("kind",            &TopicSummary::kind)
+            .def_ro("producers",       &TopicSummary::producers)
+            .def_ro("consumers",       &TopicSummary::consumers)
+            .def_ro("stall_producers", &TopicSummary::stall_producers)
+            .def_ro("stall_consumers", &TopicSummary::stall_consumers)
+            .def("__repr__", [](TopicSummary const& t)
+            {
+                return std::string{"TopicSummary(topic='"} + t.topic_name +
+                       "', producers=" + std::to_string(t.producers.size()) +
+                       ", consumers=" + std::to_string(t.consumers.size()) +
+                       ", stalled=" +
+                       std::to_string(t.stall_producers.size()
+                                      + t.stall_consumers.size()) + ")";
             });
 
         nb::class_<Registry>(m, "Registry")
@@ -468,6 +505,9 @@ namespace kickmsg
             .def("snapshot", &Registry::snapshot,
                  "Copy all currently Active participant entries.  Does not "
                  "filter by process liveness.")
+            .def("list_topics", &Registry::list_topics,
+                 "Topic-centric view: groups participants by shm_name and "
+                 "splits them into producer/consumer × alive/stall lanes.")
             .def("sweep_stale", &Registry::sweep_stale,
                  "Reclaim slots owned by processes that no longer exist.  "
                  "Returns the number of slots freed.")
@@ -478,6 +518,11 @@ namespace kickmsg
                 return std::string{"Registry(name='"} + r.name() +
                        "', capacity=" + std::to_string(r.capacity()) + ")";
             });
+
+        m.def("process_exists", &process_exists, "pid"_a,
+              "Return True if a process with `pid` exists on this host.");
+        m.def("current_pid", &current_pid,
+              "Return the PID of the current process.");
 
         // SampleRef (the C++ byte-copy sample) is not bound directly —
         // try_receive() / receive() auto-convert it to `bytes` at the

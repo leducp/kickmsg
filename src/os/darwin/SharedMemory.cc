@@ -16,6 +16,15 @@ namespace kickmsg
         // Darwin's shm_open(O_CREAT|O_TRUNC) returns EINVAL on an existing
         // object, and ftruncate can only be called once per object.  Unlink
         // first, then exclusive-create, to sidestep both.
+        //
+        // NOTE: the unlink + exclusive-create sequence is NOT safe under
+        // concurrent callers (two processes could both unlink, then both
+        // exclusive-create different objects with the same name).  This
+        // function is called only from SharedRegion::create(), whose
+        // documented contract is "caller intends exclusive ownership"
+        // (publisher-arrives-first ordering).  The race-prone multi-
+        // creator path uses try_create (in posix/SharedMemory.cc), which
+        // is a pure O_EXCL probe with no unlink and is safe.
         ::shm_unlink(name.c_str());
         fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
         if (fd_ < 0)

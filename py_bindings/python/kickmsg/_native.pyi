@@ -208,9 +208,19 @@ class Role(enum.Enum):
 
     Both = 3
 
+class Kind(enum.Enum):
+    Pubsub = 1
+
+    Broadcast = 2
+
+    Mailbox = 3
+
 class Participant:
     @property
     def pid(self) -> int: ...
+
+    @property
+    def pid_starttime(self) -> int: ...
 
     @property
     def created_at_ns(self) -> int: ...
@@ -222,10 +232,43 @@ class Participant:
     def role(self) -> int: ...
 
     @property
+    def kind(self) -> int: ...
+
+    @property
     def shm_name(self) -> str: ...
 
     @property
+    def topic_name(self) -> str: ...
+
+    @property
     def node_name(self) -> str: ...
+
+    def __repr__(self) -> str: ...
+
+class TopicSummary:
+    @property
+    def shm_name(self) -> str: ...
+
+    @property
+    def topic_name(self) -> str: ...
+
+    @property
+    def channel_type(self) -> int: ...
+
+    @property
+    def kind(self) -> int: ...
+
+    @property
+    def producers(self) -> list[Participant]: ...
+
+    @property
+    def consumers(self) -> list[Participant]: ...
+
+    @property
+    def stall_producers(self) -> list[Participant]: ...
+
+    @property
+    def stall_consumers(self) -> list[Participant]: ...
 
     def __repr__(self) -> str: ...
 
@@ -240,6 +283,9 @@ class Registry:
 
     def snapshot(self) -> list[Participant]:
         """Copy all currently Active participant entries. Does not filter by process liveness."""
+
+    def list_topics(self) -> list[TopicSummary]:
+        """Topic-centric view: groups participants by shm_name and splits them into producer/consumer × alive/stall lanes."""
 
     def sweep_stale(self) -> int:
         """Reclaim slots owned by processes that no longer exist. Returns the number of slots freed."""
