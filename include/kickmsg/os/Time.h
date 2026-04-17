@@ -9,6 +9,9 @@ namespace kickmsg
 
     void sleep(nanoseconds ns);
 
+    /// Release the current timeslice back to the scheduler.
+    void yield();
+
     nanoseconds since_epoch();
 
     nanoseconds elapsed_time(nanoseconds start);

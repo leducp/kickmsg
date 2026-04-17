@@ -210,7 +210,7 @@ bool run_subscriber_saturation()
                     std::fprintf(stderr, "  [FATAL] send() returned %d\n", rc);
                     std::abort();
                 }
-                kickmsg::sleep(0ns);
+                kickmsg::yield();
             }
         }
     }

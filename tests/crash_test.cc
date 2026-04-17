@@ -49,7 +49,7 @@ static void child_publisher_main(int /*round*/)
         auto* ptr = pub.allocate(sizeof(CrashPayload));
         if (ptr == nullptr)
         {
-            kickmsg::sleep(0ns);
+            kickmsg::yield();
             continue;
         }
 
@@ -182,7 +182,7 @@ static RoundResult run_one_round(int round)
             msg.checksum = compute_checksum(msg);
             while (pub.send(&msg, sizeof(msg)) < 0)
             {
-                kickmsg::sleep(0ns);
+                kickmsg::yield();
             }
         }
         _exit(0);

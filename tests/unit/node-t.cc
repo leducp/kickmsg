@@ -62,7 +62,7 @@ TEST_F(NodeTest, NamingConventions)
 {
     kickmsg::Node node("mynode", "app");
     EXPECT_EQ(node.name(), "mynode");
-    EXPECT_EQ(node.prefix(), "app");
+    EXPECT_EQ(node.kmsg_namespace(), "app");
 }
 
 TEST_F(NodeTest, JoinBroadcastTwoNodes)
@@ -314,10 +314,10 @@ TEST_F(NodeTest, RosStyleTopicNamesAreSanitizedIntoShmPath)
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(std::memcmp(got->data(), &val, sizeof(val)), 0);
 
-    // Also confirm Node::name() / prefix() return the sanitized form so
-    // callers can log/introspect the actual identifiers in use.
-    EXPECT_EQ(pub_node.prefix(), "test.ns");
-    EXPECT_EQ(pub_node.name(),   "drv");
+    // Also confirm Node::name() / kmsg_namespace() return the sanitized
+    // form so callers can log/introspect the actual identifiers in use.
+    EXPECT_EQ(pub_node.kmsg_namespace(), "test.ns");
+    EXPECT_EQ(pub_node.name(),           "drv");
 }
 
 TEST_F(NodeTest, EmptyTopicNameThrows)

@@ -14,6 +14,9 @@
 ///     Subscriber             — try_receive / receive (GIL release) / *_view
 ///     SampleView             — read-only zero-copy sample (buffer protocol)
 ///     BroadcastHandle        — NamedTuple-like (pub, sub)
+///     Role                   — registry::Role enum (Publisher/Subscriber/Both)
+///     Participant            — registry snapshot entry
+///     Registry               — per-namespace participant discovery
 ///     Node                   — high-level topic / broadcast / mailbox
 ///     schema (submodule)
 ///       Diff                 — enum (bitmask)
@@ -70,6 +73,7 @@
 #include "kickmsg/Node.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Region.h"
+#include "kickmsg/Registry.h"
 #include "kickmsg/Subscriber.h"
 #include "kickmsg/Hash.h"
 #include "kickmsg/types.h"
@@ -426,6 +430,55 @@ namespace kickmsg
         m.def("unlink_shm", [](std::string const& name) { SharedMemory::unlink(name); },
               "name"_a, "Unlink a shared-memory entry by name (no-op if absent).");
 
+        // -------------------------------------------------------------------
+        // Registry — per-namespace participant directory
+        // -------------------------------------------------------------------
+
+        nb::enum_<registry::Role>(m, "Role")
+            .value("Publisher",  registry::Publisher)
+            .value("Subscriber", registry::Subscriber)
+            .value("Both",       registry::Both);
+
+        nb::class_<Participant>(m, "Participant")
+            .def_ro("pid",           &Participant::pid)
+            .def_ro("created_at_ns", &Participant::created_at_ns)
+            .def_ro("channel_type",  &Participant::channel_type)
+            .def_ro("role",          &Participant::role)
+            .def_ro("shm_name",      &Participant::shm_name)
+            .def_ro("node_name",     &Participant::node_name)
+            .def("__repr__", [](Participant const& p)
+            {
+                char const* role_name =
+                    p.role == registry::Publisher  ? "Publisher"  :
+                    p.role == registry::Subscriber ? "Subscriber" :
+                    p.role == registry::Both       ? "Both"       : "?";
+                return std::string{"Participant(shm='"} + p.shm_name +
+                       "', node='" + p.node_name +
+                       "', pid=" + std::to_string(p.pid) +
+                       ", role=" + role_name + ")";
+            });
+
+        nb::class_<Registry>(m, "Registry")
+            .def_static("open_or_create", &Registry::open_or_create,
+                        "namespace"_a, "capacity"_a = registry::DEFAULT_CAPACITY,
+                        nb::rv_policy::move,
+                        "Open the registry SHM for `namespace`, creating it if absent.")
+            .def_static("unlink", &Registry::unlink, "namespace"_a,
+                        "Remove the registry SHM for `namespace` from the filesystem.")
+            .def("snapshot", &Registry::snapshot,
+                 "Copy all currently Active participant entries.  Does not "
+                 "filter by process liveness.")
+            .def("sweep_stale", &Registry::sweep_stale,
+                 "Reclaim slots owned by processes that no longer exist.  "
+                 "Returns the number of slots freed.")
+            .def_prop_ro("name",     &Registry::name)
+            .def_prop_ro("capacity", &Registry::capacity)
+            .def("__repr__", [](Registry const& r)
+            {
+                return std::string{"Registry(name='"} + r.name() +
+                       "', capacity=" + std::to_string(r.capacity()) + ")";
+            });
+
         // SampleRef (the C++ byte-copy sample) is not bound directly —
         // try_receive() / receive() auto-convert it to `bytes` at the
         // Python boundary.  Users who want ring-position information
@@ -730,7 +783,7 @@ namespace kickmsg
         // keep_alive<0, 1>: the return value (0) pins the Node (1 = self).
         nb::class_<Node>(m, "Node")
             .def(nb::init<std::string const&, std::string const&>(),
-                 "name"_a, "prefix"_a = std::string{"kickmsg"})
+                 "name"_a, "namespace"_a = std::string{"kickmsg"})
             .def("advertise",
                 [](Node& n, char const* topic, channel::Config const& cfg)
                 { return n.advertise(topic, cfg); },
@@ -773,12 +826,12 @@ namespace kickmsg
             .def("topic_schema",           &Node::topic_schema,           "topic"_a)
             .def("try_claim_topic_schema", &Node::try_claim_topic_schema,
                  "topic"_a, "info"_a)
-            .def_prop_ro("name",   &Node::name)
-            .def_prop_ro("prefix", &Node::prefix)
+            .def_prop_ro("name",      &Node::name)
+            .def_prop_ro("namespace", &Node::kmsg_namespace)
             .def("__repr__", [](Node const& n)
             {
                 return std::string{"Node(name='"} + n.name() +
-                       "', prefix='" + n.prefix() + "')";
+                       "', namespace='" + n.kmsg_namespace() + "')";
             });
     }
 }

@@ -85,7 +85,7 @@ namespace kickmsg
                 ++drain_timeouts_;
                 break;
             }
-            kickmsg::sleep(0ns);
+            kickmsg::yield();
         }
 
         if (quiesced)

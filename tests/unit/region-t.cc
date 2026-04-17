@@ -8,12 +8,8 @@
 #include <cstring>
 #include <thread>
 #include <vector>
-#ifdef _WIN32
-#include <process.h>
-#define getpid _getpid
-#else
-#include <unistd.h>
-#endif
+
+#include "kickmsg/os/Process.h"
 
 class RegionTest : public ::testing::Test
 {
@@ -120,7 +116,7 @@ TEST_F(RegionTest, HeaderStoresCreatorMetadata)
                       SHM_NAME, kickmsg::channel::PubSub, cfg, "my_node");
     auto* hdr   = region.header();
 
-    EXPECT_EQ(hdr->creator_pid, static_cast<uint64_t>(getpid()));
+    EXPECT_EQ(hdr->creator_pid, kickmsg::current_pid());
     EXPECT_GT(hdr->created_at_ns, 0u);
     EXPECT_NE(hdr->config_hash, 0u);
 }

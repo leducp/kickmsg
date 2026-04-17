@@ -2,14 +2,9 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
-#ifdef _WIN32
-#include <process.h>
-#define getpid _getpid
-#else
-#include <unistd.h>
-#endif
 
 #include "kickmsg/Region.h"
+#include "kickmsg/os/Process.h"
 #include "kickmsg/os/Time.h"
 
 namespace kickmsg
@@ -89,7 +84,7 @@ namespace kickmsg
         h->sub_ring_stride   = ring_stride;
         h->commit_timeout_us = static_cast<uint64_t>(cfg.commit_timeout.count());
         h->config_hash       = compute_config_hash(type, cfg);
-        h->creator_pid       = static_cast<uint64_t>(getpid());
+        h->creator_pid       = kickmsg::current_pid();
         h->created_at_ns     = static_cast<uint64_t>(kickmsg::since_epoch().count());
         h->creator_name_len  = creator_len;
         std::memcpy(header_creator_name(h), creator_name, creator_len);

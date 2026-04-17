@@ -5,6 +5,7 @@ add_executable(kickmsg_unit
     unit/subscriber-t.cc
     unit/naming-t.cc
     unit/node-t.cc
+    unit/registry-t.cc
 )
 target_link_libraries(kickmsg_unit PRIVATE kickmsg GTest::gmock_main)
 set_target_properties(kickmsg_unit

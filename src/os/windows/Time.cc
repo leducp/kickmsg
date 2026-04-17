@@ -10,10 +10,15 @@ namespace kickmsg
         auto ms = duration_cast<milliseconds>(ns);
         if (ms.count() <= 0)
         {
-            SwitchToThread();
+            yield();
             return;
         }
         Sleep(static_cast<DWORD>(ms.count()));
+    }
+
+    void yield()
+    {
+        ::SwitchToThread();
     }
 
     nanoseconds since_epoch()

@@ -201,6 +201,57 @@ class SharedRegion:
 def unlink_shm(name: str) -> None:
     """Unlink a shared-memory entry by name (no-op if absent)."""
 
+class Role(enum.Enum):
+    Publisher = 1
+
+    Subscriber = 2
+
+    Both = 3
+
+class Participant:
+    @property
+    def pid(self) -> int: ...
+
+    @property
+    def created_at_ns(self) -> int: ...
+
+    @property
+    def channel_type(self) -> int: ...
+
+    @property
+    def role(self) -> int: ...
+
+    @property
+    def shm_name(self) -> str: ...
+
+    @property
+    def node_name(self) -> str: ...
+
+    def __repr__(self) -> str: ...
+
+class Registry:
+    @staticmethod
+    def open_or_create(namespace: str, capacity: int = ...) -> Registry:
+        """Open the registry SHM for `namespace`, creating it if absent."""
+
+    @staticmethod
+    def unlink(namespace: str) -> None:
+        """Remove the registry SHM for `namespace` from the filesystem."""
+
+    def snapshot(self) -> list[Participant]:
+        """Copy all currently Active participant entries. Does not filter by process liveness."""
+
+    def sweep_stale(self) -> int:
+        """Reclaim slots owned by processes that no longer exist. Returns the number of slots freed."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def capacity(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
 class SampleView:
     def __buffer__(self, flags, /):
         """
@@ -324,7 +375,7 @@ class BroadcastHandle:
     def __repr__(self) -> str: ...
 
 class Node:
-    def __init__(self, name: str, prefix: str = 'kickmsg') -> None: ...
+    def __init__(self, name: str, namespace: str = 'kickmsg') -> None: ...
 
     def advertise(self, topic: str, cfg: Config = ...) -> Publisher: ...
 
@@ -354,6 +405,6 @@ class Node:
     def name(self) -> str: ...
 
     @property
-    def prefix(self) -> str: ...
+    def namespace(self) -> str: ...
 
     def __repr__(self) -> str: ...

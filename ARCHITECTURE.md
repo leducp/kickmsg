@@ -1227,6 +1227,89 @@ Mailbox paths include the owner's node name because they are personal
 reply channels -- the sender must know who to reply to.
 
 
+## Registry & Discovery
+
+Kickmsg's core IPC path is decentralized: no broker, no daemon, no
+central registry.  Channels are plain shared-memory regions that
+producers and consumers find by name.  That works well until an
+operator asks *"what's running on this box?"* — which is the job of
+the **participant registry**.
+
+### What it is
+
+A single dedicated shared-memory region per prefix, at
+`/{prefix}_registry`, holding a fixed-size array of participant
+entries.  Each entry records one `(Node, channel, role)` membership:
+
+- `pid` — OS process id of the owner
+- `node_name` — the `Node` that registered
+- `shm_name` — the channel region this participant is attached to
+- `channel_type` — PubSub / Broadcast
+- `role` — Publisher / Subscriber / Both (broadcast)
+- `created_at_ns` — registration timestamp
+- `state` — atomic `Free` / `Claiming` / `Active`
+
+A `Node` lazily opens-or-creates the registry on its first
+`advertise` / `subscribe` / `join_broadcast` / `create_mailbox` /
+`open_mailbox` call, scans for the first `Free` slot, CAS-claims it
+(`Free → Claiming`), writes the fields, then release-stores
+`Active`.  The `Node`'s destructor deregisters every slot it claimed.
+
+The key property is **cross-platform parity**: Linux `/dev/shm` is
+filesystem-visible, but macOS and Windows are not — we can't use
+`readdir` to list topics there.  Routing discovery through a regular
+`SharedMemory` region means one code path, identical behaviour on
+all three targets.
+
+### State machine
+
+```
+Free (0) ── CAS ──► Claiming (1) ── release-store ──► Active (2)
+   ▲                                                    │
+   │                                                    │
+   └────────── deregister: store-release ◄──────────────┘
+                (or sweep_stale: CAS(Active → Free))
+```
+
+Snapshots acquire-load `state` per slot; only `Active` entries are
+returned.  The `Claiming` state is the publication fence for the
+field bytes — a reader observing `Active` is guaranteed to see all
+the field writes that happened-before the release-store.
+
+### Role upgrade
+
+A `Node` that both advertises and subscribes to the same topic is
+recorded as a single entry with `role = Both` rather than two
+separate entries.  `Node::touch_registry` detects the existing slot
+and upgrades via deregister + re-register.  Upgrades happen at
+connect time only — zero hot-path cost.
+
+### Liveness
+
+The registry does not track heartbeats.  A crashed process that
+never ran its `Node` destructor leaves its entries stuck at
+`Active` until reclaimed.  Two recovery paths:
+
+- **Query-time filter**: diagnostic tools probe each entry's pid via
+  `process_exists()` and hide dead entries from the user without
+  touching the registry.  Non-invasive; safe under live traffic.
+- **`Registry::sweep_stale()`**: iterates active entries and
+  CAS-resets any slot whose owner pid is gone.  Opt-in cleanup for
+  an operator or supervisor sweep; not automatic.
+
+Split deliberately so a concurrent read never rewrites the registry
+under another process's feet.
+
+### Sizing
+
+Default capacity is 1024 slots × 256 B = 256 KB per prefix.  A robot
+telemetry Node typically holds a few hundred topics; the registry is
+sized for an order of magnitude of headroom above that.  Exhaustion
+is non-fatal: `register_participant` returns `INVALID_SLOT` and the
+Node continues to work without a discovery row — registration is a
+diagnostic nicety, not a correctness dependency.
+
+
 ## Design Tradeoffs
 
 ### Silent data loss on slow subscribers
