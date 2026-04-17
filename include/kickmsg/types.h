@@ -19,6 +19,19 @@ namespace kickmsg
     static_assert(std::atomic<uint32_t>::is_always_lock_free,
         "Kickmsg requires lock-free 32-bit atomics.");
 
+    // All three futex backends (Linux SYS_futex, Darwin __ulock, Windows
+    // WaitOnAddress) take a 32-bit comparison word and we point them at the
+    // low half of a std::atomic<uint64_t> via reinterpret_cast.  That is only
+    // correct when the low 32 bits of the 64-bit word live at the lower
+    // address — i.e. little-endian.  A big-endian target would silently watch
+    // the high half (the write_pos counter's top bits, which almost never
+    // change) and miss every wake.  Fail the build instead.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+        "Kickmsg requires a little-endian target: the futex wait/wake layer "
+        "reinterprets std::atomic<uint64_t> as its low 32 bits.");
+#endif
+
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
     constexpr uint32_t    VERSION         = 4;
     constexpr uint32_t    INVALID_SLOT    = UINT32_MAX;

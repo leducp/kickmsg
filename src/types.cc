@@ -46,13 +46,17 @@ namespace kickmsg
     // with this ordering.
     uint64_t compute_config_hash(channel::Type type, channel::Config const& cfg)
     {
+        // Feed commit_timeout in by its underlying integer count() rather than
+        // by the std::chrono::microseconds object: the chrono type's storage
+        // layout (padding, ABI) is implementation-defined, and we want the
+        // hash to be determined by the value the user actually set.
         uint64_t h;
-        h = hash::fnv1a_64(&type,                  sizeof(type));
-        h = hash::fnv1a_64(&cfg.max_subscribers,   sizeof(cfg.max_subscribers),   h);
-        h = hash::fnv1a_64(&cfg.sub_ring_capacity, sizeof(cfg.sub_ring_capacity), h);
-        h = hash::fnv1a_64(&cfg.pool_size,         sizeof(cfg.pool_size),         h);
-        h = hash::fnv1a_64(&cfg.max_payload_size,  sizeof(cfg.max_payload_size),  h);
-        h = hash::fnv1a_64(&cfg.commit_timeout,    sizeof(cfg.commit_timeout),    h);
+        h = hash::fnv1a_64(type);
+        h = hash::fnv1a_64(cfg.max_subscribers,       h);
+        h = hash::fnv1a_64(cfg.sub_ring_capacity,     h);
+        h = hash::fnv1a_64(cfg.pool_size,             h);
+        h = hash::fnv1a_64(cfg.max_payload_size,      h);
+        h = hash::fnv1a_64(cfg.commit_timeout.count(), h);
         return h;
     }
 

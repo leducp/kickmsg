@@ -51,6 +51,18 @@ namespace kickmsg
             return 0;
         }
 
+        // INVARIANT: clear pending_slot_ BEFORE any refcount manipulation below.
+        //
+        // Once we pre-set slot->refcount = max_subs and start pushing to rings,
+        // the slot can be freed on any code path (eviction, consumption, excess
+        // release) — including asynchronously from another process.  If we
+        // then threw or returned with pending_slot_ still set, ~Publisher()
+        // → release_pending() would push the same slot onto the free stack a
+        // second time, corrupting the Treiber list.  Keeping this clear as the
+        // first statement in publish() means the destructor is a no-op from
+        // this point on, regardless of what the rest of the function does.
+        //
+        // Anyone refactoring publish() MUST preserve this ordering.
         uint32_t slot_idx = pending_slot_;
         uint32_t len      = pending_len_;
         pending_slot_ = INVALID_SLOT;
@@ -136,7 +148,7 @@ namespace kickmsg
             if (pos >= capacity)
             {
                 uint64_t expected_seq = pos - capacity + 1;
-                old_slot = wait_and_capture_slot(e, expected_seq, commit_timeout_);
+                old_slot = wait_and_capture_slot(e, expected_seq, capacity, commit_timeout_);
             }
 
             // Two-phase commit: CAS sequence to LOCKED_SEQUENCE to exclusively
@@ -260,15 +272,41 @@ namespace kickmsg
     }
 
     uint32_t Publisher::wait_and_capture_slot(Entry& e, uint64_t expected_seq,
+                                              uint64_t capacity,
                                               microseconds timeout)
     {
+        uint64_t seq = e.sequence.load(std::memory_order_acquire);
+        if (seq >= expected_seq and seq != LOCKED_SEQUENCE)
+        {
+            return e.slot_idx.load(std::memory_order_acquire);
+        }
+
+        // Fast stale-entry short-circuit (Case B).  If the committed
+        // sequence we observe is more than a full wrap behind what we
+        // expect, no healthy publisher can still be mid-commit on it —
+        // a legitimate commit takes a handful of nanoseconds between
+        // fetch_add(write_pos) and the release-store of the sequence,
+        // so > capacity positions of write_pos advance is proof the
+        // previous occupant is gone (crashed before the CAS lock, or
+        // stomped by the resume-race in #7).  Returning INVALID_SLOT
+        // immediately hands off to the Case B self-repair path in the
+        // caller without paying commit_timeout (10 ms default) on the
+        // hot path.  Once seq == LOCKED_SEQUENCE we cannot distinguish
+        // a µs-slow live commit from a dead holder and still have to
+        // pay the wait — that path is covered by out-of-band
+        // repair_locked_entries() called on a supervisor timer.
+        if (seq != LOCKED_SEQUENCE and seq + capacity < expected_seq)
+        {
+            return INVALID_SLOT;
+        }
+
         constexpr int CHECK_INTERVAL = 1024;
         nanoseconds start = kickmsg::since_epoch();
 
         int i = 0;
         while (true)
         {
-            uint64_t seq = e.sequence.load(std::memory_order_acquire);
+            seq = e.sequence.load(std::memory_order_acquire);
             if (seq >= expected_seq and seq != LOCKED_SEQUENCE)
             {
                 return e.slot_idx.load(std::memory_order_acquire);

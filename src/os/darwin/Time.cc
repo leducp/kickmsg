@@ -4,11 +4,17 @@
 
 #include <cerrno>
 #include <ctime>
+#include <sched.h>
 #include <stdexcept>
 #include <system_error>
 
 namespace kickmsg
 {
+    void yield()
+    {
+        ::sched_yield();
+    }
+
     void sleep(nanoseconds ns)
     {
         auto secs = duration_cast<seconds>(ns);
@@ -34,7 +40,10 @@ namespace kickmsg
     nanoseconds since_epoch()
     {
         timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        {
+            throw std::system_error(errno, std::system_category(), "clock_gettime()");
+        }
         return seconds{ts.tv_sec} + nanoseconds{ts.tv_nsec};
     }
 

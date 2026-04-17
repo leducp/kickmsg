@@ -5,12 +5,19 @@
 
 namespace kickmsg
 {
+    void yield()
+    {
+        // SwitchToThread yields this timeslice to a ready thread on the
+        // same processor; returns FALSE if none was available (no-op).
+        ::SwitchToThread();
+    }
+
     void sleep(nanoseconds ns)
     {
         auto ms = duration_cast<milliseconds>(ns);
         if (ms.count() <= 0)
         {
-            SwitchToThread();
+            yield();
             return;
         }
         Sleep(static_cast<DWORD>(ms.count()));

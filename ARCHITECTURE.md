@@ -415,17 +415,24 @@ Publisher
    |                                a single LDADDAL on AArch64 (LSE).
    |
    |-- If ring full (wrap):
-   |     wait_and_capture_slot()   Spin-wait (check clock every 1024
-   |     |                         iterations) up to commit_timeout
-   |     |                         (default 100ms).
+   |     wait_and_capture_slot()   First, fast stale-entry short-circuit:
+   |     |                         if the current committed seq is more
+   |     |                         than one full wrap behind expected_seq,
+   |     |                         return INVALID_SLOT immediately (Case B
+   |     |                         — no timeout needed, a healthy publisher
+   |     |                         can't be mid-commit on a value that old).
+   |     |                         Otherwise spin-wait (check clock every
+   |     |                         1024 iterations) up to commit_timeout
+   |     |                         (default 10ms).
    |     |-- Committed:            Capture slot_idx (old_slot).
    |     |                         Release is DEFERRED until after lock
    |     |                         CAS succeeds (see below).
-   |     '-- Timeout (crash):      Previous writer crashed. old_slot =
+   |     '-- Timeout / stale:      Previous writer crashed. old_slot =
    |                                INVALID_SLOT. The pool slot referenced
    |                                by the abandoned entry is leaked
    |                                (recoverable by GC). The ring position
-   |                                is poisoned until repair_locked_entries().
+   |                                is poisoned until repair_locked_entries()
+   |                                or the next publisher self-repairs here.
    |
    |-- Two-phase commit:
    |   |
@@ -742,18 +749,37 @@ When a publisher wraps around to a ring entry that was previously
 claimed but never committed, it calls `wait_and_capture_slot()`:
 
 ```
-wait_and_capture_slot(entry, expected_seq, timeout):
+wait_and_capture_slot(entry, expected_seq, capacity, timeout):
+    seq = entry.sequence (acquire)
+    if seq >= expected_seq and seq != LOCKED_SEQUENCE:
+        return entry.slot_idx              (committed, capture the old slot)
+
+    # Fast Case-B short-circuit: a committed seq that is more than one
+    # full wrap behind cannot possibly be a live mid-commit.  A healthy
+    # publisher takes ~10 ns between its fetch_add(write_pos) and the
+    # release-store of the new sequence, so the fact that write_pos has
+    # advanced by > capacity positions since proves the previous occupant
+    # is gone (crashed before the CAS lock, or left there by the stomp
+    # race).  Skip the commit_timeout wait and hand off to the Case B
+    # self-repair in the caller.
+    if seq != LOCKED_SEQUENCE and seq + capacity < expected_seq:
+        return INVALID_SLOT
+
     deadline = now() + timeout
     loop (check clock every 1024 iterations):
         seq = entry.sequence (acquire)
         if seq >= expected_seq and seq != LOCKED_SEQUENCE:
             return entry.slot_idx          (committed, capture the old slot)
         if now() >= deadline:
-            return INVALID_SLOT            (timeout)
+            return INVALID_SLOT            (timeout — Case A, LOCKED holder)
 ```
 
 The function skips entries in `LOCKED_SEQUENCE` state because another
-publisher is mid-commit on that entry and will release shortly.
+publisher is mid-commit on that entry and will release shortly.  Only
+the Case A path (LOCKED held by an apparently-dead publisher) still
+pays the full `commit_timeout`: we cannot distinguish a µs-slow live
+commit from a dead holder without waiting.  Case B (stale wraps, the
+far more common crash residue) short-circuits on entry.
 
 On timeout (returns `INVALID_SLOT`), the publisher:
 1. Skips `release_slot()` (the old `slot_idx` may be garbage)
@@ -767,14 +793,36 @@ On timeout (returns `INVALID_SLOT`), the publisher:
    The ring resumes normal operation on the next wrap.
 
 The timeout is configurable per channel via `channel::Config::commit_timeout`
-(default: 100 ms). The tradeoff:
+(default: 10 ms). The tradeoff:
 
 - **Shorter timeout** → faster recovery after a crash, but higher risk
   of falsely evicting a slow-but-alive publisher under heavy scheduling
   pressure (RT preemption, CPU throttling, etc.).
 - **Longer timeout** → safer under load, but adds worst-case latency
-  whenever a publisher truly crashed mid-commit and a ring wraps to
-  the abandoned position.
+  whenever a publisher truly crashed mid-commit holding `LOCKED_SEQUENCE`
+  (Case B no longer pays the timeout).
+
+### Hot-path cost of crash residue
+
+With the Case-B short-circuit in place, the hot-path penalty from a
+crashed or stomped publisher breaks down as follows:
+
+```
+Residue state              Who pays              Cost
+────────────────────────────────────────────────────────────────────
+Stale wrap (Case B)        First publisher       ~0 (early-exit) +
+                           to hit the entry      3 stores self-repair
+LOCKED_SEQUENCE (Case A)   First publisher       commit_timeout +
+                           to hit the entry      3 stores self-repair
+```
+
+For Case A, running `SharedRegion::repair_locked_entries()` on a fast
+supervisor timer (1–5 ms) takes the `commit_timeout` off the hot path:
+the background sweep heals LOCKED entries before any publisher wraps
+to them, turning both classes into ~0-cost on the hot path.  The
+supervisor timer is the recommended operational pattern — the library
+will self-heal without it, but at the cost of one `commit_timeout`
+per LOCKED crash residue per affected ring position.
 
 ### How the subscriber recovers
 

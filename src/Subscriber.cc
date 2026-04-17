@@ -85,7 +85,13 @@ namespace kickmsg
                 ++drain_timeouts_;
                 break;
             }
-            kickmsg::sleep(0ns);
+            // Cooperative yield rather than sleep(0ns): on Linux,
+            // clock_nanosleep(CLOCK_MONOTONIC, 0, &zero) returns immediately
+            // without releasing the core, turning this quiescence wait into
+            // a hot spin for up to commit_timeout.  sched_yield actually
+            // hands the timeslice to another runnable thread — the publisher
+            // we're waiting on, in the usual case.
+            kickmsg::yield();
         }
 
         if (quiesced)
@@ -290,6 +296,18 @@ namespace kickmsg
                 futex_wait(ring->write_pos, cur, remaining);
                 ring->has_waiter.store(0, std::memory_order_relaxed);
             }
+            else
+            {
+                // A publisher has already claimed a position past read_pos_
+                // (write_pos advanced) but hasn't released the sequence yet
+                // — we're either racing an in-progress commit or waiting on
+                // a LOCKED_SEQUENCE entry from a crashed publisher.  The
+                // futex above can't help here because write_pos already
+                // moved; yield so we don't burn the core while the commit
+                // lands (microseconds in the healthy case, bounded by the
+                // outer timeout in the crashed case).
+                kickmsg::yield();
+            }
         }
     }
 
@@ -410,6 +428,13 @@ namespace kickmsg
                 ring->has_waiter.store(1, std::memory_order_relaxed);
                 futex_wait(ring->write_pos, cur, remaining);
                 ring->has_waiter.store(0, std::memory_order_relaxed);
+            }
+            else
+            {
+                // Mid-commit race / crashed publisher: write_pos already
+                // advanced, so futex_wait(write_pos, cur) would return
+                // immediately.  Yield instead — see receive() for rationale.
+                kickmsg::yield();
             }
         }
     }

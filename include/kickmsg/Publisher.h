@@ -63,6 +63,7 @@ namespace kickmsg
 
     private:
         static uint32_t wait_and_capture_slot(Entry& e, uint64_t expected_seq,
+                                              uint64_t capacity,
                                               microseconds timeout);
         void release_slot(uint32_t idx);
         void release_pending();
