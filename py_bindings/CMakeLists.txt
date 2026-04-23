@@ -22,25 +22,19 @@ if (SKBUILD)
             $<$<CONFIG:Release>:-Wl,--gc-sections -Wl,--strip-all>)
     endif()
 
-    # The package layout is:
-    #   kickmsg/
-    #     __init__.py      re-exports _native + surfaces diagnostics
-    #     _native.*.so     this target
-    #     _native.pyi      type stubs for the native surface
-    #     diagnostics.py   pure-Python typed API (importable by GUIs)
-    #     _cli.py          argparse entry point (`kickmsg` console_script)
-    #     py.typed         PEP 561 marker
+    # Source layout:
+    #   py_bindings/src/kickmsg_py.cc    C++ binding (compiled to _native.so)
+    #   python/kickmsg/                  pure-Python package
+    #
+    # At install / editable-build time both land in the same package dir.
     set_target_properties(kickmsg_py PROPERTIES
         OUTPUT_NAME "_native"
-        # Drop the native module into build_py/py_bindings/kickmsg/ so
-        # `PYTHONPATH=build_py/py_bindings` gives a valid package without a
-        # full wheel install.
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/kickmsg")
 
-    # Stage the Python sources alongside the native module for the same
-    # PYTHONPATH-pointed dev flow.  Symlinks (not copies) so edits to the
-    # .py sources are picked up on the next invocation without a rebuild.
-    set(PY_PACKAGE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/python/kickmsg)
+    # Stage pure-Python sources alongside the native module for
+    # PYTHONPATH-based dev iteration.  Symlinks so .py edits don't
+    # require a rebuild.
+    set(PY_PACKAGE_SRC ${CMAKE_SOURCE_DIR}/python/kickmsg)
     set(PY_PACKAGE_DST ${CMAKE_CURRENT_BINARY_DIR}/kickmsg)
     file(GLOB PY_PACKAGE_FILES
         "${PY_PACKAGE_SRC}/*.py"
