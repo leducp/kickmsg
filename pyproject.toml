@@ -13,7 +13,7 @@ maintainers = [
 ]
 
 [project.scripts]
-kickmsg = "kickmsg._cli:main"
+kickmsg = "kickmsg.cli:main"
 
 [tool.scikit-build]
 minimum-version = "0.11"

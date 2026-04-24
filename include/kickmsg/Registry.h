@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -137,6 +138,11 @@ namespace kickmsg
         static Registry open_or_create(std::string const& kmsg_namespace,
                                        uint32_t capacity = registry::DEFAULT_CAPACITY);
 
+        /// Returns nullopt if the region doesn't exist.  For read-only
+        /// tools that must not create a 2 MB SHM as a side effect of
+        /// inspection.  Throws on version mismatch.
+        static std::optional<Registry> try_open(std::string const& kmsg_namespace);
+
         static void unlink(std::string const& kmsg_namespace);
 
         /// Returns the claimed slot index, or `INVALID_SLOT` if the
@@ -171,6 +177,7 @@ namespace kickmsg
     private:
         static std::size_t region_size(uint32_t capacity);
         static std::string make_shm_name(std::string const& kmsg_namespace);
+        static std::optional<Registry> spin_open(std::string const& name);
         void init_as_creator(uint32_t capacity);
 
         RegistryHeader*       header();

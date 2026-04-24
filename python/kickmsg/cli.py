@@ -67,11 +67,11 @@ def _resolve_shm_name(args) -> str:
 
     # Registry lookup only — no pubsub-pattern fallback, since guessing
     # silently gave the wrong SHM name for broadcast/mailbox topics.
-    try:
-        registry = _native.Registry.open_or_create(args.namespace)
-    except RuntimeError as e:
+    registry = _native.Registry.try_open(args.namespace)
+    if registry is None:
         raise SystemExit(
-            f"error: no registry for namespace '{args.namespace}': {e}") from e
+            f"error: no registry for namespace '{args.namespace}'.  "
+            f"No kickmsg participant has registered under this namespace yet.")
 
     for t in registry.list_topics():
         if t.topic_name == topic:

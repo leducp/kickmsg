@@ -37,6 +37,26 @@ namespace kickmsg
         uint64_t pool_size;             ///< Total pool capacity (static)
     };
 
+    /// Static header metadata returned by SharedRegion::info().
+    /// All fields are written once at creation and never mutated, so this
+    /// read is a plain copy of stable bytes.
+    struct RegionInfo
+    {
+        std::string   shm_name;
+        channel::Type channel_type;
+        uint32_t      version;
+        uint64_t      config_hash;
+        uint64_t      total_size;
+        uint64_t      max_subs;
+        uint64_t      sub_ring_capacity;
+        uint64_t      pool_size;
+        uint64_t      max_payload_size;
+        uint64_t      commit_timeout_us;
+        uint64_t      creator_pid;
+        uint64_t      created_at_ns;
+        std::string   creator_name;
+    };
+
 
     class SharedRegion
     {
@@ -177,6 +197,10 @@ namespace kickmsg
         /// walk for `pool_free` is bounded by `pool_size` so it can't loop
         /// forever under racing pushes/pops.
         RegionStats stats() const;
+
+        /// Static header snapshot — geometry + creator metadata.  All
+        /// fields are written once at creation, so this is a plain copy.
+        RegionInfo info() const;
 
         /// Reclaim orphaned slots (refcount > 0 but not referenced by any ring entry).
         /// These are caused by publisher crashes between allocate and publish, or by

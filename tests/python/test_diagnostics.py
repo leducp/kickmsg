@@ -208,7 +208,7 @@ def test_schema_diff_detects_version_delta(kmsg_namespace, small_cfg):
 
 
 def test_cli_list_empty_still_prints_header(kmsg_namespace, capsys):
-    from kickmsg._cli import main as cli_main
+    from kickmsg.cli import main as cli_main
     rc = cli_main(["list", "--namespace", kmsg_namespace])
     captured = capsys.readouterr()
     # Empty list is not an error — exit 0, header still rendered so the
@@ -219,7 +219,7 @@ def test_cli_list_empty_still_prints_header(kmsg_namespace, capsys):
 
 
 def test_cli_list_shows_registered_topic(kmsg_namespace, small_cfg, capsys):
-    from kickmsg._cli import main as cli_main
+    from kickmsg.cli import main as cli_main
 
     node = kickmsg.Node("cli_test", namespace=kmsg_namespace)
     pub = node.advertise("cli_topic", small_cfg)
@@ -258,7 +258,7 @@ def test_cli_resolves_topic_via_registry(kmsg_namespace, small_cfg,
     silently fell through to a pubsub-pattern guess that worked only for
     pubsub — broadcast and mailbox silently resolved to the wrong SHM.
     """
-    from kickmsg._cli import _resolve_shm_name
+    from kickmsg.cli import _resolve_shm_name
 
     node = kickmsg.Node("resolver", namespace=kmsg_namespace)
     handle = setup(node, kmsg_namespace, small_cfg)
@@ -283,7 +283,7 @@ def test_cli_resolves_topic_via_registry(kmsg_namespace, small_cfg,
 def test_cli_resolve_rejects_unknown_topic(kmsg_namespace):
     """With no fallback, an unknown topic is an explicit error, not a
     silent wrong-region guess."""
-    from kickmsg._cli import _resolve_shm_name
+    from kickmsg.cli import _resolve_shm_name
 
     class Args:
         shm = None
@@ -292,12 +292,15 @@ def test_cli_resolve_rejects_unknown_topic(kmsg_namespace):
 
     with pytest.raises(SystemExit) as info:
         _resolve_shm_name(Args())
-    assert "not found" in str(info.value).lower()
+    msg = str(info.value).lower()
+    # Either "no registry exists for this namespace" or "topic not found
+    # in this namespace" — both are explicit errors, not a silent guess.
+    assert "no registry" in msg or "not found" in msg
 
 
 def test_cli_resolve_shm_overrides_topic(kmsg_namespace):
     """--shm always wins, even if --namespace/topic are set."""
-    from kickmsg._cli import _resolve_shm_name
+    from kickmsg.cli import _resolve_shm_name
 
     class Args:
         shm = "raw_name"  # auto-prepended leading '/'

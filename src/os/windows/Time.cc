@@ -21,7 +21,7 @@ namespace kickmsg
         ::SwitchToThread();
     }
 
-    nanoseconds since_epoch()
+    nanoseconds monotonic_ns()
     {
         static LARGE_INTEGER freq{};
         if (freq.QuadPart == 0)
@@ -39,8 +39,22 @@ namespace kickmsg
         return seconds{secs} + nanoseconds{nanos};
     }
 
+    nanoseconds since_epoch()
+    {
+        // FILETIME is 100-ns intervals since 1601-01-01 UTC.  Shift the
+        // epoch to 1970-01-01 UTC: 11644473600 seconds.
+        FILETIME ft;
+        GetSystemTimePreciseAsFileTime(&ft);
+        ULARGE_INTEGER u;
+        u.LowPart  = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        constexpr uint64_t epoch_offset_100ns = 116444736000000000ULL;
+        uint64_t ns100 = u.QuadPart - epoch_offset_100ns;
+        return nanoseconds{ns100 * 100};
+    }
+
     nanoseconds elapsed_time(nanoseconds start)
     {
-        return since_epoch() - start;
+        return monotonic_ns() - start;
     }
 }

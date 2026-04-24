@@ -511,6 +511,29 @@ namespace kickmsg
         return out;
     }
 
+    RegionInfo SharedRegion::info() const
+    {
+        auto const* h = header();
+        RegionInfo out{};
+        out.shm_name          = name_;
+        out.channel_type      = h->channel_type;
+        out.version           = h->version;
+        out.config_hash       = h->config_hash;
+        out.total_size        = h->total_size;
+        out.max_subs          = h->max_subs;
+        out.sub_ring_capacity = h->sub_ring_capacity;
+        out.pool_size         = h->pool_size;
+        out.max_payload_size  = h->slot_data_size;
+        out.commit_timeout_us = h->commit_timeout_us;
+        out.creator_pid       = h->creator_pid;
+        out.created_at_ns     = h->created_at_ns;
+
+        // Creator name tail: bytes written at offset sizeof(Header).
+        auto const* tail = static_cast<char const*>(base()) + sizeof(Header);
+        out.creator_name.assign(tail, h->creator_name_len);
+        return out;
+    }
+
     std::size_t SharedRegion::reclaim_orphaned_slots()
     {
         auto* b = base();

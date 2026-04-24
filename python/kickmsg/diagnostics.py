@@ -210,17 +210,25 @@ def _open(shm_name: str) -> _native.SharedRegion:
 def info(shm_name: str) -> RegionInfo:
     """Static header metadata for a region."""
     region = _open(shm_name)
-    # TODO(bindings): the Region header fields (geometry, creator, etc.)
-    # aren't currently exposed individually.  Until they are, we fall
-    # back on what the native API already surfaces: channel_type, name,
-    # schema, plus diagnose() for the live-ring count.
+    header = region.info()
     return RegionInfo(
-        shm_name=region.name,
-        channel_type=_CHANNEL_NAME.get(region.channel_type.value, "?"),
-        version=0,
-        config_hash=0,
-        geometry=Geometry(0, 0, 0, 0, 0, 0),
-        creator=Creator(pid=0, name="", created_at_ns=0),
+        shm_name=header.shm_name,
+        channel_type=_CHANNEL_NAME.get(header.channel_type.value, "?"),
+        version=header.version,
+        config_hash=header.config_hash,
+        geometry=Geometry(
+            max_subscribers=header.max_subs,
+            sub_ring_capacity=header.sub_ring_capacity,
+            pool_size=header.pool_size,
+            max_payload_size=header.max_payload_size,
+            commit_timeout_us=header.commit_timeout_us,
+            total_size=header.total_size,
+        ),
+        creator=Creator(
+            pid=header.creator_pid,
+            name=header.creator_name,
+            created_at_ns=header.created_at_ns,
+        ),
         schema=_schema_snapshot(region),
     )
 
@@ -393,12 +401,11 @@ def list_topics(kmsg_namespace: str = "kickmsg") -> list[TopicSummary]:
     enrichment (name + version from the region header, when published)
     and converts the native dataclasses into Python ones.
     """
-    try:
-        registry = _native.Registry.open_or_create(kmsg_namespace)
-    except RuntimeError:
-        # No registry exists (nobody has registered) — return empty.
+    registry = _native.Registry.try_open(kmsg_namespace)
+    if registry is None:
         return []
 
+    now_ns = time.time_ns()
     out: list[TopicSummary] = []
     for native_t in registry.list_topics():
         schema_name = None
@@ -414,13 +421,22 @@ def list_topics(kmsg_namespace: str = "kickmsg") -> list[TopicSummary]:
             # skip schema enrichment, keep the row.
             pass
 
+        # Topic age = now - earliest participant registration.
+        all_parts = (list(native_t.producers) + list(native_t.consumers)
+                   + list(native_t.stall_producers) + list(native_t.stall_consumers))
+        age_seconds = None
+        if all_parts:
+            earliest_ns = min(p.created_at_ns for p in all_parts)
+            if earliest_ns > 0:
+                age_seconds = max(0.0, (now_ns - earliest_ns) / 1e9)
+
         out.append(TopicSummary(
             topic_name=native_t.topic_name,
             shm_name=native_t.shm_name,
             kind=_KIND_NAME.get(native_t.kind, "?"),
             channel_type=_CHANNEL_NAME.get(native_t.channel_type, "?"),
             kmsg_namespace=kmsg_namespace,
-            age_seconds=None,
+            age_seconds=age_seconds,
             producers=[_to_participant(p) for p in native_t.producers],
             consumers=[_to_participant(p) for p in native_t.consumers],
             stall_producers=[_to_participant(p) for p in native_t.stall_producers],
