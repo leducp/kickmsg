@@ -161,6 +161,36 @@ class RegionStats:
 
     def __repr__(self) -> str: ...
 
+class RegionInfo:
+    @property
+    def shm_name(self) -> str: ...
+    @property
+    def channel_type(self) -> ChannelType: ...
+    @property
+    def version(self) -> int: ...
+    @property
+    def config_hash(self) -> int: ...
+    @property
+    def total_size(self) -> int: ...
+    @property
+    def max_subs(self) -> int: ...
+    @property
+    def sub_ring_capacity(self) -> int: ...
+    @property
+    def pool_size(self) -> int: ...
+    @property
+    def max_payload_size(self) -> int: ...
+    @property
+    def commit_timeout_us(self) -> int: ...
+    @property
+    def creator_pid(self) -> int: ...
+    @property
+    def creator_name(self) -> str: ...
+    @property
+    def created_at_ns(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
 class SharedRegion:
     @staticmethod
     def create(name: str, type: ChannelType, cfg: Config, creator: str = '') -> SharedRegion: ...
@@ -187,6 +217,9 @@ class SharedRegion:
 
     def stats(self) -> RegionStats:
         """Runtime counter snapshot (per-ring + aggregate). Safe under live traffic."""
+
+    def info(self) -> RegionInfo:
+        """Static header metadata: geometry, creator, version."""
 
     def repair_locked_entries(self) -> int: ...
 
@@ -276,6 +309,10 @@ class Registry:
     @staticmethod
     def open_or_create(namespace: str, capacity: int = ...) -> Registry:
         """Open the registry SHM for `namespace`, creating it if absent."""
+
+    @staticmethod
+    def try_open(namespace: str) -> Registry | None:
+        """Open an existing registry; returns None if none exists."""
 
     @staticmethod
     def unlink(namespace: str) -> None:

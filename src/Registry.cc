@@ -62,27 +62,8 @@ namespace kickmsg
         h->magic.store(registry::MAGIC, std::memory_order_release);
     }
 
-    Registry Registry::open_or_create(std::string const& kmsg_namespace, uint32_t capacity)
+    std::optional<Registry> Registry::spin_open(std::string const& name)
     {
-        if (capacity == 0)
-        {
-            throw std::invalid_argument("Registry capacity must be > 0");
-        }
-
-        std::string name = make_shm_name(kmsg_namespace);
-        std::size_t bytes = region_size(capacity);
-
-        {
-            Registry r;
-            r.name_ = name;
-            if (r.shm_.try_create(name, bytes))
-            {
-                r.init_as_creator(capacity);
-                return r;
-            }
-        }
-
-        // Spin-wait on MAGIC — the creator publishes it last.
         for (int i = 0; i < 200; ++i)
         {
             SharedMemory shm;
@@ -104,8 +85,46 @@ namespace kickmsg
             }
             kickmsg::sleep(10ms);
         }
+        return std::nullopt;
+    }
 
+    Registry Registry::open_or_create(std::string const& kmsg_namespace, uint32_t capacity)
+    {
+        if (capacity == 0)
+        {
+            throw std::invalid_argument("Registry capacity must be > 0");
+        }
+
+        std::string name  = make_shm_name(kmsg_namespace);
+        std::size_t bytes = region_size(capacity);
+
+        {
+            Registry r;
+            r.name_ = name;
+            if (r.shm_.try_create(name, bytes))
+            {
+                r.init_as_creator(capacity);
+                return r;
+            }
+        }
+
+        auto opened = spin_open(name);
+        if (opened.has_value())
+        {
+            return std::move(*opened);
+        }
         throw std::runtime_error("Timed out waiting for registry init: " + name);
+    }
+
+    std::optional<Registry> Registry::try_open(std::string const& kmsg_namespace)
+    {
+        std::string  name = make_shm_name(kmsg_namespace);
+        SharedMemory probe;
+        if (not probe.try_open(name))
+        {
+            return std::nullopt;
+        }
+        return spin_open(name);
     }
 
     void Registry::unlink(std::string const& kmsg_namespace)

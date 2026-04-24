@@ -394,6 +394,28 @@ namespace kickmsg
                        "/" + std::to_string(s.pool_size) + ")";
             });
 
+        nb::class_<RegionInfo>(m, "RegionInfo")
+            .def_ro("shm_name",          &RegionInfo::shm_name)
+            .def_ro("channel_type",      &RegionInfo::channel_type)
+            .def_ro("version",           &RegionInfo::version)
+            .def_ro("config_hash",       &RegionInfo::config_hash)
+            .def_ro("total_size",        &RegionInfo::total_size)
+            .def_ro("max_subs",          &RegionInfo::max_subs)
+            .def_ro("sub_ring_capacity", &RegionInfo::sub_ring_capacity)
+            .def_ro("pool_size",         &RegionInfo::pool_size)
+            .def_ro("max_payload_size",  &RegionInfo::max_payload_size)
+            .def_ro("commit_timeout_us", &RegionInfo::commit_timeout_us)
+            .def_ro("creator_pid",       &RegionInfo::creator_pid)
+            .def_ro("creator_name",      &RegionInfo::creator_name)
+            .def_ro("created_at_ns",     &RegionInfo::created_at_ns)
+            .def("__repr__", [](RegionInfo const& i)
+            {
+                return std::string{"RegionInfo(shm='"} + i.shm_name +
+                       "', version=" + std::to_string(i.version) +
+                       ", creator_pid=" + std::to_string(i.creator_pid) +
+                       ", creator='" + i.creator_name + "')";
+            });
+
         // -------------------------------------------------------------------
         // SharedRegion
         // -------------------------------------------------------------------
@@ -422,6 +444,8 @@ namespace kickmsg
             .def("stats",                  &SharedRegion::stats,
                  "Runtime counter snapshot (per-ring + aggregate). "
                  "Safe under live traffic.")
+            .def("info",                   &SharedRegion::info,
+                 "Static header metadata: geometry, creator, version.")
             .def("repair_locked_entries", &SharedRegion::repair_locked_entries)
             .def("reset_retired_rings",   &SharedRegion::reset_retired_rings)
             .def("reclaim_orphaned_slots",&SharedRegion::reclaim_orphaned_slots)
@@ -500,6 +524,9 @@ namespace kickmsg
                         "namespace"_a, "capacity"_a = registry::DEFAULT_CAPACITY,
                         nb::rv_policy::move,
                         "Open the registry SHM for `namespace`, creating it if absent.")
+            .def_static("try_open", &Registry::try_open, "namespace"_a,
+                        nb::rv_policy::move,
+                        "Open an existing registry; returns None if none exists.")
             .def_static("unlink", &Registry::unlink, "namespace"_a,
                         "Remove the registry SHM for `namespace` from the filesystem.")
             .def("snapshot", &Registry::snapshot,

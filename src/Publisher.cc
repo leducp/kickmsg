@@ -264,7 +264,7 @@ namespace kickmsg
                                               microseconds timeout)
     {
         constexpr int CHECK_INTERVAL = 1024;
-        nanoseconds start = kickmsg::since_epoch();
+        nanoseconds start = kickmsg::monotonic_ns();
 
         int i = 0;
         while (true)

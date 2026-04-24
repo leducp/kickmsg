@@ -71,7 +71,7 @@ namespace kickmsg
         // Wait for all admitted publishers to finish.
         bool quiesced = true;
         microseconds deadline{header_->commit_timeout_us};
-        nanoseconds start = kickmsg::since_epoch();
+        nanoseconds start = kickmsg::monotonic_ns();
         while (ring::get_in_flight(
                    ring->state_flight.load(std::memory_order_acquire)) > 0)
         {
@@ -268,7 +268,7 @@ namespace kickmsg
     std::optional<Subscriber::SampleRef> Subscriber::receive(nanoseconds timeout)
     {
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
-        nanoseconds start = kickmsg::since_epoch();
+        nanoseconds start = kickmsg::monotonic_ns();
 
         while (true)
         {
@@ -395,7 +395,7 @@ namespace kickmsg
     std::optional<Subscriber::SampleView> Subscriber::receive_view(nanoseconds timeout)
     {
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
-        nanoseconds start = kickmsg::since_epoch();
+        nanoseconds start = kickmsg::monotonic_ns();
 
         while (true)
         {

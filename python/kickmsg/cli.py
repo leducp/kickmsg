@@ -67,11 +67,11 @@ def _resolve_shm_name(args) -> str:
 
     # Registry lookup only — no pubsub-pattern fallback, since guessing
     # silently gave the wrong SHM name for broadcast/mailbox topics.
-    try:
-        registry = _native.Registry.open_or_create(args.namespace)
-    except RuntimeError as e:
+    registry = _native.Registry.try_open(args.namespace)
+    if registry is None:
         raise SystemExit(
-            f"error: no registry for namespace '{args.namespace}': {e}") from e
+            f"error: no registry for namespace '{args.namespace}'.  "
+            f"No kickmsg participant has registered under this namespace yet.")
 
     for t in registry.list_topics():
         if t.topic_name == topic:
@@ -342,10 +342,44 @@ def cmd_diagnose(args) -> int:
 # ----------------------------------------------------------------------
 
 
+_UNSAFE_WARNINGS = {
+    "retired": (
+        "--retired calls reset_retired_rings(), which is ONLY safe after the "
+        "crashed publisher is confirmed gone.  Resetting under a live "
+        "publisher will corrupt in-flight messages."),
+    "reclaim": (
+        "--reclaim calls reclaim_orphaned_slots(), which requires full "
+        "quiescence: no active publishers AND no live SampleView pins.  "
+        "Reclaiming under traffic will free in-use slots."),
+}
+
+
+def _confirm_unsafe(unsafe_flags: list[str], assume_yes: bool) -> bool:
+    for flag in unsafe_flags:
+        print(f"warning: {_UNSAFE_WARNINGS[flag]}", file=sys.stderr)
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("error: refusing to run unsafe repair non-interactively without --yes",
+              file=sys.stderr)
+        return False
+    flags = ", ".join(f"--{f}" for f in unsafe_flags)
+    answer = input(f"\nProceed with {flags}? [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
 def cmd_repair(args) -> int:
     target = _resolve_shm_name(args)
     if not (args.locked or args.retired or args.reclaim):
         args.locked = True  # default: safe operation only
+
+    unsafe = []
+    if args.retired:
+        unsafe.append("retired")
+    if args.reclaim:
+        unsafe.append("reclaim")
+    if unsafe and not _confirm_unsafe(unsafe, args.yes):
+        return 2
 
     if args.locked:
         n = diag.repair_locked(target)
@@ -486,6 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="reset_retired_rings() — only after crashed publisher confirmed gone")
     sp.add_argument("--reclaim", action="store_true",
                     help="reclaim_orphaned_slots() — requires full quiescence")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="skip the confirmation prompt for --retired / --reclaim")
     sp.set_defaults(func=cmd_repair)
 
     sp = sub.add_parser("watch", help="top-like live stats view")
