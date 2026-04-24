@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <type_traits>
 
 namespace kickmsg
 {
@@ -38,6 +39,24 @@ namespace kickmsg
         /// overload; preserved as a separate entry point because
         /// descriptor-string hashing is by far the most common use.
         uint64_t fnv1a_64(std::string_view s) noexcept;
+
+        /// 64-bit FNV-1a of a trivially-copyable scalar or POD.  Lets
+        /// callers chain fields without spelling out `&v, sizeof(v)`:
+        ///     h = fnv1a_64(cfg.max_subscribers, h);
+        ///     h = fnv1a_64(cfg.pool_size,       h);
+        /// Pointers, nullptr, and string_view are excluded so the
+        /// dedicated overloads keep their priority.
+        template <typename T>
+        auto fnv1a_64(T const& value, uint64_t seed = FNV1A_64_OFFSET_BASIS) noexcept
+            -> std::enable_if_t<
+                std::is_trivially_copyable_v<T>
+                and not std::is_pointer_v<T>
+                and not std::is_null_pointer_v<T>
+                and not std::is_same_v<T, std::string_view>,
+                uint64_t>
+        {
+            return fnv1a_64(&value, sizeof(T), seed);
+        }
 
         /// Convenience: pack a 64-bit FNV-1a of `descriptor` into the
         /// leading eight bytes of a 64-byte identity slot, zero-padding

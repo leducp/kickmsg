@@ -8,6 +8,7 @@
 #include "kickmsg/Region.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
+#include "kickmsg/Registry.h"
 
 namespace kickmsg
 {
@@ -28,15 +29,19 @@ namespace kickmsg
     class Node
     {
     public:
-        // Name components (node name, namespace/prefix, topic, channel,
+        // Name components (node name, namespace, topic, channel,
         // owner, tag) are sanitized into a POSIX-shm-compatible form:
         // leading '/' is stripped, interior '/' becomes '.', and any char
         // outside [A-Za-z0-9._-] becomes '_'. This lets callers pass
         // ROS-style paths like "/robot/arm/joint1" directly — the region
-        // ends up at "/<prefix>_robot.arm.joint1" in /dev/shm, still
+        // ends up at "/<namespace>_robot.arm.joint1" in /dev/shm, still
         // human-readable (no hashing). A component that sanitizes to the
         // empty string throws std::invalid_argument.
-        Node(std::string const& name, std::string const& prefix = "kickmsg");
+        Node(std::string const& name, std::string const& kmsg_namespace = "kickmsg");
+
+        /// Deregisters every participant entry this Node holds in the
+        /// namespace's registry.
+        ~Node();
 
         // Explicit non-copyable / move-only.  Node already holds SharedRegion
         // values (move-only), so it's non-copyable de facto; declaring it
@@ -123,8 +128,8 @@ namespace kickmsg
         /// else got there first (read back with topic_schema()).
         bool try_claim_topic_schema(char const* topic, SchemaInfo const& info);
 
-        std::string const& name()   const { return name_; }
-        std::string const& prefix() const { return prefix_; }
+        std::string const& name()           const { return name_; }
+        std::string const& kmsg_namespace() const { return namespace_; }
 
     private:
         std::string make_topic_name(char const* topic) const;
@@ -137,8 +142,19 @@ namespace kickmsg
         SharedRegion*       find_region(std::string const& shm_name);
         SharedRegion const* find_region(std::string const& shm_name) const;
 
+        Registry& lazy_registry();
+
+        /// Register `shm_name` with `role`, or upgrade the existing entry
+        /// to `Both` if this Node already has one with the complementary
+        /// role. Registry failures are logged and swallowed.
+        void touch_registry(std::string const& shm_name,
+                            std::string const& topic_name,
+                            channel::Type      channel_type,
+                            registry::Kind     kind,
+                            registry::Role     role);
+
         std::string name_;
-        std::string prefix_;
+        std::string namespace_;
         // Keyed by SHM name for O(1) lookup.  A telemetry node on a
         // humanoid robot can easily hold 100-300 topics (joints × (meas,
         // target) + cameras + IMUs + force sensors + hands), so O(N)
@@ -148,6 +164,12 @@ namespace kickmsg
         // guarantees reference stability for elements (the mmap addresses
         // used by Publisher/Subscriber don't move on rehash).
         std::unordered_map<std::string, SharedRegion> regions_;
+
+        struct RegistrySlot { uint32_t slot_index; registry::Role role; };
+        std::unordered_map<std::string, RegistrySlot> registry_slots_;
+        std::optional<Registry> registry_;
+        bool registry_disabled_ = false;  ///< latched on first registry failure
+        bool registry_full_warned_ = false;  ///< latched after first INVALID_SLOT log
     };
 }
 

@@ -168,9 +168,9 @@ TEST_F(SubscriberTest, BlockingReceiveTimesOut)
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     kickmsg::Subscriber sub(region);
 
-    nanoseconds start  = kickmsg::since_epoch();
+    nanoseconds start  = kickmsg::monotonic_ns();
     auto        sample = sub.receive(milliseconds{50});
-    nanoseconds elapsed = kickmsg::since_epoch() - start;
+    nanoseconds elapsed = kickmsg::monotonic_ns() - start;
 
     EXPECT_FALSE(sample.has_value());
     EXPECT_GE(elapsed, milliseconds{40});
@@ -442,7 +442,7 @@ TEST_F(SubscriberTest, SlowPublisherNoCorruption)
         // Wait for signal to start publishing
         while (not pub_start.load(std::memory_order_acquire))
         {
-            kickmsg::sleep(0ns);
+            kickmsg::yield();
         }
 
         // Publish several messages slowly (each takes > commit_timeout)

@@ -118,6 +118,79 @@ class HealthReport:
 
     def __repr__(self) -> str: ...
 
+class RingStats:
+    @property
+    def state(self) -> int:
+        """Ring state as raw int: 0=Free, 1=Live, 2=Draining."""
+
+    @property
+    def in_flight(self) -> int: ...
+
+    @property
+    def write_pos(self) -> int: ...
+
+    @property
+    def dropped_count(self) -> int: ...
+
+    @property
+    def lost_count(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
+class RegionStats:
+    @property
+    def rings(self) -> list[RingStats]: ...
+
+    @property
+    def total_writes(self) -> int: ...
+
+    @property
+    def total_drops(self) -> int: ...
+
+    @property
+    def total_losses(self) -> int: ...
+
+    @property
+    def live_rings(self) -> int: ...
+
+    @property
+    def pool_free(self) -> int: ...
+
+    @property
+    def pool_size(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
+class RegionInfo:
+    @property
+    def shm_name(self) -> str: ...
+    @property
+    def channel_type(self) -> ChannelType: ...
+    @property
+    def version(self) -> int: ...
+    @property
+    def config_hash(self) -> int: ...
+    @property
+    def total_size(self) -> int: ...
+    @property
+    def max_subs(self) -> int: ...
+    @property
+    def sub_ring_capacity(self) -> int: ...
+    @property
+    def pool_size(self) -> int: ...
+    @property
+    def max_payload_size(self) -> int: ...
+    @property
+    def commit_timeout_us(self) -> int: ...
+    @property
+    def creator_pid(self) -> int: ...
+    @property
+    def creator_name(self) -> str: ...
+    @property
+    def created_at_ns(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
 class SharedRegion:
     @staticmethod
     def create(name: str, type: ChannelType, cfg: Config, creator: str = '') -> SharedRegion: ...
@@ -142,6 +215,12 @@ class SharedRegion:
 
     def diagnose(self) -> HealthReport: ...
 
+    def stats(self) -> RegionStats:
+        """Runtime counter snapshot (per-ring + aggregate). Safe under live traffic."""
+
+    def info(self) -> RegionInfo:
+        """Static header metadata: geometry, creator, version."""
+
     def repair_locked_entries(self) -> int: ...
 
     def reset_retired_rings(self) -> int: ...
@@ -154,6 +233,107 @@ class SharedRegion:
 
 def unlink_shm(name: str) -> None:
     """Unlink a shared-memory entry by name (no-op if absent)."""
+
+class Role(enum.Enum):
+    Publisher = 1
+
+    Subscriber = 2
+
+    Both = 3
+
+class Kind(enum.Enum):
+    Pubsub = 1
+
+    Broadcast = 2
+
+    Mailbox = 3
+
+class Participant:
+    @property
+    def pid(self) -> int: ...
+
+    @property
+    def pid_starttime(self) -> int: ...
+
+    @property
+    def created_at_ns(self) -> int: ...
+
+    @property
+    def channel_type(self) -> int: ...
+
+    @property
+    def role(self) -> int: ...
+
+    @property
+    def kind(self) -> int: ...
+
+    @property
+    def shm_name(self) -> str: ...
+
+    @property
+    def topic_name(self) -> str: ...
+
+    @property
+    def node_name(self) -> str: ...
+
+    def __repr__(self) -> str: ...
+
+class TopicSummary:
+    @property
+    def shm_name(self) -> str: ...
+
+    @property
+    def topic_name(self) -> str: ...
+
+    @property
+    def channel_type(self) -> int: ...
+
+    @property
+    def kind(self) -> int: ...
+
+    @property
+    def producers(self) -> list[Participant]: ...
+
+    @property
+    def consumers(self) -> list[Participant]: ...
+
+    @property
+    def stall_producers(self) -> list[Participant]: ...
+
+    @property
+    def stall_consumers(self) -> list[Participant]: ...
+
+    def __repr__(self) -> str: ...
+
+class Registry:
+    @staticmethod
+    def open_or_create(namespace: str, capacity: int = ...) -> Registry:
+        """Open the registry SHM for `namespace`, creating it if absent."""
+
+    @staticmethod
+    def try_open(namespace: str) -> Registry | None:
+        """Open an existing registry; returns None if none exists."""
+
+    @staticmethod
+    def unlink(namespace: str) -> None:
+        """Remove the registry SHM for `namespace` from the filesystem."""
+
+    def snapshot(self) -> list[Participant]:
+        """Copy all currently Active participant entries. Does not filter by process liveness."""
+
+    def list_topics(self) -> list[TopicSummary]:
+        """Topic-centric view: groups participants by shm_name and splits them into producer/consumer × alive/stall lanes."""
+
+    def sweep_stale(self) -> int:
+        """Reclaim slots owned by processes that no longer exist. Returns the number of slots freed."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def capacity(self) -> int: ...
+
+    def __repr__(self) -> str: ...
 
 class SampleView:
     def __buffer__(self, flags, /):
@@ -278,7 +458,7 @@ class BroadcastHandle:
     def __repr__(self) -> str: ...
 
 class Node:
-    def __init__(self, name: str, prefix: str = 'kickmsg') -> None: ...
+    def __init__(self, name: str, namespace: str = 'kickmsg') -> None: ...
 
     def advertise(self, topic: str, cfg: Config = ...) -> Publisher: ...
 
@@ -308,6 +488,6 @@ class Node:
     def name(self) -> str: ...
 
     @property
-    def prefix(self) -> str: ...
+    def namespace(self) -> str: ...
 
     def __repr__(self) -> str: ...

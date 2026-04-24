@@ -6,7 +6,7 @@
 ///   - "display" subscribes to "temperature" and prints them
 ///
 /// Single-process for simplicity; in production, each node lives in
-/// its own process sharing the same prefix.
+/// its own process sharing the same namespace.
 
 #include <cstdint>
 #include <cstring>

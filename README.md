@@ -116,6 +116,49 @@ region.reset_retired_rings();
 region.reclaim_orphaned_slots();
 ```
 
+## CLI (`kickmsg`)
+
+Installing the Python wheel puts a `kickmsg` command on `$PATH` that
+inspects running channels via a shared participant registry (one per
+namespace, backed by a SHM region at `/{namespace}_registry`).  Works
+identically on Linux, macOS, and Windows — no `/dev/shm` filesystem
+walk required.
+
+```bash
+kickmsg list                        # topic-centric enumeration
+kickmsg list -o name,pub,sub,stall  # ps-style column selection
+kickmsg info  <shm>                 # static header metadata
+kickmsg stats <shm>                 # runtime counters (write_pos / dropped / lost)
+kickmsg watch <shm>                 # top-like live view with msg/s rates
+kickmsg diagnose <shm>              # wraps SharedRegion::diagnose()
+kickmsg repair   <shm> [--locked]   # run repair primitives
+kickmsg schema <shm>                # focused schema descriptor view
+kickmsg schema-diff <a> <b>         # field-by-field schema comparison
+```
+
+All subcommands accept `--json` for scripting.
+
+### Programmatic use (GUIs, exporters)
+
+The same data the CLI renders is available as typed dataclasses through
+`kickmsg.diagnostics`, so a GUI can consume it without shelling out:
+
+```python
+from kickmsg import diagnostics as diag
+
+for topic in diag.list_topics(namespace="kickmsg"):
+    print(topic.shm_name, len(topic.producers), len(topic.consumers))
+
+stats = diag.stats("/kickmsg_telemetry")
+for ring in stats.rings:
+    if ring.state == "live":
+        print(ring.write_pos, ring.dropped_count, ring.lost_count)
+
+# Live updates (generator — caller drives the loop)
+for frame in diag.watch("/kickmsg_telemetry", interval=1.0):
+    gui.update(frame.stats, frame.rates_msg_per_sec)
+```
+
 ## Building
 
 ### Prerequisites

@@ -33,7 +33,7 @@ bool run_subscriber_churn()
 
             while (pub.send(&msg, sizeof(msg)) < 0)
             {
-                kickmsg::sleep(0ns);
+                kickmsg::yield();
             }
         }
         pub_done = true;

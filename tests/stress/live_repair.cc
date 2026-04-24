@@ -50,7 +50,7 @@ bool run_live_repair()
             }
             else if (rc == -EAGAIN)
             {
-                kickmsg::sleep(0ns);
+                kickmsg::yield();
             }
         }
     };

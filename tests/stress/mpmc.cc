@@ -25,7 +25,7 @@ bool run_stress_test(TestConfig const& tc)
     auto region = kickmsg::SharedRegion::create(
         shm_name, kickmsg::channel::PubSub, cfg, "stress_test");
 
-    nanoseconds t0 = kickmsg::since_epoch();
+    nanoseconds t0 = kickmsg::monotonic_ns();
 
     std::vector<std::thread> sub_threads;
     std::vector<SubResult> sub_results(static_cast<std::size_t>(tc.num_subscribers));
@@ -63,7 +63,7 @@ bool run_stress_test(TestConfig const& tc)
         t.join();
     }
 
-    nanoseconds t1 = kickmsg::since_epoch();
+    nanoseconds t1 = kickmsg::monotonic_ns();
     int64_t elapsed_ms = std::chrono::duration_cast<milliseconds>(t1 - t0).count();
 
     uint64_t total_sent = static_cast<uint64_t>(tc.num_publishers) * tc.msgs_per_pub;

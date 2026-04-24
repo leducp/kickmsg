@@ -7,12 +7,16 @@
 ///     Config                 — channel::Config
 ///     SchemaInfo             — payload schema descriptor
 ///     HealthReport           — SharedRegion::diagnose() result
-///     SharedRegion           — factory methods + schema/health/repair
+///     RingStats / RegionStats — SharedRegion::stats() result
+///     SharedRegion           — factory methods + schema/health/repair/stats
 ///     Publisher              — send(bytes) + allocate() → AllocatedSlot
 ///     AllocatedSlot          — writable zero-copy handle + .publish()
 ///     Subscriber             — try_receive / receive (GIL release) / *_view
 ///     SampleView             — read-only zero-copy sample (buffer protocol)
 ///     BroadcastHandle        — NamedTuple-like (pub, sub)
+///     Role                   — registry::Role enum (Publisher/Subscriber/Both)
+///     Participant            — registry snapshot entry
+///     Registry               — per-namespace participant discovery
 ///     Node                   — high-level topic / broadcast / mailbox
 ///     schema (submodule)
 ///       Diff                 — enum (bitmask)
@@ -64,12 +68,15 @@
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "kickmsg/Node.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Region.h"
+#include "kickmsg/Registry.h"
 #include "kickmsg/Subscriber.h"
 #include "kickmsg/Hash.h"
+#include "kickmsg/os/Process.h"
 #include "kickmsg/types.h"
 
 namespace nb = nanobind;
@@ -208,9 +215,12 @@ namespace
 
 namespace kickmsg
 {
-    NB_MODULE(kickmsg, m)
+    // Native module name is `_native`; the outer `kickmsg/__init__.py` does
+    // `from ._native import *` so user-visible import paths (kickmsg.Publisher,
+    // kickmsg.Node, …) are unchanged.
+    NB_MODULE(_native, m)
     {
-        m.doc() = "Kickmsg — lock-free shared-memory IPC";
+        m.doc() = "Kickmsg — lock-free shared-memory IPC (native bindings)";
 
         // -------------------------------------------------------------------
         // Enums & simple types
@@ -340,6 +350,73 @@ namespace kickmsg
             });
 
         // -------------------------------------------------------------------
+        // RingStats / RegionStats — runtime counter snapshot via stats()
+        // -------------------------------------------------------------------
+
+        nb::class_<RingStats>(m, "RingStats")
+            .def_ro("state",         &RingStats::state)
+            .def_ro("in_flight",     &RingStats::in_flight)
+            .def_ro("write_pos",     &RingStats::write_pos)
+            .def_ro("dropped_count", &RingStats::dropped_count)
+            .def_ro("lost_count",    &RingStats::lost_count)
+            .def("__repr__", [](RingStats const& r)
+            {
+                char const* state_name = "?";
+                switch (r.state)
+                {
+                    case ring::Free:     state_name = "Free";     break;
+                    case ring::Live:     state_name = "Live";     break;
+                    case ring::Draining: state_name = "Draining"; break;
+                }
+                return std::string{"RingStats(state="} + state_name +
+                       ", in_flight=" + std::to_string(r.in_flight) +
+                       ", write_pos=" + std::to_string(r.write_pos) +
+                       ", dropped=" + std::to_string(r.dropped_count) +
+                       ", lost=" + std::to_string(r.lost_count) + ")";
+            });
+
+        nb::class_<RegionStats>(m, "RegionStats")
+            .def_ro("rings",        &RegionStats::rings)
+            .def_ro("total_writes", &RegionStats::total_writes)
+            .def_ro("total_drops",  &RegionStats::total_drops)
+            .def_ro("total_losses", &RegionStats::total_losses)
+            .def_ro("live_rings",   &RegionStats::live_rings)
+            .def_ro("pool_free",    &RegionStats::pool_free)
+            .def_ro("pool_size",    &RegionStats::pool_size)
+            .def("__repr__", [](RegionStats const& s)
+            {
+                return std::string{"RegionStats(live_rings="} +
+                       std::to_string(s.live_rings) +
+                       ", total_writes=" + std::to_string(s.total_writes) +
+                       ", total_drops=" + std::to_string(s.total_drops) +
+                       ", total_losses=" + std::to_string(s.total_losses) +
+                       ", pool_free=" + std::to_string(s.pool_free) +
+                       "/" + std::to_string(s.pool_size) + ")";
+            });
+
+        nb::class_<RegionInfo>(m, "RegionInfo")
+            .def_ro("shm_name",          &RegionInfo::shm_name)
+            .def_ro("channel_type",      &RegionInfo::channel_type)
+            .def_ro("version",           &RegionInfo::version)
+            .def_ro("config_hash",       &RegionInfo::config_hash)
+            .def_ro("total_size",        &RegionInfo::total_size)
+            .def_ro("max_subs",          &RegionInfo::max_subs)
+            .def_ro("sub_ring_capacity", &RegionInfo::sub_ring_capacity)
+            .def_ro("pool_size",         &RegionInfo::pool_size)
+            .def_ro("max_payload_size",  &RegionInfo::max_payload_size)
+            .def_ro("commit_timeout_us", &RegionInfo::commit_timeout_us)
+            .def_ro("creator_pid",       &RegionInfo::creator_pid)
+            .def_ro("creator_name",      &RegionInfo::creator_name)
+            .def_ro("created_at_ns",     &RegionInfo::created_at_ns)
+            .def("__repr__", [](RegionInfo const& i)
+            {
+                return std::string{"RegionInfo(shm='"} + i.shm_name +
+                       "', version=" + std::to_string(i.version) +
+                       ", creator_pid=" + std::to_string(i.creator_pid) +
+                       ", creator='" + i.creator_name + "')";
+            });
+
+        // -------------------------------------------------------------------
         // SharedRegion
         // -------------------------------------------------------------------
 
@@ -364,6 +441,11 @@ namespace kickmsg
             .def("try_claim_schema",   &SharedRegion::try_claim_schema,   "info"_a)
             .def("reset_schema_claim", &SharedRegion::reset_schema_claim)
             .def("diagnose",               &SharedRegion::diagnose)
+            .def("stats",                  &SharedRegion::stats,
+                 "Runtime counter snapshot (per-ring + aggregate). "
+                 "Safe under live traffic.")
+            .def("info",                   &SharedRegion::info,
+                 "Static header metadata: geometry, creator, version.")
             .def("repair_locked_entries", &SharedRegion::repair_locked_entries)
             .def("reset_retired_rings",   &SharedRegion::reset_retired_rings)
             .def("reclaim_orphaned_slots",&SharedRegion::reclaim_orphaned_slots)
@@ -378,6 +460,96 @@ namespace kickmsg
 
         m.def("unlink_shm", [](std::string const& name) { SharedMemory::unlink(name); },
               "name"_a, "Unlink a shared-memory entry by name (no-op if absent).");
+
+        // -------------------------------------------------------------------
+        // Registry — per-namespace participant directory
+        // -------------------------------------------------------------------
+
+        nb::enum_<registry::Role>(m, "Role")
+            .value("Publisher",  registry::Publisher)
+            .value("Subscriber", registry::Subscriber)
+            .value("Both",       registry::Both);
+
+        nb::enum_<registry::Kind>(m, "Kind")
+            .value("Pubsub",    registry::Pubsub)
+            .value("Broadcast", registry::Broadcast)
+            .value("Mailbox",   registry::Mailbox);
+
+        nb::class_<Participant>(m, "Participant")
+            .def_ro("pid",            &Participant::pid)
+            .def_ro("pid_starttime",  &Participant::pid_starttime)
+            .def_ro("created_at_ns",  &Participant::created_at_ns)
+            .def_ro("channel_type",   &Participant::channel_type)
+            .def_ro("role",           &Participant::role)
+            .def_ro("kind",           &Participant::kind)
+            .def_ro("shm_name",       &Participant::shm_name)
+            .def_ro("topic_name",     &Participant::topic_name)
+            .def_ro("node_name",      &Participant::node_name)
+            .def("__repr__", [](Participant const& p)
+            {
+                char const* role_name = "?";
+                switch (p.role)
+                {
+                    case registry::Publisher:  role_name = "Publisher";  break;
+                    case registry::Subscriber: role_name = "Subscriber"; break;
+                    case registry::Both:       role_name = "Both";       break;
+                }
+                return std::string{"Participant(topic='"} + p.topic_name +
+                       "', node='" + p.node_name +
+                       "', pid=" + std::to_string(p.pid) +
+                       ", role=" + role_name + ")";
+            });
+
+        nb::class_<TopicSummary>(m, "TopicSummary")
+            .def_ro("shm_name",        &TopicSummary::shm_name)
+            .def_ro("topic_name",      &TopicSummary::topic_name)
+            .def_ro("channel_type",    &TopicSummary::channel_type)
+            .def_ro("kind",            &TopicSummary::kind)
+            .def_ro("producers",       &TopicSummary::producers)
+            .def_ro("consumers",       &TopicSummary::consumers)
+            .def_ro("stall_producers", &TopicSummary::stall_producers)
+            .def_ro("stall_consumers", &TopicSummary::stall_consumers)
+            .def("__repr__", [](TopicSummary const& t)
+            {
+                return std::string{"TopicSummary(topic='"} + t.topic_name +
+                       "', producers=" + std::to_string(t.producers.size()) +
+                       ", consumers=" + std::to_string(t.consumers.size()) +
+                       ", stalled=" +
+                       std::to_string(t.stall_producers.size()
+                                      + t.stall_consumers.size()) + ")";
+            });
+
+        nb::class_<Registry>(m, "Registry")
+            .def_static("open_or_create", &Registry::open_or_create,
+                        "namespace"_a, "capacity"_a = registry::DEFAULT_CAPACITY,
+                        nb::rv_policy::move,
+                        "Open the registry SHM for `namespace`, creating it if absent.")
+            .def_static("try_open", &Registry::try_open, "namespace"_a,
+                        nb::rv_policy::move,
+                        "Open an existing registry; returns None if none exists.")
+            .def_static("unlink", &Registry::unlink, "namespace"_a,
+                        "Remove the registry SHM for `namespace` from the filesystem.")
+            .def("snapshot", &Registry::snapshot,
+                 "Copy all currently Active participant entries.  Does not "
+                 "filter by process liveness.")
+            .def("list_topics", &Registry::list_topics,
+                 "Topic-centric view: groups participants by shm_name and "
+                 "splits them into producer/consumer × alive/stall lanes.")
+            .def("sweep_stale", &Registry::sweep_stale,
+                 "Reclaim slots owned by processes that no longer exist.  "
+                 "Returns the number of slots freed.")
+            .def_prop_ro("name",     &Registry::name)
+            .def_prop_ro("capacity", &Registry::capacity)
+            .def("__repr__", [](Registry const& r)
+            {
+                return std::string{"Registry(name='"} + r.name() +
+                       "', capacity=" + std::to_string(r.capacity()) + ")";
+            });
+
+        m.def("process_exists", &process_exists, "pid"_a,
+              "Return True if a process with `pid` exists on this host.");
+        m.def("current_pid", &current_pid,
+              "Return the PID of the current process.");
 
         // SampleRef (the C++ byte-copy sample) is not bound directly —
         // try_receive() / receive() auto-convert it to `bytes` at the
@@ -683,7 +855,7 @@ namespace kickmsg
         // keep_alive<0, 1>: the return value (0) pins the Node (1 = self).
         nb::class_<Node>(m, "Node")
             .def(nb::init<std::string const&, std::string const&>(),
-                 "name"_a, "prefix"_a = std::string{"kickmsg"})
+                 "name"_a, "namespace"_a = std::string{"kickmsg"})
             .def("advertise",
                 [](Node& n, char const* topic, channel::Config const& cfg)
                 { return n.advertise(topic, cfg); },
@@ -726,12 +898,12 @@ namespace kickmsg
             .def("topic_schema",           &Node::topic_schema,           "topic"_a)
             .def("try_claim_topic_schema", &Node::try_claim_topic_schema,
                  "topic"_a, "info"_a)
-            .def_prop_ro("name",   &Node::name)
-            .def_prop_ro("prefix", &Node::prefix)
+            .def_prop_ro("name",      &Node::name)
+            .def_prop_ro("namespace", &Node::kmsg_namespace)
             .def("__repr__", [](Node const& n)
             {
                 return std::string{"Node(name='"} + n.name() +
-                       "', prefix='" + n.prefix() + "')";
+                       "', namespace='" + n.kmsg_namespace() + "')";
             });
     }
 }
