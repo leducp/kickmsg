@@ -139,7 +139,7 @@ static void run_latency(BenchConfig const& bc, bool zerocopy)
 
         while (pub.send(payload.data(), payload.size()) < 0)
         {
-            kickmsg::sleep(0ns);
+            kickmsg::yield();
         }
 
         if (zerocopy)

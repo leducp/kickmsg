@@ -2,14 +2,9 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
-#ifdef _WIN32
-#include <process.h>
-#define getpid _getpid
-#else
-#include <unistd.h>
-#endif
 
 #include "kickmsg/Region.h"
+#include "kickmsg/os/Process.h"
 #include "kickmsg/os/Time.h"
 
 namespace kickmsg
@@ -89,7 +84,7 @@ namespace kickmsg
         h->sub_ring_stride   = ring_stride;
         h->commit_timeout_us = static_cast<uint64_t>(cfg.commit_timeout.count());
         h->config_hash       = compute_config_hash(type, cfg);
-        h->creator_pid       = static_cast<uint64_t>(getpid());
+        h->creator_pid       = kickmsg::current_pid();
         h->created_at_ns     = static_cast<uint64_t>(kickmsg::since_epoch().count());
         h->creator_name_len  = creator_len;
         std::memcpy(header_creator_name(h), creator_name, creator_len);
@@ -120,9 +115,11 @@ namespace kickmsg
         for (uint32_t i = 0; i < cfg.max_subscribers; ++i)
         {
             auto* ring = sub_ring_at(base(), h, i);
-            ring->state_flight = ring::make_packed(ring::Free);
-            ring->write_pos    = 0;
-            ring->has_waiter   = 0;
+            ring->state_flight  = ring::make_packed(ring::Free);
+            ring->write_pos     = 0;
+            ring->has_waiter    = 0;
+            ring->dropped_count = 0;
+            ring->lost_count    = 0;
         }
 
         // Write magic LAST with release: create_or_open() polls magic with
@@ -447,6 +444,94 @@ namespace kickmsg
             expected, schema::Unset,
             std::memory_order_acq_rel,
             std::memory_order_relaxed);
+    }
+
+    RegionStats SharedRegion::stats() const
+    {
+        auto const* b = base();
+        auto const* h = header();
+
+        RegionStats out{};
+        out.pool_size = h->pool_size;
+        out.rings.reserve(h->max_subs);
+
+        for (uint64_t i = 0; i < h->max_subs; ++i)
+        {
+            // sub_ring_at needs a non-const base*/header*, but the operation
+            // is read-only — const_cast is safe here.
+            auto* ring = sub_ring_at(const_cast<void*>(b),
+                                     h, static_cast<uint32_t>(i));
+            uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
+
+            RingStats rs{};
+            rs.state         = static_cast<uint32_t>(ring::get_state(packed));
+            rs.in_flight     = ring::get_in_flight(packed);
+            rs.write_pos     = ring->write_pos.load(std::memory_order_acquire);
+            rs.dropped_count = ring->dropped_count.load(std::memory_order_relaxed);
+            rs.lost_count    = ring->lost_count.load(std::memory_order_relaxed);
+
+            if (rs.state == ring::Live)
+            {
+                ++out.live_rings;
+            }
+            // Max across ALL rings: a Free ring's write_pos is frozen at
+            // whatever value it had when its last subscriber left, so it's
+            // a valid past observation.  Using max (not sum) matches the
+            // "publish events observed by the channel" semantic and stays
+            // monotonic across subscriber churn.
+            if (rs.write_pos > out.total_writes)
+            {
+                out.total_writes = rs.write_pos;
+            }
+            out.total_drops  += rs.dropped_count;
+            out.total_losses += rs.lost_count;
+
+            out.rings.push_back(rs);
+        }
+
+        // Approximate free-slot count: walk the Treiber stack from the head,
+        // bounded by pool_size so a concurrent push/pop storm can't fool us
+        // into an unbounded loop.  Under churn we can undercount (a slot
+        // being popped mid-walk) or overcount (a slot's next_free pointing
+        // to a just-pushed node we've already counted) — acceptable for a
+        // diagnostic view.
+        uint64_t top = h->free_top.load(std::memory_order_acquire);
+        uint32_t idx = tagged_idx(top);
+        uint64_t count = 0;
+        uint64_t const limit = h->pool_size;
+        while (idx != INVALID_SLOT and count < limit)
+        {
+            if (idx >= h->pool_size) break;
+            auto* slot = slot_at(const_cast<void*>(b), h, idx);
+            idx = slot->next_free.load(std::memory_order_relaxed);
+            ++count;
+        }
+        out.pool_free = count;
+
+        return out;
+    }
+
+    RegionInfo SharedRegion::info() const
+    {
+        auto const* h = header();
+        RegionInfo out{};
+        out.shm_name          = name_;
+        out.channel_type      = h->channel_type;
+        out.version           = h->version;
+        out.config_hash       = h->config_hash;
+        out.total_size        = h->total_size;
+        out.max_subs          = h->max_subs;
+        out.sub_ring_capacity = h->sub_ring_capacity;
+        out.pool_size         = h->pool_size;
+        out.max_payload_size  = h->slot_data_size;
+        out.commit_timeout_us = h->commit_timeout_us;
+        out.creator_pid       = h->creator_pid;
+        out.created_at_ns     = h->created_at_ns;
+
+        // Creator name tail: bytes written at offset sizeof(Header).
+        auto const* tail = static_cast<char const*>(base()) + sizeof(Header);
+        out.creator_name.assign(tail, h->creator_name_len);
+        return out;
     }
 
     std::size_t SharedRegion::reclaim_orphaned_slots()

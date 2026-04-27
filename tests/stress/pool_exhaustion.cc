@@ -46,7 +46,7 @@ bool run_pool_exhaustion()
                     std::abort();
                 }
                 eagain_count.fetch_add(1, std::memory_order_relaxed);
-                kickmsg::sleep(0ns);
+                kickmsg::yield();
             }
         }
     };

@@ -8,12 +8,8 @@
 #include <cstring>
 #include <thread>
 #include <vector>
-#ifdef _WIN32
-#include <process.h>
-#define getpid _getpid
-#else
-#include <unistd.h>
-#endif
+
+#include "kickmsg/os/Process.h"
 
 class RegionTest : public ::testing::Test
 {
@@ -120,7 +116,7 @@ TEST_F(RegionTest, HeaderStoresCreatorMetadata)
                       SHM_NAME, kickmsg::channel::PubSub, cfg, "my_node");
     auto* hdr   = region.header();
 
-    EXPECT_EQ(hdr->creator_pid, static_cast<uint64_t>(getpid()));
+    EXPECT_EQ(hdr->creator_pid, kickmsg::current_pid());
     EXPECT_GT(hdr->created_at_ns, 0u);
     EXPECT_NE(hdr->config_hash, 0u);
 }
@@ -917,4 +913,121 @@ TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
     auto got = opened.schema();
     ASSERT_TRUE(got.has_value());
     EXPECT_STREQ(got->name, "creator/Type");
+}
+
+// -----------------------------------------------------------------------------
+// stats() — cross-process counter snapshot
+// -----------------------------------------------------------------------------
+
+TEST_F(RegionTest, StatsOnFreshRegionReportsZeros)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg, "stats");
+    auto s = region.stats();
+
+    EXPECT_EQ(s.rings.size(), cfg.max_subscribers);
+    EXPECT_EQ(s.live_rings,   0u);
+    EXPECT_EQ(s.total_writes, 0u);
+    EXPECT_EQ(s.total_drops,  0u);
+    EXPECT_EQ(s.total_losses, 0u);
+    EXPECT_EQ(s.pool_size,    cfg.pool_size);
+    // Fresh region: every slot is on the free stack.
+    EXPECT_EQ(s.pool_free,    cfg.pool_size);
+
+    for (auto const& r : s.rings)
+    {
+        EXPECT_EQ(r.state,         kickmsg::ring::Free);
+        EXPECT_EQ(r.in_flight,     0u);
+        EXPECT_EQ(r.write_pos,     0u);
+        EXPECT_EQ(r.dropped_count, 0u);
+        EXPECT_EQ(r.lost_count,    0u);
+    }
+}
+
+TEST_F(RegionTest, StatsWritePosAdvancesWithPublishes)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg, "stats");
+
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    constexpr int N = 5;
+    uint32_t payload = 0xC0FFEE;
+    for (int i = 0; i < N; ++i)
+    {
+        ASSERT_GE(pub.send(&payload, sizeof(payload)), 0);
+    }
+
+    auto s = region.stats();
+    EXPECT_EQ(s.live_rings,   1u);
+    EXPECT_EQ(s.total_writes, static_cast<uint64_t>(N));
+
+    // Exactly one ring should be Live and carry write_pos == N.
+    std::size_t live_seen = 0;
+    for (auto const& r : s.rings)
+    {
+        if (r.state == kickmsg::ring::Live)
+        {
+            ++live_seen;
+            EXPECT_EQ(r.write_pos, static_cast<uint64_t>(N));
+        }
+    }
+    EXPECT_EQ(live_seen, 1u);
+}
+
+TEST_F(RegionTest, StatsLostCountMatchesSubscriberLostOnOverflow)
+{
+    auto cfg    = default_cfg();  // sub_ring_capacity = 8
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg, "stats");
+
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    // Publish more than the ring can hold without draining — forces the
+    // subscriber's drain-ahead path to bump lost_count on its next read.
+    uint32_t payload = 0;
+    std::size_t const to_publish = cfg.sub_ring_capacity * 3;
+    for (std::size_t i = 0; i < to_publish; ++i)
+    {
+        payload = static_cast<uint32_t>(i);
+        ASSERT_GE(pub.send(&payload, sizeof(payload)), 0);
+    }
+
+    // Drive the subscriber: the first try_receive hits the drain-ahead
+    // branch and jumps read_pos forward, recording the skipped count.
+    while (sub.try_receive()) { /* drain */ }
+
+    EXPECT_GT(sub.lost(), 0u);
+
+    auto s = region.stats();
+    // Exactly one ring is Live — its lost_count equals the subscriber's.
+    uint64_t ring_lost = 0;
+    for (auto const& r : s.rings)
+    {
+        ring_lost += r.lost_count;
+    }
+    EXPECT_EQ(ring_lost, sub.lost());
+    EXPECT_EQ(s.total_losses, sub.lost());
+}
+
+TEST_F(RegionTest, StatsPoolFreeTracksAllocations)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(
+                      SHM_NAME, kickmsg::channel::PubSub, cfg, "stats");
+
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    // Hold a slot mid-publish (allocate without publish).
+    auto* ptr = pub.allocate(8);
+    ASSERT_NE(ptr, nullptr);
+
+    auto s = region.stats();
+    // One slot is popped from the free stack and not yet returned.
+    EXPECT_EQ(s.pool_free, cfg.pool_size - 1);
 }

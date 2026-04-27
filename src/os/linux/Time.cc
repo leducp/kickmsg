@@ -1,10 +1,11 @@
+// Linux-specific sleep().  Other Time entry points live in
+// src/os/posix/Time.cc.
 #include "kickmsg/os/Time.h"
 
 #include <cerrno>
 #include <ctime>
 #include <stdexcept>
 #include <system_error>
-#include <string>
 
 namespace kickmsg
 {
@@ -17,7 +18,7 @@ namespace kickmsg
         while (true)
         {
             timespec required = remaining;
-            int result = clock_nanosleep(CLOCK_MONOTONIC, 0, &required, &remaining);
+            int result = ::clock_nanosleep(CLOCK_MONOTONIC, 0, &required, &remaining);
             if (result == 0)
             {
                 return;
@@ -28,17 +29,5 @@ namespace kickmsg
             }
             throw std::system_error(result, std::system_category(), "clock_nanosleep()");
         }
-    }
-
-    nanoseconds since_epoch()
-    {
-        timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return seconds{ts.tv_sec} + nanoseconds{ts.tv_nsec};
-    }
-
-    nanoseconds elapsed_time(nanoseconds start)
-    {
-        return since_epoch() - start;
     }
 }

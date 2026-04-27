@@ -3,12 +3,61 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "kickmsg/types.h"
 #include "kickmsg/os/SharedMemory.h"
 
 namespace kickmsg
 {
+    /// Runtime snapshot of a single subscriber ring.
+    /// Values are relaxed/acquire-loaded, so the snapshot is internally
+    /// consistent per-ring but may race mildly across rings — fine for a
+    /// diagnostic view; not intended as a strongly-consistent read.
+    struct RingStats
+    {
+        uint32_t state;          ///< ring::State as a raw int (0=Free, 1=Live, 2=Draining)
+        uint32_t in_flight;      ///< Publishers currently admitted to this ring
+        uint64_t write_pos;      ///< Monotonic claim counter (rough throughput proxy)
+        uint64_t dropped_count;  ///< Cumulative publisher drops on this ring
+        uint64_t lost_count;     ///< Cumulative subscriber losses on this ring
+    };
+
+    /// Aggregate region snapshot returned by SharedRegion::stats().
+    /// Safe to call under live traffic: all reads are relaxed/acquire,
+    /// no writes.
+    struct RegionStats
+    {
+        std::vector<RingStats> rings;   ///< One entry per subscriber-ring slot (length == max_subs)
+        uint64_t total_writes;          ///< Max of write_pos across all rings: publish events observed by the channel, monotonic across subscriber churn
+        uint64_t total_drops;           ///< Sum of dropped_count across all rings
+        uint64_t total_losses;          ///< Sum of lost_count across all rings
+        uint64_t live_rings;            ///< Number of rings currently Live
+        uint64_t pool_free;             ///< Approximate free-slot count (walks Treiber stack — racy under churn)
+        uint64_t pool_size;             ///< Total pool capacity (static)
+    };
+
+    /// Static header metadata returned by SharedRegion::info().
+    /// All fields are written once at creation and never mutated, so this
+    /// read is a plain copy of stable bytes.
+    struct RegionInfo
+    {
+        std::string   shm_name;
+        channel::Type channel_type;
+        uint32_t      version;
+        uint64_t      config_hash;
+        uint64_t      total_size;
+        uint64_t      max_subs;
+        uint64_t      sub_ring_capacity;
+        uint64_t      pool_size;
+        uint64_t      max_payload_size;
+        uint64_t      commit_timeout_us;
+        uint64_t      creator_pid;
+        uint64_t      created_at_ns;
+        std::string   creator_name;
+    };
+
+
     class SharedRegion
     {
     public:
@@ -133,6 +182,25 @@ namespace kickmsg
         /// action, not a routine maintenance call.
         /// Returns the number of rings reset.
         std::size_t reset_retired_rings();
+
+        /// Runtime counter snapshot — safe under live traffic.
+        ///
+        /// Reads the cross-process per-ring counters (`write_pos`,
+        /// `dropped_count`, `lost_count`) plus ring state and an approximate
+        /// pool-free count.  Intended for external monitoring and the CLI's
+        /// `stats` / `watch` subcommands.
+        ///
+        /// Cheap (no syscalls, no locks, a handful of atomic loads) but not a
+        /// strongly-consistent view: individual per-ring values are consistent
+        /// with themselves (sequential loads on one variable), but different
+        /// rings may be read at slightly different instants.  The free-stack
+        /// walk for `pool_free` is bounded by `pool_size` so it can't loop
+        /// forever under racing pushes/pops.
+        RegionStats stats() const;
+
+        /// Static header snapshot — geometry + creator metadata.  All
+        /// fields are written once at creation, so this is a plain copy.
+        RegionInfo info() const;
 
         /// Reclaim orphaned slots (refcount > 0 but not referenced by any ring entry).
         /// These are caused by publisher crashes between allocate and publish, or by

@@ -23,22 +23,34 @@ if(WIN32)
         src/os/windows/Time.cc
         src/os/windows/Futex.cc
         src/os/windows/SharedMemory.cc
+        src/os/windows/Process.cc
     )
     set(OS_LIBRARIES synchronization)
-elseif(APPLE)
-    set(OS_SOURCES
-        src/os/darwin/Time.cc
-        src/os/darwin/Futex.cc
-        src/os/darwin/SharedMemory.cc
-    )
-    set(OS_LIBRARIES pthread)
 else()
+    # Linux and macOS share most of the POSIX OS layer; only sleep(),
+    # create(), and the futex backend diverge.
     set(OS_SOURCES
-        src/os/linux/Time.cc
-        src/os/linux/Futex.cc
-        src/os/linux/SharedMemory.cc
+        src/os/posix/Time.cc
+        src/os/posix/SharedMemory.cc
+        src/os/posix/Process.cc
     )
-    set(OS_LIBRARIES rt pthread)
+    if(APPLE)
+        list(APPEND OS_SOURCES
+            src/os/darwin/Time.cc
+            src/os/darwin/SharedMemory.cc
+            src/os/darwin/Futex.cc
+            src/os/darwin/Process.cc
+        )
+        set(OS_LIBRARIES pthread)
+    else()
+        list(APPEND OS_SOURCES
+            src/os/linux/Time.cc
+            src/os/linux/SharedMemory.cc
+            src/os/linux/Futex.cc
+            src/os/linux/Process.cc
+        )
+        set(OS_LIBRARIES rt pthread)
+    endif()
 endif()
 
 # --- Library ---
@@ -49,6 +61,7 @@ add_library(kickmsg STATIC
     src/Publisher.cc
     src/Subscriber.cc
     src/Region.cc
+    src/Registry.cc
     src/Node.cc
     ${OS_SOURCES}
 )

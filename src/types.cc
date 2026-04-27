@@ -37,22 +37,17 @@ namespace kickmsg
         return reinterpret_cast<char*>(h) + sizeof(Header);
     }
 
-    // FNV-1a hash of config fields, used to detect parameter mismatches
-    // when opening an existing region.  Chained through hash::fnv1a_64()
-    // so the hashed byte sequence (and therefore the resulting value) is
-    // identical to a single fnv1a_64 over the concatenation of the same
-    // raw field bytes in the same order — do NOT reorder these fields
-    // without bumping VERSION, since existing regions on disk are hashed
-    // with this ordering.
+    // FNV-1a over the config fields, detecting parameter mismatches at
+    // open time.  Field order is part of the on-disk hash — do NOT
+    // reorder without bumping VERSION.
     uint64_t compute_config_hash(channel::Type type, channel::Config const& cfg)
     {
-        uint64_t h;
-        h = hash::fnv1a_64(&type,                  sizeof(type));
-        h = hash::fnv1a_64(&cfg.max_subscribers,   sizeof(cfg.max_subscribers),   h);
-        h = hash::fnv1a_64(&cfg.sub_ring_capacity, sizeof(cfg.sub_ring_capacity), h);
-        h = hash::fnv1a_64(&cfg.pool_size,         sizeof(cfg.pool_size),         h);
-        h = hash::fnv1a_64(&cfg.max_payload_size,  sizeof(cfg.max_payload_size),  h);
-        h = hash::fnv1a_64(&cfg.commit_timeout,    sizeof(cfg.commit_timeout),    h);
+        uint64_t h = hash::fnv1a_64(type);
+        h = hash::fnv1a_64(cfg.max_subscribers,        h);
+        h = hash::fnv1a_64(cfg.sub_ring_capacity,      h);
+        h = hash::fnv1a_64(cfg.pool_size,              h);
+        h = hash::fnv1a_64(cfg.max_payload_size,       h);
+        h = hash::fnv1a_64(cfg.commit_timeout.count(), h);
         return h;
     }
 

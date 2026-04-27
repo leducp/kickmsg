@@ -71,7 +71,7 @@ namespace kickmsg
         // Wait for all admitted publishers to finish.
         bool quiesced = true;
         microseconds deadline{header_->commit_timeout_us};
-        nanoseconds start = kickmsg::since_epoch();
+        nanoseconds start = kickmsg::monotonic_ns();
         while (ring::get_in_flight(
                    ring->state_flight.load(std::memory_order_acquire)) > 0)
         {
@@ -85,7 +85,7 @@ namespace kickmsg
                 ++drain_timeouts_;
                 break;
             }
-            kickmsg::sleep(0ns);
+            kickmsg::yield();
         }
 
         if (quiesced)
@@ -168,7 +168,9 @@ namespace kickmsg
             uint64_t capacity = header_->sub_ring_capacity;
             if (wp - read_pos_ > capacity)
             {
-                lost_ += (wp - read_pos_) - capacity;
+                uint64_t skipped = (wp - read_pos_) - capacity;
+                lost_ += skipped;
+                ring->lost_count.fetch_add(skipped, std::memory_order_relaxed);
                 read_pos_ = wp - capacity;
             }
 
@@ -189,6 +191,7 @@ namespace kickmsg
                 }
                 // Entry was overwritten (seq > expected): advance and retry.
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -199,6 +202,7 @@ namespace kickmsg
             if (slot_idx >= header_->pool_size or payload_len > header_->slot_data_size)
             {
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -224,6 +228,7 @@ namespace kickmsg
             {
                 // refcount == 0: slot already freed, count as lost.
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -240,6 +245,7 @@ namespace kickmsg
                     treiber_push(header_->free_top, slot, slot_idx);
                 }
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -262,7 +268,7 @@ namespace kickmsg
     std::optional<Subscriber::SampleRef> Subscriber::receive(nanoseconds timeout)
     {
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
-        nanoseconds start = kickmsg::since_epoch();
+        nanoseconds start = kickmsg::monotonic_ns();
 
         while (true)
         {
@@ -308,7 +314,9 @@ namespace kickmsg
             uint64_t capacity = header_->sub_ring_capacity;
             if (wp - read_pos_ > capacity)
             {
-                lost_ += (wp - read_pos_) - capacity;
+                uint64_t skipped = (wp - read_pos_) - capacity;
+                lost_ += skipped;
+                ring->lost_count.fetch_add(skipped, std::memory_order_relaxed);
                 read_pos_ = wp - capacity;
             }
 
@@ -324,6 +332,7 @@ namespace kickmsg
                     return std::nullopt;
                 }
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -334,6 +343,7 @@ namespace kickmsg
             if (slot_idx >= header_->pool_size or payload_len > header_->slot_data_size)
             {
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -355,6 +365,7 @@ namespace kickmsg
             if (not pinned)
             {
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -370,6 +381,7 @@ namespace kickmsg
                     treiber_push(header_->free_top, slot, slot_idx);
                 }
                 ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
@@ -383,7 +395,7 @@ namespace kickmsg
     std::optional<Subscriber::SampleView> Subscriber::receive_view(nanoseconds timeout)
     {
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
-        nanoseconds start = kickmsg::since_epoch();
+        nanoseconds start = kickmsg::monotonic_ns();
 
         while (true)
         {
