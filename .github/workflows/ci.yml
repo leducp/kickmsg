@@ -85,7 +85,9 @@ jobs:
       - uses: ./.github/actions/setup-conan
 
       - name: conan create
-        run: conan create conan/all --version=0.0.0 --build=missing
+        run: |
+          conan profile detect
+          conan create conan/all --version=0.0.0 --build=missing
         shell: bash
 
   # Cross-compile for ARM64 (no run — just verify it compiles)
