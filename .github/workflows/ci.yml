@@ -51,7 +51,7 @@ jobs:
       - name: Configure and build (Windows)
         if: runner.os == 'Windows'
         run: |
-          conan install conanfile.py -of=build/ \
+          conan install conan/conanfile.py -of=build/ \
             -pr:b conan/profile_windows_x86_64.txt \
             -pr:h conan/profile_windows_x86_64.txt \
             -o "&:unit_tests=True" \
@@ -73,6 +73,19 @@ jobs:
         if: contains(matrix.configure_args, 'benchmarks')
         working-directory: build
         run: ./kickmsg_microbench --benchmark_min_time=0.1s
+        shell: bash
+
+  # Verify the Conan package recipe is well-formed and the package builds
+  # cleanly from the recipe (no local source leaking in).
+  conan-create:
+    name: Conan Create
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-conan
+
+      - name: conan create
+        run: conan create conan/all --version=0.0.0 --build=missing
         shell: bash
 
   # Cross-compile for ARM64 (no run — just verify it compiles)
@@ -133,7 +146,7 @@ jobs:
   # PyPI project must list this repository + environment `maintainer` as
   # a trusted publisher).  No API tokens stored in GitHub secrets.
   release:
-    needs: [build, cross_arm64, build-wheels]
+    needs: [build, conan-create, cross_arm64, build-wheels]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     environment:

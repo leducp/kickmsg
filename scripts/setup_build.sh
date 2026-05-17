@@ -259,7 +259,7 @@ fi
 # Conan install
 step "Installing Conan dependencies"
 info "Installing $BUILD_TYPE dependencies..."
-conan install "$PROJECT_DIR/conanfile.py" -of="$build_dir" $CONAN_PROFILE_ARGS $CONAN_OPTIONS --build=missing -s build_type=$BUILD_TYPE
+conan install "$PROJECT_DIR/conan/conanfile.py" -of="$build_dir" $CONAN_PROFILE_ARGS $CONAN_OPTIONS --build=missing -s build_type=$BUILD_TYPE
 
 # CMake configure
 step "Configuring CMake ($BUILD_TYPE)"
