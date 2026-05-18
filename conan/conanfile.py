@@ -1,55 +1,32 @@
 from conan import ConanFile
-from conan.tools.cmake import CMake, CMakeToolchain, cmake_layout
-from conan.tools.files import copy
-
-import os
 
 
-class KickmsgConan(ConanFile):
-    """Conan package recipe for kickmsg.
+class KickmsgDev(ConanFile):
+    """Local development conanfile — installs dependencies based on build options.
 
-    For consumers: add kickmsg as a requirement in your conanfile:
-        self.requires("kickmsg/<version>")
+    Options mirror those in scripts/configure.sh and CMakeLists.txt.
+    setup_build.sh passes them via -o when calling conan install.
     """
-    name = "kickmsg"
-    license = "CeCILL-C"
-    url = "https://github.com/leducp/kickmsg"
-    description = "Lock-free shared-memory MPMC messaging library"
-    topics = ("ipc", "shared-memory", "lock-free", "pub-sub", "zero-copy")
-
     settings = "os", "compiler", "build_type", "arch"
 
-    exports_sources = (
-        "CMakeLists.txt",
-        "include/*",
-        "src/*",
-        "os/*",
-        "LICENSE",
-    )
+    options = {
+        "unit_tests": [True, False],
+        "benchmarks": [True, False],
+    }
+    default_options = {
+        "unit_tests": False,
+        "benchmarks": False,
+    }
 
-    def layout(self):
-        cmake_layout(self)
+    generators = "CMakeDeps"
 
-    def generate(self):
-        tc = CMakeToolchain(self)
-        tc.generate()
+    def requirements(self):
+        if self.options.unit_tests:
+            self.requires("gtest/1.15.0")
 
-    def build(self):
-        cmake = CMake(self)
-        cmake.configure()
-        cmake.build()
+        if self.options.benchmarks:
+            self.requires("benchmark/1.9.1")
 
-    def package(self):
-        copy(self, "LICENSE", src=self.source_folder,
-             dst=os.path.join(self.package_folder, "licenses"))
-        copy(self, "*.h", src=os.path.join(self.source_folder, "include"),
-             dst=os.path.join(self.package_folder, "include"))
-        copy(self, "*.a", src=self.build_folder,
-             dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-        copy(self, "*.lib", src=self.build_folder,
-             dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-
-    def package_info(self):
-        self.cpp_info.libs = ["kickmsg"]
-        if self.settings.os == "Linux":
-            self.cpp_info.system_libs = ["rt", "pthread"]
+    def configure(self):
+        if self.options.unit_tests:
+            self.options["gtest"].build_gmock = True
