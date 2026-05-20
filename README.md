@@ -21,6 +21,21 @@ Kickmsg provides MPMC publish/subscribe over shared memory with zero-copy receiv
 | Broadcast (N-to-N) | `join_broadcast` | `/{prefix}_broadcast_{channel}` |
 | Mailbox (N-to-1) | `create_mailbox` / `open_mailbox` | `/{prefix}_{owner}_mbx_{tag}` |
 
+## Installation
+
+For Python (also installs the `kickmsg` CLI):
+
+```bash
+pip install kickmsg
+```
+
+Pre-built wheels are published for CPython 3.10–3.12 on Linux x86_64 / aarch64
+(manylinux_2_28) and macOS 11+ (universal2).  On any other platform `pip` will
+fall back to a source build, which needs the [build prerequisites](#prerequisites).
+
+For C++ only, see [Building](#building) or use the Conan recipe in
+[`conan/all`](conan/all/conanfile.py).
+
 ## Quick Start
 
 ```cpp
@@ -129,7 +144,7 @@ kickmsg list                        # topic-centric enumeration
 kickmsg list -o name,pub,sub,stall  # ps-style column selection
 kickmsg info  <shm>                 # static header metadata
 kickmsg stats <shm>                 # runtime counters (write_pos / dropped / lost)
-kickmsg watch <shm>                 # top-like live view with msg/s rates
+kickmsg watch <shm>                 # top-like live view, msg/s rates (interactive; Ctrl-C to quit)
 kickmsg diagnose <shm>              # wraps SharedRegion::diagnose()
 kickmsg repair   <shm> [--locked]   # run repair primitives
 kickmsg schema <shm>                # focused schema descriptor view
@@ -187,11 +202,20 @@ cmake --build build
 ./build/kickmsg_stress_test
 ./build/kickmsg_crash_test
 
-# Run examples
+# Run C++ examples
 ./build/examples/hello_pubsub
 ./build/examples/hello_zerocopy
 ./build/examples/hello_broadcast
 ./build/examples/hello_diagnose
+./build/examples/hello_schema
+./build/examples/hello_schema_late_publisher
+./build/examples/hello_lowlevel
+
+# Run Python examples (after `pip install kickmsg`)
+python examples/python/hello_pubsub.py
+python examples/python/hello_camera_zerocopy.py    # zero-copy with memoryview
+python examples/python/hello_schema.py
+python examples/python/cli_playground.py           # long-running, drive the `kickmsg` CLI against it
 ```
 
 ### As a subdirectory
@@ -223,6 +247,10 @@ Actively validated on Linux x86-64, Linux ARM64 (Raspberry Pi 4B, 12 h continuou
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design: shared-memory layout, concurrency model, publish/subscribe flows, crash resilience, garbage collection, and ABA safety analysis.
+
+## Troubleshooting
+
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common operational gotchas: stale segments after a crash, the diagnose/repair flow, SHM naming and length limits, permission errors, and platform-specific notes (macOS PSHMNAMLEN, Windows session isolation, Linux `/dev/shm` sizing).
 
 ## License
 
