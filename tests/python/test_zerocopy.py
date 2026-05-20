@@ -20,16 +20,17 @@ def test_publisher_allocate_returns_writable_slot(shm_name, small_cfg):
     pub = kickmsg.Publisher(region)
     sub = kickmsg.Subscriber(region)
 
-    slot = pub.allocate(16)
+    slot = pub.allocate()
     assert slot is not None
-    assert len(slot) == 16
+    assert slot.max_size == small_cfg.max_payload_size
+    assert len(slot) == small_cfg.max_payload_size
     assert not slot.published
 
     mv = memoryview(slot)
     assert not mv.readonly
     mv[:5]   = b"hello"
     mv[5:16] = b"-zerocopy!!"
-    slot.publish()
+    slot.publish(16)
     assert slot.published
 
     got = sub.try_receive()
@@ -61,10 +62,10 @@ def test_slot_publish_rejects_new_memoryview(shm_name, small_cfg):
     pub = kickmsg.Publisher(region)
     sub = kickmsg.Subscriber(region)
 
-    slot = pub.allocate(8)
+    slot = pub.allocate()
     mv1 = memoryview(slot)
     mv1[:4] = b"xxxx"
-    slot.publish()
+    slot.publish(8)
 
     with pytest.raises(BufferError):
         memoryview(slot)
@@ -78,11 +79,11 @@ def test_slot_publish_rejects_new_memoryview(shm_name, small_cfg):
 def test_double_publish_raises(shm_name, small_cfg):
     region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
     pub = kickmsg.Publisher(region)
-    slot = pub.allocate(4)
-    memoryview(slot)[:] = b"ping"
-    slot.publish()
+    slot = pub.allocate()
+    memoryview(slot)[:4] = b"ping"
+    slot.publish(4)
     with pytest.raises(ValueError, match="more than once"):
-        slot.publish()
+        slot.publish(4)
 
 
 def test_view_release_returns_slot_to_pool(shm_name, small_cfg):
@@ -134,14 +135,15 @@ def test_zerocopy_camera_frame_pattern(shm_name):
     sub = kickmsg.Subscriber(region)
 
     frame_size = 320 * 240 * 3  # smaller test frame
-    slot = pub.allocate(frame_size)
+    slot = pub.allocate()
     assert slot is not None
+    assert slot.max_size == cfg.max_payload_size
     buf = memoryview(slot)
     # Fill with a pattern — cheap, full write coverage.
     for i in range(0, frame_size, 4096):
         chunk = min(4096, frame_size - i)
         buf[i:i + chunk] = bytes([(i + j) & 0xFF for j in range(chunk)])
-    slot.publish()
+    slot.publish(frame_size)
 
     view = sub.try_receive_view()
     try:

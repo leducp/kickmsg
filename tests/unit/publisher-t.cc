@@ -59,12 +59,13 @@ TEST_F(PublisherTest, AllocatePublishSeparately)
     kickmsg::Subscriber sub(region);
     kickmsg::Publisher  pub(region);
 
-    auto* ptr = pub.allocate(sizeof(uint32_t));
-    ASSERT_NE(ptr, nullptr);
+    auto a = pub.allocate();
+    ASSERT_NE(a.data, nullptr);
+    EXPECT_GE(a.max_size, sizeof(uint32_t));
 
     uint32_t val = 42;
-    std::memcpy(ptr, &val, sizeof(val));
-    std::size_t delivered = pub.publish();
+    std::memcpy(a.data, &val, sizeof(val));
+    std::size_t delivered = pub.publish(sizeof(val));
     EXPECT_EQ(delivered, 1u);
 
     auto sample = sub.try_receive();
@@ -75,13 +76,15 @@ TEST_F(PublisherTest, AllocatePublishSeparately)
     EXPECT_EQ(got, 42u);
 }
 
-TEST_F(PublisherTest, AllocateTooLargeReturnsNull)
+TEST_F(PublisherTest, AllocateExposesMaxSize)
 {
     auto cfg    = default_cfg();
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     kickmsg::Publisher pub(region);
 
-    EXPECT_EQ(pub.allocate(cfg.max_payload_size + 1), nullptr);
+    auto a = pub.allocate();
+    ASSERT_NE(a.data, nullptr);
+    EXPECT_EQ(a.max_size, cfg.max_payload_size);
 }
 
 TEST_F(PublisherTest, SendReturnsEmsgsize)

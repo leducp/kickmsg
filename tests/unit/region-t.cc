@@ -1024,8 +1024,8 @@ TEST_F(RegionTest, StatsPoolFreeTracksAllocations)
     kickmsg::Publisher  pub(region);
 
     // Hold a slot mid-publish (allocate without publish).
-    auto* ptr = pub.allocate(8);
-    ASSERT_NE(ptr, nullptr);
+    auto a = pub.allocate();
+    ASSERT_NE(a.data, nullptr);
 
     auto s = region.stats();
     // One slot is popped from the free stack and not yet returned.

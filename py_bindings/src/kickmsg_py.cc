@@ -27,19 +27,21 @@
 ///
 /// Zero-copy contract (lifetime-safe via the Python buffer protocol):
 ///
-///   slot = pub.allocate(N)      → AllocatedSlot.  memoryview(slot) is a
-///                                 writable view into the SHM slot.  The
-///                                 memoryview pins the slot, which pins
-///                                 the Publisher, which pins the mmap —
-///                                 so retained memoryviews stay valid
-///                                 (at the mmap level) as long as Python
-///                                 holds them.
-///   slot.publish()              → commits.  NEW memoryview(slot) after
-///                                 this raises BufferError.  Memoryviews
-///                                 obtained BEFORE publish remain pointer-
-///                                 valid but writing through them after
-///                                 publish would corrupt in-flight
-///                                 subscribers — user contract: don't.
+///   slot = pub.allocate()       → AllocatedSlot sized to max_payload_size.
+///                                 memoryview(slot) is a writable view into
+///                                 the SHM slot.  The memoryview pins the
+///                                 slot, which pins the Publisher, which
+///                                 pins the mmap — so retained memoryviews
+///                                 stay valid (at the mmap level) as long
+///                                 as Python holds them.
+///   slot.publish(n)             → commits, recording `n` bytes as the
+///                                 payload size.  NEW memoryview(slot)
+///                                 after this raises BufferError.
+///                                 Memoryviews obtained BEFORE publish
+///                                 remain pointer-valid but writing
+///                                 through them after publish would
+///                                 corrupt in-flight subscribers — user
+///                                 contract: don't.
 ///
 ///   view = sub.try_receive_view() → SampleView.  memoryview(view) is a
 ///                                 read-only view into the SHM slot.  The
@@ -85,10 +87,10 @@ using namespace nb::literals;
 namespace kickmsg
 {
     // Python-only wrapper around a Publisher reservation.  Holds the slot
-    // pointer + length returned by Publisher::allocate(), exposes the
-    // writable buffer protocol so `memoryview(slot)` points directly into
-    // the shared-memory slot (zero-copy), and has a .publish() method
-    // that commits via the Publisher.
+    // pointer and max payload size returned by Publisher::allocate(),
+    // exposes the writable buffer protocol so `memoryview(slot)` points
+    // directly into the shared-memory slot (zero-copy), and has a
+    // .publish(n) method that commits `n` bytes via the Publisher.
     //
     // Lifetime: the Py_buffer obtained through buffer protocol pins this
     // AllocatedSlot alive (view->obj = self; Py_INCREF), which in turn
@@ -101,11 +103,11 @@ namespace kickmsg
     {
         Publisher*  publisher;
         void*       ptr;
-        std::size_t len;
+        std::size_t max_size;
         bool        published;
 
-        PyAllocatedSlot(Publisher& p, void* data, std::size_t n)
-            : publisher{&p}, ptr{data}, len{n}, published{false}
+        PyAllocatedSlot(Publisher& p, void* data, std::size_t cap)
+            : publisher{&p}, ptr{data}, max_size{cap}, published{false}
         {
         }
     };
@@ -176,7 +178,7 @@ namespace
         view->buf        = slot->ptr;
         view->obj        = self;
         Py_INCREF(self);
-        view->len        = static_cast<Py_ssize_t>(slot->len);
+        view->len        = static_cast<Py_ssize_t>(slot->max_size);
         view->itemsize   = 1;
         view->readonly   = 0;                // writable
         view->ndim       = 1;
@@ -633,26 +635,36 @@ namespace kickmsg
         nb::class_<PyAllocatedSlot>(m, "AllocatedSlot",
             nb::type_slots(as_slots))
             .def("publish",
-                [](PyAllocatedSlot& s) -> std::size_t
+                [](PyAllocatedSlot& s, std::size_t len) -> std::size_t
                 {
                     if (s.published)
                     {
                         throw nb::value_error(
                             "AllocatedSlot.publish() called more than once");
                     }
+                    if (len > s.max_size)
+                    {
+                        throw nb::value_error(
+                            "publish(len) exceeds slot max_size");
+                    }
                     s.published = true;
-                    return s.publisher->publish();
+                    return s.publisher->publish(len);
                 },
-                "Commit the reserved slot.  Returns the number of rings "
-                "the sample was delivered to.  After this call, any NEW "
-                "memoryview(slot) fails with BufferError.")
+                "len"_a,
+                "Commit the reserved slot, recording `len` bytes as the "
+                "payload size.  Returns the number of rings the sample was "
+                "delivered to.  After this call, any NEW memoryview(slot) "
+                "fails with BufferError.")
             .def("__len__",
-                [](PyAllocatedSlot const& s) -> std::size_t { return s.len; })
+                [](PyAllocatedSlot const& s) -> std::size_t { return s.max_size; })
+            .def_prop_ro("max_size",
+                [](PyAllocatedSlot const& s) -> std::size_t { return s.max_size; })
             .def_prop_ro("published",
                 [](PyAllocatedSlot const& s) -> bool { return s.published; })
             .def("__repr__", [](PyAllocatedSlot const& s)
             {
-                return std::string{"AllocatedSlot(len="} + std::to_string(s.len) +
+                return std::string{"AllocatedSlot(max_size="} +
+                       std::to_string(s.max_size) +
                        ", published=" + (s.published ? "True" : "False") + ")";
             });
 
@@ -701,26 +713,26 @@ namespace kickmsg
                 "the message exceeds max_payload_size, BlockingIOError if "
                 "the slot pool is exhausted, OSError on other failures.")
             .def("allocate",
-                [](Publisher& p, std::size_t len) -> std::optional<PyAllocatedSlot>
+                [](Publisher& p) -> std::optional<PyAllocatedSlot>
                 {
-                    void* ptr = p.allocate(len);
-                    if (ptr == nullptr)
+                    auto a = p.allocate();
+                    if (a.data == nullptr)
                     {
                         return std::nullopt;
                     }
-                    return PyAllocatedSlot{p, ptr, len};
+                    return PyAllocatedSlot{p, a.data, a.max_size};
                 },
-                "len"_a,
                 // keep_alive<0, 1>: the returned AllocatedSlot (arg 0)
                 // must pin the Publisher (arg 1 = self).  Memoryviews
                 // obtained from the slot in turn pin the AllocatedSlot
                 // (via Py_buffer::obj), so the full chain is
                 // memoryview → AllocatedSlot → Publisher → SharedRegion.
                 nb::keep_alive<0, 1>(),
-                "Reserve a slot of `len` bytes and return an AllocatedSlot.  "
-                "Use memoryview(slot) or numpy.asarray(slot) to fill it "
-                "in place (zero-copy), then call slot.publish().  Returns "
-                "None if the pool is exhausted.")
+                "Reserve a slot sized to max_payload_size and return an "
+                "AllocatedSlot.  Use memoryview(slot) or numpy.asarray(slot) "
+                "to write up to slot.max_size bytes in place (zero-copy), "
+                "then call slot.publish(n) with the actual number of bytes "
+                "written.  Returns None if the pool is exhausted.")
             .def_prop_ro("dropped", &Publisher::dropped,
                 "Per-ring delivery drops (CAS contention or pool exhaustion).")
             .def("__repr__", [](Publisher const& p)

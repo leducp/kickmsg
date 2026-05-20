@@ -44,7 +44,7 @@ int main()
     // Publish a few "frames"
     for (uint32_t i = 0; i < 3; ++i)
     {
-        void* ptr = pub.allocate(sizeof(ImageHeader));
+        auto [ptr, max_size] = pub.allocate();
         if (ptr == nullptr)
         {
             std::cerr << "Pool exhausted at frame " << i << "\n";
@@ -53,7 +53,7 @@ int main()
 
         ImageHeader hdr{640, 480, 3, i};
         std::memcpy(ptr, &hdr, sizeof(hdr));
-        pub.publish();
+        pub.publish(sizeof(hdr));
 
         std::cout << "Published frame " << i << " (640x480x3)\n";
     }

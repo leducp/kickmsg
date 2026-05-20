@@ -7,6 +7,15 @@
 
 namespace kickmsg
 {
+    /// Reservation returned by Publisher::allocate(): a writable pointer
+    /// into shared memory plus the maximum number of bytes the caller may
+    /// write through it.  data == nullptr signals pool exhaustion.
+    struct Allocation
+    {
+        void*       data;
+        std::size_t max_size;
+    };
+
     class Publisher
     {
     public:
@@ -15,7 +24,6 @@ namespace kickmsg
             , header_{region.header()}
             , commit_timeout_{microseconds{header_->commit_timeout_us}}
             , pending_slot_{INVALID_SLOT}
-            , pending_len_{0}
         {
         }
 
@@ -29,7 +37,6 @@ namespace kickmsg
             , header_{other.header_}
             , commit_timeout_{other.commit_timeout_}
             , pending_slot_{other.pending_slot_}
-            , pending_len_{other.pending_len_}
             , dropped_{other.dropped_}
         {
             other.pending_slot_ = INVALID_SLOT;
@@ -44,15 +51,20 @@ namespace kickmsg
                 header_         = other.header_;
                 commit_timeout_ = other.commit_timeout_;
                 pending_slot_   = other.pending_slot_;
-                pending_len_    = other.pending_len_;
                 dropped_        = other.dropped_;
                 other.pending_slot_ = INVALID_SLOT;
             }
             return *this;
         }
 
-        void* allocate(std::size_t len);
-        std::size_t publish();
+        /// Reserve a slot.  Returns {data, max_size}; data is nullptr if
+        /// the pool is exhausted.
+        Allocation allocate();
+
+        /// Commit the currently reserved slot, recording `len` as the
+        /// payload size.  No bounds check: caller guarantees
+        /// `len <= max_size` from the preceding allocate().
+        std::size_t publish(std::size_t len);
 
         /// Allocate, copy, and publish in one call.
         /// Returns bytes written on success, -EMSGSIZE if too large, -EAGAIN if pool exhausted.
@@ -71,7 +83,6 @@ namespace kickmsg
         Header*      header_;
         microseconds commit_timeout_;
         uint32_t     pending_slot_;
-        uint32_t     pending_len_;
         uint64_t     dropped_{0};
     };
 }
