@@ -57,8 +57,8 @@ static void child_publisher_main(int /*round*/)
 
     for (uint32_t i = 0; ; ++i)
     {
-        auto* ptr = pub.allocate(sizeof(CrashPayload));
-        if (ptr == nullptr)
+        auto a = pub.allocate();
+        if (a.data == nullptr)
         {
             kickmsg::yield();
             continue;
@@ -68,9 +68,9 @@ static void child_publisher_main(int /*round*/)
         msg.magic    = CrashPayload::MAGIC;
         msg.seq      = i;
         msg.checksum = compute_checksum(msg);
-        std::memcpy(ptr, &msg, sizeof(msg));
+        std::memcpy(a.data, &msg, sizeof(msg));
 
-        pub.publish();
+        pub.publish(sizeof(msg));
     }
 }
 
@@ -369,8 +369,8 @@ static bool test_multi_publisher_crash()
             kickmsg::Publisher p(r);
             for (uint32_t seq = 0; ; ++seq)
             {
-                auto* ptr = p.allocate(sizeof(CrashPayload));
-                if (ptr == nullptr)
+                auto a = p.allocate();
+                if (a.data == nullptr)
                 {
                     kickmsg::yield();
                     continue;
@@ -379,8 +379,8 @@ static bool test_multi_publisher_crash()
                 msg.magic    = CrashPayload::MAGIC;
                 msg.seq      = seq;
                 msg.checksum = compute_checksum(msg);
-                std::memcpy(ptr, &msg, sizeof(msg));
-                p.publish();
+                std::memcpy(a.data, &msg, sizeof(msg));
+                p.publish(sizeof(msg));
             }
         }
     }

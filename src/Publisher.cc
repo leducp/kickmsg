@@ -17,34 +17,27 @@ namespace kickmsg
             auto* slot = slot_at(base_, header_, pending_slot_);
             treiber_push(header_->free_top, slot, pending_slot_);
             pending_slot_ = INVALID_SLOT;
-            pending_len_  = 0;
         }
     }
 
-    void* Publisher::allocate(std::size_t len)
+    Allocation Publisher::allocate()
     {
-        if (len > header_->slot_data_size)
-        {
-            return nullptr;
-        }
-
         // Release any previously allocated but unpublished slot.
         release_pending();
 
         uint32_t slot_idx = treiber_pop(header_->free_top, base_, header_);
         if (slot_idx == INVALID_SLOT)
         {
-            return nullptr;
+            return Allocation{nullptr, 0};
         }
 
         pending_slot_ = slot_idx;
-        pending_len_  = static_cast<uint32_t>(len);
 
         auto* slot = slot_at(base_, header_, slot_idx);
-        return slot_data(slot);
+        return Allocation{slot_data(slot), header_->slot_data_size};
     }
 
-    std::size_t Publisher::publish()
+    std::size_t Publisher::publish(std::size_t len)
     {
         if (pending_slot_ == INVALID_SLOT)
         {
@@ -52,9 +45,7 @@ namespace kickmsg
         }
 
         uint32_t slot_idx = pending_slot_;
-        uint32_t len      = pending_len_;
         pending_slot_ = INVALID_SLOT;
-        pending_len_  = 0;
 
         auto*    slot     = slot_at(base_, header_, slot_idx);
         uint64_t capacity = header_->sub_ring_capacity;
@@ -207,7 +198,7 @@ namespace kickmsg
             // We exclusively own this entry. No other publisher can CAS from
             // LOCKED_SEQUENCE since they expect prev_seq.
             e.slot_idx.store(slot_idx, std::memory_order_relaxed);
-            e.payload_len.store(len, std::memory_order_relaxed);
+            e.payload_len.store(static_cast<uint32_t>(len), std::memory_order_relaxed);
 
             // Release-store commits the entry: subscribers and future publishers
             // at this position will see all preceding stores.
@@ -249,14 +240,14 @@ namespace kickmsg
             return -EMSGSIZE;
         }
 
-        auto* ptr = allocate(len);
-        if (ptr == nullptr)
+        auto a = allocate();
+        if (a.data == nullptr)
         {
             return -EAGAIN;
         }
 
-        std::memcpy(ptr, data, len);
-        publish();
+        std::memcpy(a.data, data, len);
+        publish(len);
         return static_cast<int32_t>(len);
     }
 

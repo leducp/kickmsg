@@ -2,13 +2,14 @@
 AllocatedSlot / SampleView buffer-protocol path was designed for.
 
 Shows how to:
-  1. Reserve a slot directly in shared memory via Publisher.allocate(size),
-     then obtain a writable memoryview with `memoryview(slot)` and fill it
-     in-place (no intermediate buffer).  In a real pipeline you'd:
+  1. Reserve a slot directly in shared memory via Publisher.allocate(),
+     which returns an AllocatedSlot sized to max_payload_size.  Obtain a
+     writable memoryview with `memoryview(slot)` and fill it in-place
+     (no intermediate buffer).  In a real pipeline you'd:
        - numpy.copyto(np.asarray(slot).reshape(H, W, 3), frame), or
        - DMA from a V4L2 buffer into the slot, or
        - render directly into the slot.
-     Then call `slot.publish()` to commit.
+     Then call `slot.publish(n)` with the number of bytes actually written.
   2. Receive it zero-copy on the other side via Subscriber.try_receive_view
      and `memoryview(view)` — read-only, no copy either.  The memoryview
      pins the SampleView alive so the slot stays valid until every
@@ -53,12 +54,12 @@ def main() -> int:
     for i in range(3):
         # Zero-copy capture: reserve a slot, write directly into SHM via
         # a memoryview, publish.  Nothing is copied on the publish side.
-        slot = pub.allocate(frame_bytes)
+        slot = pub.allocate()
         if slot is None:
             print(f"frame {i}: pool exhausted, dropping")
             continue
         fill_frame(memoryview(slot), height, width)
-        slot.publish()
+        slot.publish(frame_bytes)
         print(f"Published frame {i} ({width}x{height} RGB, {frame_bytes} B zero-copy)")
 
     for i in range(3):
