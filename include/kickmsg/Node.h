@@ -99,6 +99,16 @@ namespace kickmsg
         Subscriber create_mailbox(char const* tag, channel::Config const& cfg = {});
         Publisher  open_mailbox(char const* owner_node, char const* tag);
 
+        // Relaxed-order mailbox: either side may arrive first. Mirrors
+        // advertise_or_join / subscribe_or_create for strict pub/sub.
+        // Both sides must pass `cfg` because either may end up being the
+        // creator; max_subscribers is forced to 1 to preserve the mailbox
+        // invariant regardless of cfg.
+        Subscriber create_or_open_mailbox(char const* tag,
+                                          channel::Config const& cfg);
+        Publisher  open_or_create_mailbox(char const* owner_node, char const* tag,
+                                          channel::Config const& cfg);
+
         // --- Unlink helpers -----------------------------------------------
         //
         // Thin wrappers that call SharedMemory::unlink() with the same name
@@ -141,6 +151,17 @@ namespace kickmsg
         // returned here remain valid across subsequent insertions.
         SharedRegion*       find_region(std::string const& shm_name);
         SharedRegion const* find_region(std::string const& shm_name) const;
+
+        // Shared body of every *_or_* method: idempotent find, else
+        // create_or_open, then touch_registry on both branches.
+        // Instantiated for Publisher and Subscriber inside Node.cc.
+        template <typename Handle>
+        Handle create_or_open_handle(std::string const& shm_name,
+                                     std::string const& topic_path,
+                                     channel::Type      channel_type,
+                                     registry::Kind     kind,
+                                     registry::Role     role,
+                                     channel::Config const& cfg);
 
         Registry& lazy_registry();
 

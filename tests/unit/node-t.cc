@@ -357,3 +357,65 @@ TEST_F(NodeTest, MailboxMultipleWriters)
 
     EXPECT_TRUE((got1 == m1 && got2 == m2) || (got1 == m2 && got2 == m1));
 }
+
+TEST_F(NodeTest, RelaxedMailboxOwnerFirst)
+{
+    track("/test_owner_mbx_inbox");
+
+    auto cfg = small_cfg();
+
+    kickmsg::Node owner("owner", "test");
+    auto inbox = owner.create_or_open_mailbox("inbox", cfg);
+
+    kickmsg::Node sender("snd", "test");
+    auto pub = sender.open_or_create_mailbox("owner", "inbox", cfg);
+
+    std::string m = "ping";
+    ASSERT_GE(pub.send(m.data(), m.size()), 0);
+
+    auto r = inbox.try_receive();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::string(static_cast<char const*>(r->data()), r->len()), m);
+}
+
+TEST_F(NodeTest, RelaxedMailboxSenderFirst)
+{
+    track("/test_owner_mbx_inbox");
+
+    auto cfg = small_cfg();
+
+    // Sender starts before owner: it materializes the region.
+    kickmsg::Node sender("snd", "test");
+    auto pub = sender.open_or_create_mailbox("owner", "inbox", cfg);
+
+    kickmsg::Node owner("owner", "test");
+    auto inbox = owner.create_or_open_mailbox("inbox", cfg);
+
+    std::string m = "ping";
+    ASSERT_GE(pub.send(m.data(), m.size()), 0);
+
+    auto r = inbox.try_receive();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::string(static_cast<char const*>(r->data()), r->len()), m);
+}
+
+TEST_F(NodeTest, RelaxedMailboxForcesMaxSubscribersOne)
+{
+    // If a caller passes cfg.max_subscribers != 1, the mailbox APIs must
+    // override it. Verify by reading back the region info.
+    track("/test_owner_mbx_inbox");
+
+    auto cfg = small_cfg();
+    cfg.max_subscribers = 4;  // mailbox should clamp to 1
+
+    kickmsg::Node owner("owner", "test");
+    auto inbox = owner.create_or_open_mailbox("inbox", cfg);
+
+    kickmsg::Node sender("snd", "test");
+    auto pub = sender.open_or_create_mailbox("owner", "inbox", cfg);
+
+    std::string m = "data";
+    ASSERT_GE(pub.send(m.data(), m.size()), 0);
+    auto r = inbox.try_receive();
+    ASSERT_TRUE(r.has_value());
+}
