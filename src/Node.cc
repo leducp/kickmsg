@@ -166,42 +166,39 @@ namespace kickmsg
         return Subscriber(it->second);
     }
 
-    Publisher Node::advertise_or_join(char const* topic, channel::Config const& cfg)
+    template <typename Handle>
+    Handle Node::create_or_open_handle(std::string const& shm_name,
+                                       std::string const& topic_path,
+                                       channel::Type      channel_type,
+                                       registry::Kind     kind,
+                                       registry::Role     role,
+                                       channel::Config const& cfg)
     {
-        auto shm_name   = make_topic_name(topic);
-        auto topic_path = with_leading_slash(topic);
         if (auto* r = find_region(shm_name))
         {
-            touch_registry(shm_name, topic_path, channel::PubSub,
-                           registry::Pubsub, registry::Publisher);
-            return Publisher(*r);
+            touch_registry(shm_name, topic_path, channel_type, kind, role);
+            return Handle(*r);
         }
         auto [it, _] = regions_.emplace(
             shm_name,
             SharedRegion::create_or_open(
-                shm_name.c_str(), channel::PubSub, cfg, name_.c_str()));
-        touch_registry(shm_name, topic_path, channel::PubSub,
-                       registry::Pubsub, registry::Publisher);
-        return Publisher(it->second);
+                shm_name.c_str(), channel_type, cfg, name_.c_str()));
+        touch_registry(shm_name, topic_path, channel_type, kind, role);
+        return Handle(it->second);
+    }
+
+    Publisher Node::advertise_or_join(char const* topic, channel::Config const& cfg)
+    {
+        return create_or_open_handle<Publisher>(
+            make_topic_name(topic), with_leading_slash(topic),
+            channel::PubSub, registry::Pubsub, registry::Publisher, cfg);
     }
 
     Subscriber Node::subscribe_or_create(char const* topic, channel::Config const& cfg)
     {
-        auto shm_name   = make_topic_name(topic);
-        auto topic_path = with_leading_slash(topic);
-        if (auto* r = find_region(shm_name))
-        {
-            touch_registry(shm_name, topic_path, channel::PubSub,
-                           registry::Pubsub, registry::Subscriber);
-            return Subscriber(*r);
-        }
-        auto [it, _] = regions_.emplace(
-            shm_name,
-            SharedRegion::create_or_open(
-                shm_name.c_str(), channel::PubSub, cfg, name_.c_str()));
-        touch_registry(shm_name, topic_path, channel::PubSub,
-                       registry::Pubsub, registry::Subscriber);
-        return Subscriber(it->second);
+        return create_or_open_handle<Subscriber>(
+            make_topic_name(topic), with_leading_slash(topic),
+            channel::PubSub, registry::Pubsub, registry::Subscriber, cfg);
     }
 
     BroadcastHandle Node::join_broadcast(char const* channel, channel::Config const& cfg)
@@ -254,6 +251,28 @@ namespace kickmsg
         touch_registry(shm_name, topic_path, channel::PubSub,
                        registry::Mailbox, registry::Publisher);
         return Publisher(it->second);
+    }
+
+    Subscriber Node::create_or_open_mailbox(char const* tag,
+                                            channel::Config const& cfg)
+    {
+        channel::Config mbx_cfg = cfg;
+        mbx_cfg.max_subscribers = 1;
+        return create_or_open_handle<Subscriber>(
+            make_mailbox_name(name_.c_str(), tag),
+            mailbox_topic(name_.c_str(), tag),
+            channel::PubSub, registry::Mailbox, registry::Subscriber, mbx_cfg);
+    }
+
+    Publisher Node::open_or_create_mailbox(char const* owner_node, char const* tag,
+                                            channel::Config const& cfg)
+    {
+        channel::Config mbx_cfg = cfg;
+        mbx_cfg.max_subscribers = 1;
+        return create_or_open_handle<Publisher>(
+            make_mailbox_name(owner_node, tag),
+            mailbox_topic(owner_node, tag),
+            channel::PubSub, registry::Mailbox, registry::Publisher, mbx_cfg);
     }
 
     void Node::unlink_topic(char const* topic) const
