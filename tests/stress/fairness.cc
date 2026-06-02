@@ -2,12 +2,16 @@
 
 bool run_fairness_test()
 {
-    std::printf("--- Fairness test: 1 pub x 100000 msgs, 16 subs (ring=256, pool=512) ---\n");
-
     g_all_publishers_done = false;
 
-    constexpr int      NUM_SUBS  = 16;
+    // Subscriber count scales to the host (max_subscribers tracks it, so the
+    // ring count scales too): bounded on a low-core CI box, oversubscribed on
+    // a big one. See contention_count().
+    int const          NUM_SUBS  = static_cast<int>(contention_count());
     uint32_t const     NUM_MSGS  = 100000 / TSAN_SCALE;
+
+    std::printf("--- Fairness test: 1 pub x %u msgs, %d subs (ring=256, pool=512) ---\n",
+                NUM_MSGS, NUM_SUBS);
 
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = NUM_SUBS;

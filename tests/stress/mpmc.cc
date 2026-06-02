@@ -169,14 +169,15 @@ void run_all_mpmc(TestRunner& runner)
     }
 
     {
+        int const n = contention_count();
         TestConfig tc;
-        tc.num_publishers  = 8;
-        tc.num_subscribers = 8;
+        tc.num_publishers  = n;
+        tc.num_subscribers = n;
         tc.msgs_per_pub    = 50000 / TSAN_SCALE;
         tc.pool_size       = 128;
         tc.ring_capacity   = 32;
-        tc.max_subs        = 16;
-        runner.run("mpmc 8p/8s", [&]{ return run_stress_test(tc); });
+        tc.max_subs        = static_cast<std::size_t>(n);
+        runner.run("mpmc contended (pool 128)", [&]{ return run_stress_test(tc); });
     }
 
     {
@@ -190,16 +191,17 @@ void run_all_mpmc(TestRunner& runner)
         runner.run("mpmc 1p/1s", [&]{ return run_stress_test(tc); });
     }
 
-    // High contention: many pubs, small pool, heavy overflow
+    // High contention: small pool, heavy overflow
     {
+        int const n = contention_count();
         TestConfig tc;
-        tc.num_publishers  = 16;
-        tc.num_subscribers = 16;
+        tc.num_publishers  = n;
+        tc.num_subscribers = n;
         tc.msgs_per_pub    = 20000 / TSAN_SCALE;
         tc.pool_size       = 32;
         tc.ring_capacity   = 8;
-        tc.max_subs        = 16;
-        runner.run("mpmc 16p/16s hi-contention", [&]{ return run_stress_test(tc); });
+        tc.max_subs        = static_cast<std::size_t>(n);
+        runner.run("mpmc contended (pool 32, tiny)", [&]{ return run_stress_test(tc); });
     }
 
     // Zero-copy receive tests -- exercises SampleView pin CAS,
@@ -217,27 +219,29 @@ void run_all_mpmc(TestRunner& runner)
     }
 
     {
+        int const n = contention_count();
         TestConfig tc;
-        tc.num_publishers  = 8;
-        tc.num_subscribers = 8;
+        tc.num_publishers  = n;
+        tc.num_subscribers = n;
         tc.msgs_per_pub    = 50000 / TSAN_SCALE;
         tc.pool_size       = 128;
         tc.ring_capacity   = 32;
-        tc.max_subs        = 16;
+        tc.max_subs        = static_cast<std::size_t>(n);
         tc.use_zerocopy    = true;
-        runner.run("mpmc 8p/8s zerocopy", [&]{ return run_stress_test(tc); });
+        runner.run("mpmc contended (pool 128) zerocopy", [&]{ return run_stress_test(tc); });
     }
 
-    // High contention zero-copy
+    // High contention zero-copy: small pool, heavy overflow
     {
+        int const n = contention_count();
         TestConfig tc;
-        tc.num_publishers  = 16;
-        tc.num_subscribers = 16;
+        tc.num_publishers  = n;
+        tc.num_subscribers = n;
         tc.msgs_per_pub    = 20000 / TSAN_SCALE;
         tc.pool_size       = 32;
         tc.ring_capacity   = 8;
-        tc.max_subs        = 16;
+        tc.max_subs        = static_cast<std::size_t>(n);
         tc.use_zerocopy    = true;
-        runner.run("mpmc 16p/16s zerocopy hi-contention", [&]{ return run_stress_test(tc); });
+        runner.run("mpmc contended (pool 32, tiny) zerocopy", [&]{ return run_stress_test(tc); });
     }
 }

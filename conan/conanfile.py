@@ -23,6 +23,7 @@ class KickmsgDev(ConanFile):
     def requirements(self):
         if self.options.unit_tests:
             self.requires("gtest/1.15.0")
+            self.requires("argparse/3.2")  # stress-test CLI
 
         if self.options.benchmarks:
             self.requires("benchmark/1.9.1")

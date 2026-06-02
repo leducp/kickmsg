@@ -82,6 +82,7 @@ include(cmake/install.cmake)
 # --- Tests ---
 if(BUILD_UNIT_TESTS)
     find_package(GTest REQUIRED CONFIG)
+    find_package(argparse REQUIRED CONFIG)
     enable_testing()
     add_subdirectory(tests)
 endif()
