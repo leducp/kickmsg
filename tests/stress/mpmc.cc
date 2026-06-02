@@ -165,7 +165,7 @@ void run_all_mpmc(TestRunner& runner)
         tc.pool_size       = 256;
         tc.ring_capacity   = 64;
         tc.max_subs        = 8;
-        runner.run(run_stress_test(tc));
+        runner.run("mpmc 2p/4s", [&]{ return run_stress_test(tc); });
     }
 
     {
@@ -176,7 +176,7 @@ void run_all_mpmc(TestRunner& runner)
         tc.pool_size       = 128;
         tc.ring_capacity   = 32;
         tc.max_subs        = 16;
-        runner.run(run_stress_test(tc));
+        runner.run("mpmc 8p/8s", [&]{ return run_stress_test(tc); });
     }
 
     {
@@ -187,7 +187,7 @@ void run_all_mpmc(TestRunner& runner)
         tc.pool_size       = 64;
         tc.ring_capacity   = 16;
         tc.max_subs        = 2;
-        runner.run(run_stress_test(tc));
+        runner.run("mpmc 1p/1s", [&]{ return run_stress_test(tc); });
     }
 
     // High contention: many pubs, small pool, heavy overflow
@@ -199,7 +199,7 @@ void run_all_mpmc(TestRunner& runner)
         tc.pool_size       = 32;
         tc.ring_capacity   = 8;
         tc.max_subs        = 16;
-        runner.run(run_stress_test(tc));
+        runner.run("mpmc 16p/16s hi-contention", [&]{ return run_stress_test(tc); });
     }
 
     // Zero-copy receive tests -- exercises SampleView pin CAS,
@@ -213,7 +213,7 @@ void run_all_mpmc(TestRunner& runner)
         tc.ring_capacity   = 64;
         tc.max_subs        = 8;
         tc.use_zerocopy    = true;
-        runner.run(run_stress_test(tc));
+        runner.run("mpmc 2p/4s zerocopy", [&]{ return run_stress_test(tc); });
     }
 
     {
@@ -225,7 +225,7 @@ void run_all_mpmc(TestRunner& runner)
         tc.ring_capacity   = 32;
         tc.max_subs        = 16;
         tc.use_zerocopy    = true;
-        runner.run(run_stress_test(tc));
+        runner.run("mpmc 8p/8s zerocopy", [&]{ return run_stress_test(tc); });
     }
 
     // High contention zero-copy
@@ -238,6 +238,6 @@ void run_all_mpmc(TestRunner& runner)
         tc.ring_capacity   = 8;
         tc.max_subs        = 16;
         tc.use_zerocopy    = true;
-        runner.run(run_stress_test(tc));
+        runner.run("mpmc 16p/16s zerocopy hi-contention", [&]{ return run_stress_test(tc); });
     }
 }

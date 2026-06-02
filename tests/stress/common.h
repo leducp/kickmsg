@@ -352,8 +352,20 @@ struct TestRunner
     int pass = 0;
     int fail = 0;
 
-    void run(bool result)
+    // Takes the scenario as a callable (not a pre-computed bool) so we can
+    // print its name BEFORE running and time it. The pre-run flush means a
+    // scenario that hangs leaves its "[ RUN  ]" line on screen -- the last
+    // one without a matching "[  OK  ]" is the culprit.
+    template <typename Fn>
+    void run(char const* name, Fn&& fn)
     {
+        std::printf("[ RUN  ] %s\n", name);
+        std::fflush(stdout);
+        auto const start  = kickmsg::monotonic_ns();
+        bool const result = fn();
+        auto const ms = duration_cast<milliseconds>(
+                            kickmsg::elapsed_time(start)).count();
+        char const* tag = "[  OK  ]";
         if (result)
         {
             ++pass;
@@ -361,7 +373,10 @@ struct TestRunner
         else
         {
             ++fail;
+            tag = "[ FAIL ]";
         }
+        std::printf("%s %s (%lld ms)\n", tag, name, static_cast<long long>(ms));
+        std::fflush(stdout);
     }
 
     int summary()

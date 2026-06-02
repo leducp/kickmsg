@@ -24,15 +24,15 @@ int main()
 
     TestRunner runner;
 
-    runner.run(run_treiber_stress());
-    runner.run(run_subscriber_churn());
-    runner.run(run_gc_recovery());
-    runner.run(run_fairness_test());
+    runner.run("treiber_stress",       run_treiber_stress);
+    runner.run("subscriber_churn",     run_subscriber_churn);
+    runner.run("gc_recovery",          run_gc_recovery);
+    runner.run("fairness",             run_fairness_test);
     run_all_mpmc(runner);
-    runner.run(run_pool_exhaustion());
-    runner.run(run_live_repair());
-    runner.run(run_single_slot_ring());
-    runner.run(run_subscriber_saturation());
+    runner.run("pool_exhaustion",      run_pool_exhaustion);
+    runner.run("live_repair",          run_live_repair);
+    runner.run("single_slot_ring",     run_single_slot_ring);
+    runner.run("subscriber_saturation", run_subscriber_saturation);
 
     return runner.summary();
 }
