@@ -15,11 +15,8 @@
 /// Exits 0 on success, non-zero on any assertion failure.
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -27,7 +24,6 @@
 
 #include "kickmsg/Registry.h"
 #include "kickmsg/os/Process.h"
-#include "kickmsg/os/Time.h"
 
 using namespace kickmsg;
 using namespace std::chrono_literals;

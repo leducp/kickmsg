@@ -1,7 +1,5 @@
-#include <cstring>
 #include <stdexcept>
 #include <thread>
-#include <vector>
 
 #include "kickmsg/Region.h"
 #include "kickmsg/os/Process.h"
@@ -48,15 +46,39 @@ namespace kickmsg
 
         RegionLayout compute_layout(channel::Config const& cfg, char const* creator_name)
         {
+            if (creator_name == nullptr)
+            {
+                throw std::runtime_error("creator_name must not be null");
+            }
+            std::size_t name_len = std::strlen(creator_name);
+            // creator_name_len is a uint16_t header field; a silent cast
+            // would truncate the name and desync required_size/attach_create.
+            if (name_len > UINT16_MAX)
+            {
+                throw std::runtime_error("creator_name exceeds 65535 bytes");
+            }
+
             RegionLayout layout;
-            layout.creator_len      = static_cast<uint16_t>(std::strlen(creator_name));
+            layout.creator_len      = static_cast<uint16_t>(name_len);
             layout.header_size      = align_up(sizeof(Header) + layout.creator_len, CACHE_LINE);
             layout.ring_stride      = align_up(
                 sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
             layout.slot_stride      = align_up(sizeof(SlotHeader) + cfg.max_payload_size, CACHE_LINE);
             layout.sub_rings_offset = layout.header_size;
-            layout.pool_offset      = layout.sub_rings_offset + cfg.max_subscribers * layout.ring_stride;
-            layout.total_size       = layout.pool_offset + cfg.pool_size * layout.slot_stride;
+
+            // Overflow guards: a cfg with huge counts must not wrap total_size
+            // into a small value that maps a tiny region while publishers and
+            // subscribers stride off the end.
+            if (cfg.max_subscribers > (SIZE_MAX - layout.sub_rings_offset) / layout.ring_stride)
+            {
+                throw std::runtime_error("Config too large: subscriber rings overflow");
+            }
+            layout.pool_offset = layout.sub_rings_offset + cfg.max_subscribers * layout.ring_stride;
+            if (cfg.pool_size > (SIZE_MAX - layout.pool_offset) / layout.slot_stride)
+            {
+                throw std::runtime_error("Config too large: slot pool overflow");
+            }
+            layout.total_size = layout.pool_offset + cfg.pool_size * layout.slot_stride;
             return layout;
         }
     }
@@ -127,6 +149,212 @@ namespace kickmsg
         h->magic.store(MAGIC, std::memory_order_release);
     }
 
+    namespace
+    {
+        /// Validate that an already-attached Header has internally
+        /// consistent geometry.
+        ///
+        /// Reject a Header whose geometry fields are not self-consistent.
+        /// attach_open() trusts caller-supplied bytes, and every offset /
+        /// stride / count / length below drives later pointer math in
+        /// Publisher, Subscriber, info() and the repair paths -- junk here
+        /// means wild pointers. A region kickmsg itself stamped always
+        /// passes; only corrupt or hostile input fails. open() runs it too
+        /// as defense in depth. Caller has already checked magic, version,
+        /// and size >= total_size.
+        void validate_header_geometry(Header const* h)
+        {
+            if (h->total_size < sizeof(Header))
+            {
+                throw std::runtime_error(
+                    "Header geometry: total_size smaller than Header");
+            }
+
+            // No zero counts or strides — divide-by-zero protection for
+            // the bound checks below depends on these, and stamp_new_region
+            // never produces a zero here.
+            if (h->max_subs == 0 or h->pool_size == 0
+                or h->slot_data_size == 0 or h->sub_ring_capacity == 0
+                or h->slot_stride == 0    or h->sub_ring_stride == 0)
+            {
+                throw std::runtime_error(
+                    "Header geometry: zero-cardinality field");
+            }
+
+            if (not is_power_of_two(h->sub_ring_capacity))
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_capacity not a power of 2");
+            }
+            if (h->sub_ring_mask != h->sub_ring_capacity - 1)
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_mask inconsistent with capacity");
+            }
+
+            // Sub-rings span [sub_rings_offset, pool_offset); pool spans
+            // [pool_offset, total_size).
+            if (h->sub_rings_offset < sizeof(Header)
+                or h->sub_rings_offset >= h->pool_offset
+                or h->pool_offset >= h->total_size)
+            {
+                throw std::runtime_error(
+                    "Header geometry: ring/pool offsets out of range");
+            }
+
+            // creator_name tail lives in [sizeof(Header), sub_rings_offset);
+            // bound it there so info() can't read into the ring/pool area.
+            if (h->creator_name_len > h->sub_rings_offset - sizeof(Header))
+            {
+                throw std::runtime_error(
+                    "Header geometry: creator_name_len exceeds tail");
+            }
+
+            // Bound sub_ring_capacity by total_size before multiplying so
+            // the min_ring_stride product can't overflow on a junk value.
+            if (h->sub_ring_capacity > h->total_size / sizeof(Entry))
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_capacity exceeds region");
+            }
+            std::size_t const min_ring_stride =
+                sizeof(SubRingHeader) + h->sub_ring_capacity * sizeof(Entry);
+            if (h->sub_ring_stride < min_ring_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_stride too small");
+            }
+            std::size_t const min_slot_stride =
+                sizeof(SlotHeader) + h->slot_data_size;
+            if (h->slot_stride < min_slot_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: slot_stride too small");
+            }
+
+            // max_subs * sub_ring_stride must fit in the rings region.
+            // Division-based bound avoids mul-overflow on a junk max_subs.
+            std::size_t const rings_space = h->pool_offset - h->sub_rings_offset;
+            if (h->max_subs > rings_space / h->sub_ring_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: subscriber rings overflow pool_offset");
+            }
+
+            // pool_size * slot_stride must fit in the pool region.
+            std::size_t const pool_space = h->total_size - h->pool_offset;
+            if (h->pool_size > pool_space / h->slot_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: slot pool overflow total_size");
+            }
+        }
+
+        // Validate an already-mapped region: throws on a buffer too small
+        // to even hold a Header, bad magic, bad version, buffer too small
+        // for the embedded total_size, or geometry fields that would make
+        // downstream pointer math wild.
+        void validate_opened(void* address, std::size_t size)
+        {
+            if (size < sizeof(Header))
+            {
+                throw std::runtime_error(
+                    "Buffer smaller than region Header");
+            }
+            auto* h = static_cast<Header*>(address);
+            if (h->magic.load(std::memory_order_acquire) != MAGIC)
+            {
+                throw std::runtime_error("Invalid shared memory (bad magic)");
+            }
+            if (h->version != VERSION)
+            {
+                throw std::runtime_error("Version mismatch");
+            }
+            if (size < h->total_size)
+            {
+                throw std::runtime_error(
+                    "Buffer smaller than embedded region total_size");
+            }
+            validate_header_geometry(h);
+        }
+
+        // True if the ring's recorded owner is provably gone. owner_pid == 0
+        // means unowned or a claim in progress -> not dead. Mirrors
+        // Registry::sweep_stale: a matching boot-relative starttime confirms
+        // the same process; if either starttime is 0 the platform can't
+        // disambiguate, so trust pid-alive.
+        bool ring_owner_dead(SubRingHeader const* ring)
+        {
+            uint64_t pid = ring->owner_pid.load(std::memory_order_acquire);
+            if (pid == 0)
+            {
+                return false;
+            }
+            if (not process_exists(pid))
+            {
+                return true;
+            }
+            uint64_t stored = ring->owner_starttime.load(std::memory_order_relaxed);
+            uint64_t live   = process_starttime(pid);
+            if (stored == 0 or live == 0)
+            {
+                return false;
+            }
+            return stored != live;
+        }
+    }
+
+    std::size_t SharedRegion::required_size(channel::Config const& cfg,
+                                            char const* creator_name)
+    {
+        validate_config(channel::PubSub, cfg);
+        return compute_layout(cfg, creator_name).total_size;
+    }
+
+    SharedRegion SharedRegion::attach_create(void* address, std::size_t size,
+                                             channel::Type type,
+                                             channel::Config const& cfg,
+                                             char const* creator_name,
+                                             char const* label)
+    {
+        validate_config(type, cfg);
+        if (reinterpret_cast<std::uintptr_t>(address) % CACHE_LINE != 0)
+        {
+            throw std::runtime_error("attach_create: address not CACHE_LINE aligned");
+        }
+        RegionLayout layout = compute_layout(cfg, creator_name);
+        if (size < layout.total_size)
+        {
+            throw std::runtime_error("attach_create: buffer smaller than required_size");
+        }
+
+        SharedRegion region;
+        region.base_ = address;
+        region.size_ = size;
+        region.name_ = label;
+        region.stamp_new_region(type, cfg, creator_name,
+                                layout.total_size, layout.sub_rings_offset,
+                                layout.pool_offset, layout.ring_stride,
+                                layout.slot_stride, layout.creator_len);
+        return region;
+    }
+
+    SharedRegion SharedRegion::attach_open(void* address, std::size_t size,
+                                           char const* label)
+    {
+        if (reinterpret_cast<std::uintptr_t>(address) % CACHE_LINE != 0)
+        {
+            throw std::runtime_error("attach_open: address not CACHE_LINE aligned");
+        }
+
+        SharedRegion region;
+        region.base_ = address;
+        region.size_ = size;
+        region.name_ = label;
+        validate_opened(region.base_, region.size_);
+        return region;
+    }
+
     SharedRegion SharedRegion::create(char const* name, channel::Type type,
                                      channel::Config const& cfg,
                                      char const* creator_name)
@@ -137,6 +365,8 @@ namespace kickmsg
         SharedRegion region;
         region.name_ = name;
         region.shm_.create(name, layout.total_size);
+        region.base_ = region.shm_.address();
+        region.size_ = layout.total_size;
         region.stamp_new_region(type, cfg, creator_name,
                                 layout.total_size, layout.sub_rings_offset,
                                 layout.pool_offset, layout.ring_stride,
@@ -149,17 +379,9 @@ namespace kickmsg
         SharedRegion region;
         region.name_ = name;
         region.shm_.open(name);
-
-        auto* h = region.header();
-        if (h->magic.load(std::memory_order_acquire) != MAGIC)
-        {
-            throw std::runtime_error("Invalid shared memory (bad magic)");
-        }
-        if (h->version != VERSION)
-        {
-            throw std::runtime_error("Version mismatch");
-        }
-
+        region.base_ = region.shm_.address();
+        region.size_ = region.shm_.size();
+        validate_opened(region.base_, region.size_);
         return region;
     }
 
@@ -181,6 +403,8 @@ namespace kickmsg
         region.name_ = name;
         if (region.shm_.try_create(name, layout.total_size))
         {
+            region.base_ = region.shm_.address();
+            region.size_ = layout.total_size;
             region.stamp_new_region(type, cfg, creator_name,
                                     layout.total_size, layout.sub_rings_offset,
                                     layout.pool_offset, layout.ring_stride,
@@ -208,6 +432,13 @@ namespace kickmsg
                     SharedRegion region;
                     region.name_ = name;
                     region.shm_  = std::move(shm);
+                    region.base_ = region.shm_.address();
+                    region.size_ = region.shm_.size();
+                    // config_hash covers the cfg fields but NOT total_size,
+                    // offsets, or strides — validate the geometry like
+                    // open()/attach_open() so a corrupt or partially-stamped
+                    // creator can't hand us junk that later pointer math trusts.
+                    validate_opened(region.base_, region.size_);
                     return region;
                 }
                 // SHM exists but magic/version not ready yet — creator
@@ -223,7 +454,17 @@ namespace kickmsg
 
     void SharedRegion::unlink()
     {
-        if (not name_.empty())
+        // Release the OS-level name backing this region.  Existing
+        // mappings — this process and every peer that already opened
+        // the region — keep working until their last reference drops;
+        // only the region's discoverability by name is affected.  Any
+        // holder, creator or opener, may call this.  Future open-by-
+        // name behaviour is OS-dependent and intentionally left to the
+        // backend.
+        //
+        // Skipped for injected regions (shm_ never opened): the caller
+        // owns the memory; kickmsg has no OS-level name to release.
+        if (shm_.is_open() and not name_.empty())
         {
             SharedMemory::unlink(name_);
         }
@@ -282,6 +523,15 @@ namespace kickmsg
             else if (state == ring::Draining and in_flight > 0)
             {
                 ++report.draining_rings;
+            }
+
+            // A Live or Draining ring whose owner process is gone is an
+            // orphan no other count surfaces (a dead Live ring otherwise
+            // reads as healthy). reclaim_dead_rings() recovers it.
+            if ((state == ring::Live or state == ring::Draining)
+                and ring_owner_dead(ring))
+            {
+                ++report.dead_rings;
             }
         }
 
@@ -366,11 +616,60 @@ namespace kickmsg
             {
                 ring->state_flight.store(ring::make_packed(ring::Free),
                                          std::memory_order_release);
+                ring->owner_pid.store(0, std::memory_order_relaxed);
+                ring->owner_starttime.store(0, std::memory_order_relaxed);
                 ++reset;
             }
         }
 
         return reset;
+    }
+
+    std::size_t SharedRegion::reclaim_dead_rings()
+    {
+        auto* b = base();
+        auto* h = header();
+        std::size_t reclaimed = 0;
+
+        for (uint64_t i = 0; i < h->max_subs; ++i)
+        {
+            auto*       ring  = sub_ring_at(b, h, static_cast<uint32_t>(i));
+            uint32_t    packed = ring->state_flight.load(std::memory_order_acquire);
+            ring::State state  = ring::get_state(packed);
+
+            if (state != ring::Live and state != ring::Draining)
+            {
+                continue;
+            }
+            if (not ring_owner_dead(ring))
+            {
+                continue;
+            }
+
+            // Owner is gone. Flip the state bits to Free but PRESERVE
+            // in_flight: a publisher mid-commit to this ring will still
+            // fetch_sub, and zeroing in_flight here would underflow it into
+            // the state bits. A leftover Free | in_flight>0 is then a job
+            // for reset_retired_rings() once the publisher is confirmed gone;
+            // committed entries' slot refs are recovered by
+            // reclaim_orphaned_slots(). Clear owner last (Free + stale owner
+            // is harmless; the next claimer overwrites it).
+            uint32_t old = packed;
+            while (true)
+            {
+                uint32_t desired = (old & ~ring::STATE_MASK) | ring::Free;
+                if (ring->state_flight.compare_exchange_weak(old, desired,
+                        std::memory_order_release, std::memory_order_acquire))
+                {
+                    break;
+                }
+            }
+            ring->owner_pid.store(0, std::memory_order_relaxed);
+            ring->owner_starttime.store(0, std::memory_order_relaxed);
+            ++reclaimed;
+        }
+
+        return reclaimed;
     }
 
     std::optional<SchemaInfo> SharedRegion::schema() const
@@ -384,6 +683,10 @@ namespace kickmsg
         }
         SchemaInfo out;
         std::memcpy(&out, &h->schema_data, sizeof(SchemaInfo));
+        // name is a C string consumers stream with operator<<; a hostile or
+        // corrupt region may leave it unterminated. Force a terminator so a
+        // reader can't run off the array.
+        out.name[sizeof(out.name) - 1] = '\0';
         return out;
     }
 

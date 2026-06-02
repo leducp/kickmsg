@@ -10,8 +10,6 @@
 /// (custom naming, config tuning, multi-process open/create patterns).
 /// For most use cases, prefer the Node API (see hello_pubsub.cc).
 
-#include <cstdint>
-#include <cstring>
 #include <iostream>
 
 #include <kickmsg/Publisher.h>

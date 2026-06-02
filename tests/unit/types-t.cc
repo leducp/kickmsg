@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <cstring>
 #include <string>
 
 #include "kickmsg/types.h"

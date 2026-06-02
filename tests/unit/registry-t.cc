@@ -1,9 +1,9 @@
-#include <algorithm>
 #include <string>
 #include <unordered_set>
 
 #include <gtest/gtest.h>
 
+#include "kickmsg/Naming.h"
 #include "kickmsg/Node.h"
 #include "kickmsg/Registry.h"
 
@@ -11,6 +11,32 @@ class RegistryTest : public ::testing::Test
 {
 protected:
     static constexpr char const* KMSG_NAMESPACE = "kickmsg_regtest";
+
+    // Mirror Node::make_topic_name / make_broadcast_name so test
+    // expectations match what Node actually composes on every platform
+    // (readable on Linux, hashed on macOS to fit PSHMNAMLEN).
+    static std::string topic_shm(char const* topic)
+    {
+        return kickmsg::compose_shm_name(
+            kickmsg::sanitize_shm_component(KMSG_NAMESPACE, "namespace"),
+            kickmsg::sanitize_shm_component(topic, "topic"));
+    }
+
+    static std::string broadcast_shm(char const* channel)
+    {
+        return kickmsg::compose_shm_name(
+            kickmsg::sanitize_shm_component(KMSG_NAMESPACE, "namespace"),
+            "broadcast_" + kickmsg::sanitize_shm_component(channel, "channel"));
+    }
+
+    // Mirror Registry::make_shm_name (private) so tests stay aligned with
+    // whatever the Registry actually composes per platform.
+    static std::string registry_shm()
+    {
+        return kickmsg::compose_shm_name(
+            kickmsg::sanitize_shm_component(KMSG_NAMESPACE, "namespace"),
+            "registry");
+    }
 
     void SetUp() override
     {
@@ -38,7 +64,7 @@ private:
 TEST_F(RegistryTest, OpenOrCreateIsIdempotent)
 {
     auto r1 = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
-    EXPECT_EQ(r1.name(), std::string{"/"} + KMSG_NAMESPACE + "_registry");
+    EXPECT_EQ(r1.name(), registry_shm());
 
     // Second call opens the existing region — same name, same capacity.
     auto r2 = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
@@ -136,6 +162,22 @@ TEST_F(RegistryTest, VersionMismatchOnSmallerExistingRegionThrows)
     EXPECT_EQ(opened.capacity(), 8u);
 }
 
+TEST_F(RegistryTest, OpenRejectsCorruptCapacity)
+{
+    // Establish an 8-slot registry, then corrupt capacity in the raw segment
+    // to far exceed the mapping.  A fresh open must reject it instead of
+    // letting snapshot()/sweep_stale() walk entries past the mapped pages.
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 8);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* h = static_cast<kickmsg::RegistryHeader*>(raw.address());
+    h->capacity = 0xFFFFFFFF;
+
+    EXPECT_THROW(kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 8),
+                 std::runtime_error);
+}
+
 TEST_F(RegistryTest, SweepStaleRemovesDeadPidEntries)
 {
     auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
@@ -173,7 +215,7 @@ TEST_F(RegistryTest, SweepStaleReclaimsWedgedClaimingSlot)
               kickmsg::INVALID_SLOT);
 
     // Open the registry SHM directly to install a wedged Claiming slot.
-    auto shm_name = std::string{"/"} + KMSG_NAMESPACE + "_registry";
+    auto shm_name = registry_shm();
     kickmsg::SharedMemory raw;
     raw.open(shm_name);
     auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
@@ -197,7 +239,7 @@ TEST_F(RegistryTest, SweepStaleSkipsClaimingSlotsWithoutPid)
     // first field write.  Reclaiming would race with its stores.  Must skip.
     auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
 
-    auto shm_name = std::string{"/"} + KMSG_NAMESPACE + "_registry";
+    auto shm_name = registry_shm();
     kickmsg::SharedMemory raw;
     raw.open(shm_name);
     auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
@@ -231,7 +273,7 @@ TEST_F(RegistryTest, NodeAdvertiseRegistersPublisher)
     {
         kickmsg::Node n("pub_node", KMSG_NAMESPACE);
         auto pub = n.advertise("topicX", cfg);
-        track("/" + std::string{KMSG_NAMESPACE} + "_topicX");
+        track(topic_shm("topicX"));
 
         auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
         auto snap = reg.snapshot();
@@ -239,7 +281,7 @@ TEST_F(RegistryTest, NodeAdvertiseRegistersPublisher)
         EXPECT_EQ(snap[0].node_name, "pub_node");
         EXPECT_EQ(snap[0].role, kickmsg::registry::Publisher);
         EXPECT_EQ(snap[0].shm_name,
-                  std::string{"/"} + KMSG_NAMESPACE + "_topicX");
+                  topic_shm("topicX"));
     }
 
     // Node went out of scope — entry should be gone.
@@ -257,7 +299,7 @@ TEST_F(RegistryTest, NodeBroadcastRegistersBoth)
 
     kickmsg::Node n("bcast_node", KMSG_NAMESPACE);
     auto bh = n.join_broadcast("chanX", cfg);
-    track("/" + std::string{KMSG_NAMESPACE} + "_broadcast_chanX");
+    track(broadcast_shm("chanX"));
 
     auto reg  = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
     auto snap = reg.snapshot();
@@ -279,7 +321,7 @@ TEST_F(RegistryTest, NodeAdvertiseThenSubscribeUpgradesToBoth)
     kickmsg::Node n("dual_node", KMSG_NAMESPACE);
     auto pub = n.advertise("dualtopic", cfg);
     auto sub = n.subscribe("dualtopic");
-    track("/" + std::string{KMSG_NAMESPACE} + "_dualtopic");
+    track(topic_shm("dualtopic"));
 
     auto reg  = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
     auto snap = reg.snapshot();
@@ -298,7 +340,7 @@ TEST_F(RegistryTest, MultipleNodesEachAppearOnce)
 
     kickmsg::Node pub("pub_a", KMSG_NAMESPACE);
     auto p = pub.advertise("shared", cfg);
-    track("/" + std::string{KMSG_NAMESPACE} + "_shared");
+    track(topic_shm("shared"));
 
     kickmsg::Node s1("sub_a", KMSG_NAMESPACE);
     auto s1_h = s1.subscribe("shared");
@@ -333,7 +375,7 @@ TEST_F(RegistryTest, ListTopicsGroupsByShmName)
 
     kickmsg::Node pub("pub_a", KMSG_NAMESPACE);
     auto p = pub.advertise("telemetry", cfg);
-    track("/" + std::string{KMSG_NAMESPACE} + "_telemetry");
+    track(topic_shm("telemetry"));
 
     kickmsg::Node s1("sub_a", KMSG_NAMESPACE);
     auto s1_h = s1.subscribe("telemetry");
@@ -345,7 +387,7 @@ TEST_F(RegistryTest, ListTopicsGroupsByShmName)
 
     ASSERT_EQ(topics.size(), 1u);
     auto const& t = topics[0];
-    EXPECT_EQ(t.shm_name, std::string{"/"} + KMSG_NAMESPACE + "_telemetry");
+    EXPECT_EQ(t.shm_name, topic_shm("telemetry"));
     EXPECT_EQ(t.channel_type, kickmsg::channel::PubSub);
     EXPECT_EQ(t.producers.size(), 1u);
     EXPECT_EQ(t.consumers.size(), 2u);
@@ -364,7 +406,7 @@ TEST_F(RegistryTest, ListTopicsBroadcastRoleBothInEveryLane)
 
     kickmsg::Node node("bcast", KMSG_NAMESPACE);
     auto bh = node.join_broadcast("events", cfg);
-    track("/" + std::string{KMSG_NAMESPACE} + "_broadcast_events");
+    track(broadcast_shm("events"));
 
     auto reg    = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
     auto topics = reg.list_topics();
@@ -386,11 +428,11 @@ TEST_F(RegistryTest, ListTopicsSortedByShmName)
 
     kickmsg::Node node("n", KMSG_NAMESPACE);
     auto pc = node.advertise("c_topic", cfg);
-    track("/" + std::string{KMSG_NAMESPACE} + "_c_topic");
+    track(topic_shm("c_topic"));
     auto pa = node.advertise("a_topic", cfg);
-    track("/" + std::string{KMSG_NAMESPACE} + "_a_topic");
+    track(topic_shm("a_topic"));
     auto pb = node.advertise("b_topic", cfg);
-    track("/" + std::string{KMSG_NAMESPACE} + "_b_topic");
+    track(topic_shm("b_topic"));
 
     auto reg    = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
     auto topics = reg.list_topics();

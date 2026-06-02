@@ -1,8 +1,6 @@
 #ifndef KICKMSG_REGION_H
 #define KICKMSG_REGION_H
 
-#include <optional>
-#include <string>
 #include <vector>
 
 #include "kickmsg/types.h"
@@ -65,8 +63,36 @@ namespace kickmsg
 
         SharedRegion(SharedRegion const&) = delete;
         SharedRegion& operator=(SharedRegion const&) = delete;
-        SharedRegion(SharedRegion&&) noexcept = default;
-        SharedRegion& operator=(SharedRegion&&) noexcept = default;
+
+        // Hand-written move ops so the moved-from object's base_/size_
+        // are reset to a default-constructed state.  A defaulted move
+        // would leave them aliasing the destination's live memory —
+        // base() on the moved-from object would silently return a
+        // dangling-looking-live pointer instead of nullptr.
+        SharedRegion(SharedRegion&& other) noexcept
+            : shm_{std::move(other.shm_)}
+            , name_{std::move(other.name_)}
+            , base_{other.base_}
+            , size_{other.size_}
+        {
+            other.base_ = nullptr;
+            other.size_ = 0;
+        }
+
+        SharedRegion& operator=(SharedRegion&& other) noexcept
+        {
+            if (this != &other)
+            {
+                shm_   = std::move(other.shm_);
+                name_  = std::move(other.name_);
+                base_  = other.base_;
+                size_  = other.size_;
+                other.base_ = nullptr;
+                other.size_ = 0;
+            }
+            return *this;
+        }
+
         ~SharedRegion() = default;
 
         static SharedRegion create(char const* name, channel::Type type,
@@ -85,13 +111,44 @@ namespace kickmsg
                                            channel::Config const& cfg,
                                            char const* creator_name = "");
 
+        /// Number of bytes the caller must provide to back a region with
+        /// this config and creator name.  The address passed to
+        /// attach_create() must be at least CACHE_LINE aligned and span
+        /// at least this many bytes.
+        static std::size_t required_size(channel::Config const& cfg,
+                                         char const* creator_name = "");
+
+        /// Stamp a fresh region into caller-provided memory.  The library
+        /// does not take ownership: the caller's buffer must outlive the
+        /// returned SharedRegion and any Publisher/Subscriber attached to
+        /// it.  unlink() is a no-op on the returned region.  `label`, if
+        /// non-empty, is surfaced via info().shm_name for logging.
+        ///
+        /// Throws if address is not CACHE_LINE aligned or size is less
+        /// than required_size(cfg, creator_name).
+        static SharedRegion attach_create(void* address, std::size_t size,
+                                          channel::Type type,
+                                          channel::Config const& cfg,
+                                          char const* creator_name = "",
+                                          char const* label = "");
+
+        /// Attach to caller-provided memory that already contains a valid
+        /// region (validates MAGIC + VERSION, and that size is at least
+        /// the embedded total_size).  No ownership taken; unlink() is a
+        /// no-op.  `label` is surfaced via info().shm_name for logging.
+        ///
+        /// Throws if address is not CACHE_LINE aligned, magic/version do
+        /// not match, or size is smaller than the embedded total_size.
+        static SharedRegion attach_open(void* address, std::size_t size,
+                                        char const* label = "");
+
         void unlink();
 
-        void*       base()       { return shm_.address(); }
-        void const* base() const { return shm_.address(); }
+        void*       base()       { return base_; }
+        void const* base() const { return base_; }
 
-        Header*       header()       { return static_cast<Header*>(shm_.address()); }
-        Header const* header() const { return static_cast<Header const*>(shm_.address()); }
+        Header*       header()       { return static_cast<Header*>(base_); }
+        Header const* header() const { return static_cast<Header const*>(base_); }
 
         channel::Type channel_type() const { return header()->channel_type; }
 
@@ -138,8 +195,11 @@ namespace kickmsg
         /// action, not a routine maintenance call.
         bool reset_schema_claim();
 
-        /// Lightweight read-only health check. Safe under live traffic.
-        /// Counts locked entries and ring states without any writes.
+        /// Read-only health check. Safe under live traffic; does NOT mutate
+        /// the region. Counts locked entries and ring states, and probes
+        /// per-ring owner liveness (a bounded number of cheap OS calls, one
+        /// per occupied ring -- intended for a periodic health timer, not a
+        /// hot path).
         ///
         /// Supervisor policy:
         ///  - locked_entries > 0: crash residue, call repair_locked_entries()
@@ -147,19 +207,22 @@ namespace kickmsg
         ///    confirming the crashed publisher is gone
         ///  - draining_rings > 0: usually transient (subscriber tearing down),
         ///    persistent counts may indicate a stuck teardown
+        ///  - dead_rings > 0: a subscriber holding a Live/Draining ring died;
+        ///    call reclaim_dead_rings() to recover the ring slot
         ///  - live_rings: normal occupancy
-        ///  - schema_stuck: a claimant crashed between Unset → Claiming and
-        ///    the Set release-store.  Every future try_claim_schema() will
-        ///    return false after its bounded wait until an operator calls
-        ///    reset_schema_claim() (only safe after confirming the original
-        ///    claimant is gone).
+        ///  - schema_stuck: a claimant is in the Claiming state. This is a
+        ///    point-in-time read, so a healthy in-progress try_claim_schema()
+        ///    can transiently set it -- treat it as advisory and act
+        ///    (reset_schema_claim()) only if it persists AND the claimant is
+        ///    confirmed gone.
         struct HealthReport
         {
             uint32_t locked_entries;   ///< Entries stuck at LOCKED_SEQUENCE
             uint32_t retired_rings;    ///< Free rings with stale in_flight > 0
             uint32_t draining_rings;   ///< Draining rings with in_flight > 0
+            uint32_t dead_rings;       ///< Live/Draining rings whose owner process is gone
             uint32_t live_rings;       ///< Active subscriber rings
-            bool     schema_stuck;     ///< schema_state wedged at Claiming (crashed claimant)
+            bool     schema_stuck;     ///< schema_state at Claiming (advisory; may be a live claim)
         };
         HealthReport diagnose();
 
@@ -182,6 +245,21 @@ namespace kickmsg
         /// action, not a routine maintenance call.
         /// Returns the number of rings reset.
         std::size_t reset_retired_rings();
+
+        /// Reclaim rings whose owning subscriber process has died (a Live or
+        /// Draining ring left behind by a crash). The owner pid + start time
+        /// recorded at claim time are checked against the OS; only rings with
+        /// a provably-dead owner are reclaimed, so this is safe under live
+        /// traffic -- a slow-but-alive subscriber is never touched. in_flight
+        /// is preserved (a mid-commit publisher must still fetch_sub), so a
+        /// reclaimed ring may land in the retired state for reset_retired_rings()
+        /// to finish; committed slot refs are recovered by
+        /// reclaim_orphaned_slots(). Returns the number of rings reclaimed.
+        ///
+        /// Residual: a subscriber that crashes in the few instructions between
+        /// winning the claim CAS and recording its pid leaves owner_pid == 0,
+        /// which this cannot attribute and so will not reclaim.
+        std::size_t reclaim_dead_rings();
 
         /// Runtime counter snapshot — safe under live traffic.
         ///
@@ -228,6 +306,8 @@ namespace kickmsg
 
         SharedMemory shm_;
         std::string  name_;
+        void*        base_{nullptr};
+        std::size_t  size_{0};
     };
 }
 

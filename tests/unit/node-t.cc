@@ -1,5 +1,3 @@
-#include <cstring>
-#include <string>
 
 #include <gtest/gtest.h>
 
@@ -56,6 +54,41 @@ TEST_F(NodeTest, AdvertiseAndSubscribe)
     uint32_t got = 0;
     std::memcpy(&got, sample->data(), sizeof(got));
     EXPECT_EQ(got, 42u);
+}
+
+TEST_F(NodeTest, AdvertiseTwiceDoesNotWipeLiveRegion)
+{
+    // Regression: a second advertise() of the same topic must NOT re-run
+    // SharedRegion::create() (O_TRUNC + memset) on the live segment.  A
+    // subscriber that joined after the first advertise must keep working
+    // across the second advertise.
+    track("/test_dup");
+
+    kickmsg::Node node("node", "test");
+    auto pub1 = node.advertise("dup", small_cfg());
+
+    kickmsg::Node sub_node("subnode", "test");
+    auto sub = sub_node.subscribe("dup");  // claims a ring; region Live
+
+    // Second advertise on the same node — must reuse, not wipe.
+    auto pub2 = node.advertise("dup", small_cfg());
+
+    uint32_t val = 7;
+    ASSERT_GE(pub2.send(&val, sizeof(val)), 0);
+
+    // If the second advertise had memset the region, sub's ring claim and
+    // the header magic would be gone and this receive would fail.
+    auto sample = sub.try_receive();
+    ASSERT_TRUE(sample.has_value());
+    uint32_t got = 0;
+    std::memcpy(&got, sample->data(), sizeof(got));
+    EXPECT_EQ(got, 7u);
+
+    // The original publisher handle still targets the same intact region.
+    val = 8;
+    ASSERT_GE(pub1.send(&val, sizeof(val)), 0);
+    auto s2 = sub.try_receive();
+    ASSERT_TRUE(s2.has_value());
 }
 
 TEST_F(NodeTest, NamingConventions)

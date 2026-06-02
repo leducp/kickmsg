@@ -1,7 +1,6 @@
 #include "kickmsg/os/Futex.h"
 
 #include <cerrno>
-#include <cstdint>
 
 // macOS kernel ulock API.
 // Used by libc++ (std::atomic::wait) and libdispatch since macOS 10.12.

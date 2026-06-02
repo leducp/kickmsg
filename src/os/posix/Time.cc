@@ -5,7 +5,6 @@
 #include <cerrno>
 #include <ctime>
 #include <sched.h>
-#include <stdexcept>
 #include <system_error>
 
 namespace kickmsg

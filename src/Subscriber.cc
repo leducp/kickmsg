@@ -1,7 +1,8 @@
-#include <cstring>
 #include <stdexcept>
 
 #include "kickmsg/Subscriber.h"
+#include "kickmsg/os/Futex.h"
+#include "kickmsg/os/Process.h"
 #include "kickmsg/os/Time.h"
 
 namespace kickmsg
@@ -34,6 +35,16 @@ namespace kickmsg
                     ring::make_packed(ring::Live),
                     std::memory_order_acq_rel))
             {
+                // Record owner liveness so reclaim_dead_rings() can recover
+                // this ring if we crash without releasing it. starttime
+                // first; owner_pid (release) last, so a sweeper that reads a
+                // non-zero pid also sees the matching starttime. owner_pid
+                // stays 0 until here, so a sweep racing the claim sees 0 and
+                // skips (treats it as a claim in progress).
+                uint64_t pid = current_pid();
+                ring->owner_starttime.store(process_starttime(pid),
+                                            std::memory_order_relaxed);
+                ring->owner_pid.store(pid, std::memory_order_release);
                 ring_idx_  = i;
                 start_pos_ = wp;
                 read_pos_  = start_pos_;
@@ -112,6 +123,13 @@ namespace kickmsg
             }
         }
 
+        // Clear owner AFTER reaching Free. Order matters: clearing earlier
+        // would leave a crash window where a Draining ring shows owner == 0
+        // and reclaim_dead_rings skips it. The worst case here is a brief
+        // Free + stale-owner, which the next claimer simply overwrites.
+        ring->owner_pid.store(0, std::memory_order_relaxed);
+        ring->owner_starttime.store(0, std::memory_order_relaxed);
+
         ring_idx_ = UINT32_MAX;
     }
 
@@ -155,6 +173,12 @@ namespace kickmsg
 
     std::optional<Subscriber::SampleRef> Subscriber::try_receive()
     {
+        // Moved-from Subscriber: ring_idx_ is the UINT32_MAX sentinel, so
+        // sub_ring_at would compute a wild pointer.
+        if (ring_idx_ == UINT32_MAX)
+        {
+            return std::nullopt;
+        }
         auto* ring = sub_ring_at(base_, header_, ring_idx_);
 
         for (int retries = 0; retries < 64; ++retries)
@@ -214,7 +238,10 @@ namespace kickmsg
             auto* slot = slot_at(base_, header_, slot_idx);
             uint32_t rc = slot->refcount.load(std::memory_order_acquire);
             bool pinned = false;
-            while (rc > 0)
+            // rc == UINT32_MAX is unreachable for a healthy slot (refcount is
+            // bounded by max_subs + live views); treat it as corrupt residue
+            // so rc + 1 can't wrap to 0 and make a pinned slot look freeable.
+            while (rc > 0 and rc != UINT32_MAX)
             {
                 if (slot->refcount.compare_exchange_weak(rc, rc + 1,
                         std::memory_order_acq_rel, std::memory_order_acquire))
@@ -226,7 +253,7 @@ namespace kickmsg
 
             if (not pinned)
             {
-                // refcount == 0: slot already freed, count as lost.
+                // refcount == 0 (or corrupt): slot not pinnable, count as lost.
                 ++lost_;
                 ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
@@ -267,6 +294,12 @@ namespace kickmsg
 
     std::optional<Subscriber::SampleRef> Subscriber::receive(nanoseconds timeout)
     {
+        // Moved-from Subscriber: ring_idx_ is the UINT32_MAX sentinel, so
+        // sub_ring_at would compute a wild pointer.
+        if (ring_idx_ == UINT32_MAX)
+        {
+            return std::nullopt;
+        }
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
         nanoseconds start = kickmsg::monotonic_ns();
 
@@ -293,6 +326,10 @@ namespace kickmsg
                     return std::nullopt;
                 }
                 ring->has_waiter.store(1, std::memory_order_relaxed);
+                // Pairs with the publisher's seq_cst fence: orders this store
+                // before futex_wait's kernel read of write_pos so a concurrent
+                // publish can't be missed on a weakly-ordered CPU.
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 futex_wait(ring->write_pos, cur, remaining);
                 ring->has_waiter.store(0, std::memory_order_relaxed);
             }
@@ -301,6 +338,12 @@ namespace kickmsg
 
     std::optional<Subscriber::SampleView> Subscriber::try_receive_view()
     {
+        // Moved-from Subscriber: ring_idx_ is the UINT32_MAX sentinel, so
+        // sub_ring_at would compute a wild pointer.
+        if (ring_idx_ == UINT32_MAX)
+        {
+            return std::nullopt;
+        }
         auto* ring = sub_ring_at(base_, header_, ring_idx_);
 
         for (int retries = 0; retries < 64; ++retries)
@@ -352,7 +395,8 @@ namespace kickmsg
             auto* slot = slot_at(base_, header_, slot_idx);
             uint32_t rc = slot->refcount.load(std::memory_order_acquire);
             bool pinned = false;
-            while (rc > 0)
+            // rc == UINT32_MAX is corrupt residue; skip so rc + 1 can't wrap.
+            while (rc > 0 and rc != UINT32_MAX)
             {
                 if (slot->refcount.compare_exchange_weak(rc, rc + 1,
                         std::memory_order_acq_rel, std::memory_order_acquire))
@@ -394,6 +438,12 @@ namespace kickmsg
 
     std::optional<Subscriber::SampleView> Subscriber::receive_view(nanoseconds timeout)
     {
+        // Moved-from Subscriber: ring_idx_ is the UINT32_MAX sentinel, so
+        // sub_ring_at would compute a wild pointer.
+        if (ring_idx_ == UINT32_MAX)
+        {
+            return std::nullopt;
+        }
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
         nanoseconds start = kickmsg::monotonic_ns();
 
@@ -420,6 +470,10 @@ namespace kickmsg
                     return std::nullopt;
                 }
                 ring->has_waiter.store(1, std::memory_order_relaxed);
+                // Pairs with the publisher's seq_cst fence: orders this store
+                // before futex_wait's kernel read of write_pos so a concurrent
+                // publish can't be missed on a weakly-ordered CPU.
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 futex_wait(ring->write_pos, cur, remaining);
                 ring->has_waiter.store(0, std::memory_order_relaxed);
             }

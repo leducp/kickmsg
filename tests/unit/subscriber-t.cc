@@ -4,7 +4,6 @@
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
-#include <cstring>
 #include <thread>
 
 using namespace kickmsg;
@@ -43,6 +42,21 @@ TEST_F(SubscriberTest, ReceiveEmptyReturnsNullopt)
 
     EXPECT_FALSE(sub.try_receive().has_value());
     EXPECT_FALSE(sub.try_receive_view().has_value());
+}
+
+TEST_F(SubscriberTest, MovedFromReceiveReturnsNulloptNotCrash)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber src(region);
+    kickmsg::Subscriber dst(std::move(src));
+
+    // src is moved-from (ring_idx_ == UINT32_MAX). All four receive paths
+    // must return nullopt instead of dereferencing a wild ring pointer.
+    EXPECT_FALSE(src.try_receive().has_value());
+    EXPECT_FALSE(src.try_receive_view().has_value());
+    EXPECT_FALSE(src.receive(std::chrono::milliseconds{0}).has_value());
+    EXPECT_FALSE(src.receive_view(std::chrono::milliseconds{0}).has_value());
 }
 
 TEST_F(SubscriberTest, ZeroCopyReceive)

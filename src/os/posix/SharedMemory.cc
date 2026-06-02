@@ -4,7 +4,6 @@
 
 #include <cerrno>
 #include <fcntl.h>
-#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <sys/mman.h>
@@ -122,6 +121,15 @@ namespace kickmsg
         }
 
         size_ = static_cast<std::size_t>(st.st_size);
+        if (size_ == 0)
+        {
+            // Creator reached shm_open(O_CREAT) but not ftruncate() yet.
+            // mmap(., 0, .) would fail EINVAL; report not-ready so the
+            // create_or_open / spin_open retry loops keep spinning.
+            ::close(fd_);
+            fd_ = INVALID_SHM_HANDLE;
+            return false;
+        }
         address_ = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         if (address_ == MAP_FAILED)
         {

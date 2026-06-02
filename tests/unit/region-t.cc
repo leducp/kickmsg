@@ -5,11 +5,46 @@
 #include "kickmsg/Subscriber.h"
 
 #include <atomic>
-#include <cstring>
 #include <thread>
-#include <vector>
 
 #include "kickmsg/os/Process.h"
+
+#ifndef _WIN32
+    #include <fcntl.h>
+    #include <sys/mman.h>
+    #include <unistd.h>
+#else
+    #include <malloc.h>   // _aligned_malloc / _aligned_free
+#endif
+
+namespace
+{
+    // CACHE_LINE-aligned heap buffer for the injected-region tests.
+    // posix_memalign is POSIX-only; Windows uses _aligned_malloc, whose
+    // memory MUST be released with _aligned_free (not free()).
+    void* aligned_buffer_alloc(std::size_t align, std::size_t size)
+    {
+#if defined(_WIN32)
+        return _aligned_malloc(size, align);
+#else
+        void* p = nullptr;
+        if (::posix_memalign(&p, align, size) != 0)
+        {
+            return nullptr;
+        }
+        return p;
+#endif
+    }
+
+    void aligned_buffer_free(void* p)
+    {
+#if defined(_WIN32)
+        _aligned_free(p);
+#else
+        ::free(p);
+#endif
+    }
+}
 
 class RegionTest : public ::testing::Test
 {
@@ -72,6 +107,25 @@ TEST_F(RegionTest, OpenNonexistentThrows)
     EXPECT_THROW(kickmsg::SharedRegion::open("/kickmsg_nonexistent_42"), std::runtime_error);
 }
 
+#ifndef _WIN32
+TEST(SharedMemoryTest, TryOpenOnSizeZeroSegmentReturnsFalse)
+{
+    // A creator that did shm_open(O_CREAT) but not yet ftruncate() leaves a
+    // size-0 object. try_open must report not-ready (so create_or_open /
+    // spin_open retry) rather than mmap(., 0, .) -> EINVAL -> throw.
+    char const* name = "/kickmsg_test_size0";
+    ::shm_unlink(name);
+    int fd = ::shm_open(name, O_RDWR | O_CREAT, 0666);
+    ASSERT_GE(fd, 0);
+
+    kickmsg::SharedMemory sm;
+    EXPECT_FALSE(sm.try_open(name));
+
+    ::close(fd);
+    ::shm_unlink(name);
+}
+#endif
+
 TEST_F(RegionTest, CreateOrOpenFirstCreates)
 {
     auto cfg = default_cfg();
@@ -107,6 +161,55 @@ TEST_F(RegionTest, CreateOrOpenConfigMismatchThrows)
         kickmsg::SharedRegion::create_or_open(
             SHM_NAME, kickmsg::channel::PubSub, bad_cfg, "other"),
         std::runtime_error);
+}
+
+TEST_F(RegionTest, CreateOrOpenValidatesGeometryOnOpenBranch)
+{
+    auto cfg = default_cfg();
+    auto creator = kickmsg::SharedRegion::create_or_open(
+        SHM_NAME, kickmsg::channel::PubSub, cfg, "creator");
+
+    // Corrupt a geometry field that config_hash does NOT cover (pool_offset
+    // is computed layout, not a cfg field).  A second create_or_open hits
+    // the open branch with a matching config_hash, so only the geometry
+    // validation can catch it.
+    creator.header()->pool_offset = UINT64_MAX;
+
+    EXPECT_THROW(
+        kickmsg::SharedRegion::create_or_open(
+            SHM_NAME, kickmsg::channel::PubSub, cfg, "opener"),
+        std::runtime_error);
+}
+
+TEST_F(RegionTest, CreateRejectsOverlongCreatorName)
+{
+    std::string huge(70000, 'x');  // exceeds the uint16_t creator_name_len
+    EXPECT_THROW(
+        kickmsg::SharedRegion::create(
+            SHM_NAME, kickmsg::channel::PubSub, default_cfg(), huge.c_str()),
+        std::runtime_error);
+}
+
+TEST_F(RegionTest, RequiredSizeRejectsOverflowingConfig)
+{
+    auto cfg = default_cfg();
+    cfg.pool_size = SIZE_MAX / 2;  // pool_size * slot_stride wraps total_size
+    EXPECT_THROW(kickmsg::SharedRegion::required_size(cfg), std::runtime_error);
+}
+
+TEST_F(RegionTest, SchemaNameForcedNulTerminatedOnRead)
+{
+    auto region = kickmsg::SharedRegion::create(
+        SHM_NAME, kickmsg::channel::PubSub, default_cfg());
+    auto* h = region.header();
+
+    // Corrupt: fill name with non-zero bytes and publish Set directly.
+    std::memset(h->schema_data.name, 'A', sizeof(h->schema_data.name));
+    h->schema_state.store(kickmsg::schema::Set, std::memory_order_release);
+
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->name[sizeof(got->name) - 1], '\0');
 }
 
 TEST_F(RegionTest, HeaderStoresCreatorMetadata)
@@ -508,6 +611,66 @@ TEST_F(RegionTest, ResetRetiredRingsLeavesDrainingUntouched)
     uint32_t packed1 = ring1->state_flight.load(std::memory_order_acquire);
     EXPECT_EQ(kickmsg::ring::get_state(packed1), kickmsg::ring::Draining);
     EXPECT_EQ(kickmsg::ring::get_in_flight(packed1), 1u);
+}
+
+TEST_F(RegionTest, ReclaimDeadRingsRecoversCrashedOwnerRing)
+{
+    auto cfg = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    auto* h = region.header();
+
+    // Ring 0: a subscriber crashed holding it Live (guaranteed-dead pid,
+    // same sentinel the registry sweep test uses).
+    auto* ring0 = kickmsg::sub_ring_at(region.base(), h, 0);
+    ring0->owner_starttime.store(0, std::memory_order_relaxed);
+    ring0->owner_pid.store(0x7fffffff, std::memory_order_release);
+    ring0->state_flight.store(kickmsg::ring::make_packed(kickmsg::ring::Live),
+                              std::memory_order_release);
+
+    // Ring 1: a LIVE owner (this process) must never be reclaimed.
+    auto* ring1 = kickmsg::sub_ring_at(region.base(), h, 1);
+    ring1->owner_starttime.store(
+        kickmsg::process_starttime(kickmsg::current_pid()), std::memory_order_relaxed);
+    ring1->owner_pid.store(kickmsg::current_pid(), std::memory_order_release);
+    ring1->state_flight.store(kickmsg::ring::make_packed(kickmsg::ring::Live),
+                              std::memory_order_release);
+
+    EXPECT_EQ(region.diagnose().dead_rings, 1u);
+    EXPECT_EQ(region.reclaim_dead_rings(), 1u);
+
+    // Ring 0 reclaimed to Free with owner cleared.
+    uint32_t p0 = ring0->state_flight.load(std::memory_order_acquire);
+    EXPECT_EQ(kickmsg::ring::get_state(p0), kickmsg::ring::Free);
+    EXPECT_EQ(ring0->owner_pid.load(std::memory_order_acquire), 0u);
+
+    // Ring 1 (live owner) untouched.
+    uint32_t p1 = ring1->state_flight.load(std::memory_order_acquire);
+    EXPECT_EQ(kickmsg::ring::get_state(p1), kickmsg::ring::Live);
+
+    // Idempotent.
+    EXPECT_EQ(region.reclaim_dead_rings(), 0u);
+    EXPECT_EQ(region.diagnose().dead_rings, 0u);
+}
+
+TEST_F(RegionTest, ReclaimDeadRingsPreservesInFlight)
+{
+    auto cfg = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    auto* h = region.header();
+
+    // Dead owner holding a Live ring with a publisher still admitted: the
+    // reclaim must flip state to Free but keep in_flight (so the mid-commit
+    // publisher's fetch_sub can't underflow into the state bits).
+    auto* ring = kickmsg::sub_ring_at(region.base(), h, 0);
+    ring->owner_pid.store(0x7fffffff, std::memory_order_release);
+    ring->state_flight.store(kickmsg::ring::make_packed(kickmsg::ring::Live, 1),
+                             std::memory_order_release);
+
+    EXPECT_EQ(region.reclaim_dead_rings(), 1u);
+
+    uint32_t p = ring->state_flight.load(std::memory_order_acquire);
+    EXPECT_EQ(kickmsg::ring::get_state(p), kickmsg::ring::Free);
+    EXPECT_EQ(kickmsg::ring::get_in_flight(p), 1u);  // preserved
 }
 
 TEST_F(RegionTest, CollectGarbageDoesNotReclaimLiveSlots)
@@ -1030,4 +1193,329 @@ TEST_F(RegionTest, StatsPoolFreeTracksAllocations)
     auto s = region.stats();
     // One slot is popped from the free stack and not yet returned.
     EXPECT_EQ(s.pool_free, cfg.pool_size - 1);
+}
+
+// -----------------------------------------------------------------------------
+// attach_create / attach_open — caller-provided memory
+// -----------------------------------------------------------------------------
+
+class InjectedRegionTest : public ::testing::Test
+{
+public:
+    kickmsg::channel::Config default_cfg()
+    {
+        kickmsg::channel::Config cfg;
+        cfg.max_subscribers   = 2;
+        cfg.sub_ring_capacity = 8;
+        cfg.pool_size         = 16;
+        cfg.max_payload_size  = 64;
+        return cfg;
+    }
+
+    // Aligned heap buffer sized to fit a region with `cfg`.
+    struct Buffer
+    {
+        std::unique_ptr<void, decltype(&aligned_buffer_free)> mem{nullptr, &aligned_buffer_free};
+        std::size_t                                           size{0};
+        void* get() { return mem.get(); }
+    };
+
+    Buffer make_buffer(kickmsg::channel::Config const& cfg, char const* creator = "")
+    {
+        Buffer b;
+        b.size = kickmsg::SharedRegion::required_size(cfg, creator);
+        void* raw = aligned_buffer_alloc(kickmsg::CACHE_LINE, b.size);
+        EXPECT_NE(raw, nullptr);
+        b.mem.reset(raw);
+        return b;
+    }
+};
+
+TEST_F(InjectedRegionTest, RequiredSizeMatchesShmBackedTotalSize)
+{
+    auto cfg = default_cfg();
+    kickmsg::SharedMemory::unlink("/kickmsg_test_inject_size");
+    auto shm = kickmsg::SharedRegion::create(
+        "/kickmsg_test_inject_size", kickmsg::channel::PubSub, cfg, "x");
+    EXPECT_EQ(kickmsg::SharedRegion::required_size(cfg, "x"),
+              shm.header()->total_size);
+    shm.unlink();
+}
+
+TEST_F(InjectedRegionTest, AttachCreateRoundtrip)
+{
+    auto cfg = default_cfg();
+    auto buf = make_buffer(cfg, "inject");
+
+    auto region = kickmsg::SharedRegion::attach_create(
+        buf.get(), buf.size, kickmsg::channel::PubSub, cfg, "inject", "label");
+
+    EXPECT_EQ(region.header()->magic, kickmsg::MAGIC);
+    EXPECT_EQ(region.header()->version, kickmsg::VERSION);
+    EXPECT_EQ(region.info().shm_name, "label");
+    EXPECT_EQ(region.info().creator_name, "inject");
+
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+        ASSERT_GE(pub.send(&i, sizeof(i)), 0);
+    }
+
+    int received = 0;
+    while (auto s = sub.try_receive())
+    {
+        uint32_t got = 0;
+        std::memcpy(&got, s->data(), sizeof(got));
+        EXPECT_EQ(got, static_cast<uint32_t>(received));
+        ++received;
+    }
+    EXPECT_EQ(received, 5);
+}
+
+TEST_F(InjectedRegionTest, AttachOpenSeesStampedRegion)
+{
+    auto cfg = default_cfg();
+    auto buf = make_buffer(cfg, "creator");
+
+    {
+        auto creator = kickmsg::SharedRegion::attach_create(
+            buf.get(), buf.size, kickmsg::channel::PubSub, cfg, "creator");
+
+        kickmsg::Publisher pub(creator);
+        uint32_t val = 0xC0FFEE;
+        ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+    }
+
+    // A second handle attaches to the same buffer and validates.
+    auto reader = kickmsg::SharedRegion::attach_open(buf.get(), buf.size, "ro");
+    EXPECT_EQ(reader.info().shm_name, "ro");
+    EXPECT_EQ(reader.info().creator_name, "creator");
+    EXPECT_EQ(reader.header()->pool_size, cfg.pool_size);
+}
+
+TEST_F(InjectedRegionTest, AttachCreateRejectsMisalignedAddress)
+{
+    auto cfg  = default_cfg();
+    auto buf  = make_buffer(cfg, "x");
+    auto* bad = static_cast<char*>(buf.get()) + 1;  // off by one — not aligned
+
+    EXPECT_THROW(
+        kickmsg::SharedRegion::attach_create(
+            bad, buf.size - 1, kickmsg::channel::PubSub, cfg, "x"),
+        std::runtime_error);
+}
+
+TEST_F(InjectedRegionTest, AttachCreateRejectsUndersizedBuffer)
+{
+    auto cfg = default_cfg();
+    auto buf = make_buffer(cfg, "x");
+
+    EXPECT_THROW(
+        kickmsg::SharedRegion::attach_create(
+            buf.get(), buf.size - 1, kickmsg::channel::PubSub, cfg, "x"),
+        std::runtime_error);
+}
+
+TEST_F(InjectedRegionTest, AttachOpenRejectsZeroedBuffer)
+{
+    auto cfg = default_cfg();
+    auto buf = make_buffer(cfg, "x");
+    std::memset(buf.get(), 0, buf.size);
+
+    EXPECT_THROW(
+        kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+        std::runtime_error);
+}
+
+TEST_F(InjectedRegionTest, UnlinkOnInjectedRegionIsNoOp)
+{
+    auto cfg = default_cfg();
+    auto buf = make_buffer(cfg, "x");
+    auto region = kickmsg::SharedRegion::attach_create(
+        buf.get(), buf.size, kickmsg::channel::PubSub, cfg, "x", "should-not-be-unlinked");
+
+    // Must not call shm_unlink on the label, which would fail if it tried —
+    // the label is not a path.  Just checks that the call returns cleanly.
+    EXPECT_NO_THROW(region.unlink());
+    // And the region remains usable after a no-op unlink.
+    EXPECT_EQ(region.header()->magic, kickmsg::MAGIC);
+}
+
+TEST_F(InjectedRegionTest, AttachOpenRejectsBufferSmallerThanHeader)
+{
+    // A buffer smaller than sizeof(Header) must be rejected BEFORE any
+    // dereference of magic/version/total_size — otherwise the load is
+    // an out-of-bounds read on hostile or accidentally-small input.
+    alignas(kickmsg::CACHE_LINE) std::byte tiny[kickmsg::CACHE_LINE]{};
+    static_assert(sizeof(tiny) < sizeof(kickmsg::Header));
+
+    EXPECT_THROW(
+        kickmsg::SharedRegion::attach_open(tiny, sizeof(tiny)),
+        std::runtime_error);
+}
+
+TEST_F(InjectedRegionTest, MoveLeavesSourceWithNullBase)
+{
+    auto cfg = default_cfg();
+    auto buf = make_buffer(cfg, "x");
+    auto src = kickmsg::SharedRegion::attach_create(
+        buf.get(), buf.size, kickmsg::channel::PubSub, cfg, "x");
+
+    void* live_base = src.base();
+    ASSERT_NE(live_base, nullptr);
+
+    auto dst = std::move(src);
+    EXPECT_EQ(dst.base(), live_base);
+    // After move, the source must NOT still alias the destination's
+    // live memory — otherwise base()/header() on the moved-from object
+    // returns a dangling-looking-live pointer instead of nullptr.
+    EXPECT_EQ(src.base(), nullptr);
+}
+
+TEST_F(InjectedRegionTest, MoveAssignLeavesSourceWithNullBase)
+{
+    auto cfg = default_cfg();
+    auto buf = make_buffer(cfg, "x");
+    auto src = kickmsg::SharedRegion::attach_create(
+        buf.get(), buf.size, kickmsg::channel::PubSub, cfg, "x");
+
+    void* live_base = src.base();
+    ASSERT_NE(live_base, nullptr);
+
+    kickmsg::SharedRegion dst;
+    dst = std::move(src);
+    EXPECT_EQ(dst.base(), live_base);
+    EXPECT_EQ(src.base(), nullptr);
+}
+
+// Threat-model tests for validate_header_geometry: a kickmsg-stamped
+// buffer always passes; deliberately corrupting any geometry field must
+// fail attach_open with a runtime_error, never let downstream code
+// compute wild pointers.
+class CorruptedHeaderTest : public InjectedRegionTest
+{
+public:
+    // Make a valid stamped buffer the test can then deface.
+    Buffer make_stamped(kickmsg::channel::Config const& cfg)
+    {
+        auto buf = make_buffer(cfg, "x");
+        auto r = kickmsg::SharedRegion::attach_create(
+            buf.get(), buf.size, kickmsg::channel::PubSub, cfg, "x");
+        (void)r;  // RAII drops; the bytes in `buf` stay stamped
+        return buf;
+    }
+
+    kickmsg::Header* hdr(Buffer& b) { return static_cast<kickmsg::Header*>(b.get()); }
+};
+
+TEST_F(CorruptedHeaderTest, RejectsZeroMaxSubs)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->max_subs = 0;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsNonPowerOfTwoRingCapacity)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->sub_ring_capacity = 7;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsInconsistentRingMask)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->sub_ring_mask = 3;  // capacity is 8, mask should be 7
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsCreatorNameLenOverflow)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->creator_name_len = UINT16_MAX;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsPoolOffsetPastTotalSize)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->pool_offset = UINT64_MAX;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsTotalSizeSmallerThanHeader)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->total_size = sizeof(kickmsg::Header) - 1;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsRingsOverflowingPoolOffset)
+{
+    auto buf = make_stamped(default_cfg());
+    // max_subs * sub_ring_stride must fit in [sub_rings_offset, pool_offset).
+    hdr(buf)->max_subs = UINT64_MAX;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsPoolOverflowingTotalSize)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->pool_size = UINT64_MAX;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsTinySlotStride)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->slot_stride = 1;  // smaller than sizeof(SlotHeader)
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsTinyRingStride)
+{
+    auto buf = make_stamped(default_cfg());
+    hdr(buf)->sub_ring_stride = 1;  // smaller than a SubRingHeader + entries
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsRingCapacityOverflowingRegion)
+{
+    auto buf = make_stamped(default_cfg());
+    // Huge power-of-two capacity with a consistent mask: passes the
+    // power-of-two and mask checks, must trip the pre-multiply overflow guard.
+    hdr(buf)->sub_ring_capacity = uint64_t{1} << 60;
+    hdr(buf)->sub_ring_mask     = (uint64_t{1} << 60) - 1;
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, StampedBufferStillValidates)
+{
+    auto buf = make_stamped(default_cfg());
+    // Sanity: an unmodified stamped buffer must pass.
+    EXPECT_NO_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size));
+}
+
+TEST_F(CorruptedHeaderTest, RejectsCreatorNameLenPastTail)
+{
+    auto buf = make_stamped(default_cfg());
+    // Within total_size but past the creator-name tail (would let info()
+    // read into the subscriber rings / pool).
+    hdr(buf)->creator_name_len =
+        static_cast<uint16_t>(hdr(buf)->sub_rings_offset);
+    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
+                 std::runtime_error);
 }

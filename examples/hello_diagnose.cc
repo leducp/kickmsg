@@ -8,8 +8,6 @@
 ///   4. Repair with repair_locked_entries()
 ///   5. Verify the channel is fully operational again
 
-#include <cstdint>
-#include <cstring>
 #include <iostream>
 
 #include <kickmsg/Publisher.h>

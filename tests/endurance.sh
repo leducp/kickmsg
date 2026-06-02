@@ -15,9 +15,13 @@ echo ""
 while [ "$(date +%s)" -lt "$END_TIME" ]; do
     OUTPUT=$("$BINARY" 2>&1)
     RUNS=$((RUNS + 1))
+    if [ "$RUNS" -eq 1 ]; then
+        echo "$OUTPUT" | grep -iE "harness built" || true
+        echo ""
+    fi
     SUMMARY=$(echo "$OUTPUT" | grep "Summary:" | tail -1)
-    RUN_PASS=$(echo "$SUMMARY" | grep -oP '\d+ passed' | grep -oP '\d+')
-    RUN_FAIL=$(echo "$SUMMARY" | grep -oP '\d+ failed' | grep -oP '\d+')
+    RUN_PASS=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
+    RUN_FAIL=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')
     RUN_REORDER=$(echo "$OUTPUT" | { grep -c "REORDER" || true; })
     PASS=$((PASS + RUN_PASS))
     FAIL=$((FAIL + RUN_FAIL))

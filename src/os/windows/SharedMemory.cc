@@ -1,7 +1,5 @@
 #include "kickmsg/os/SharedMemory.h"
 
-#include <stdexcept>
-#include <string>
 #include <system_error>
 
 namespace kickmsg

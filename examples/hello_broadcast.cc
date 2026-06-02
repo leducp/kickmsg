@@ -7,13 +7,11 @@
 ///   - Multiple concurrent participants on the same channel
 ///   - Each node sees messages from all other nodes (not its own)
 
-#include <cstring>
 #include <iostream>
-#include <string>
 #include <thread>
-#include <vector>
 
 #include <kickmsg/Node.h>
+#include <kickmsg/os/Time.h>
 
 using namespace kickmsg;
 

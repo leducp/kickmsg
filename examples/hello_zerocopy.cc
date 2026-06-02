@@ -6,8 +6,6 @@
 /// is alive, preventing reuse. Ideal for large payloads (camera frames,
 /// point clouds) where memcpy overhead matters.
 
-#include <cstdint>
-#include <cstring>
 #include <iostream>
 
 #include <kickmsg/Node.h>

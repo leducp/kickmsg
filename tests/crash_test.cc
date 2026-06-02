@@ -15,17 +15,14 @@
 /// sequences) and Case-B (retired rings) residue coexist at multiple
 /// ring positions.
 
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <vector>
 
 #include "kickmsg/os/Time.h"
 #include "kickmsg/Publisher.h"

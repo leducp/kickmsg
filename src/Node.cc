@@ -141,6 +141,17 @@ namespace kickmsg
     {
         auto shm_name   = make_topic_name(topic);
         auto topic_path = with_leading_slash(topic);
+        // Guard the create: without it, a second advertise() of the same
+        // topic re-evaluates SharedRegion::create() (shm_open O_TRUNC +
+        // memset) on the already-mapped live segment before emplace
+        // discards the duplicate — wiping the header/rings/pool under any
+        // existing Publisher and remote peers.
+        if (auto* r = find_region(shm_name))
+        {
+            touch_registry(shm_name, topic_path, channel::PubSub,
+                           registry::Pubsub, registry::Publisher);
+            return Publisher(*r);
+        }
         auto [it, _]  = regions_.emplace(
             shm_name,
             SharedRegion::create(shm_name.c_str(), channel::PubSub, cfg, name_.c_str()));
@@ -226,6 +237,17 @@ namespace kickmsg
         mbx_cfg.max_subscribers = 1;
         auto shm_name   = make_mailbox_name(name_.c_str(), tag);
         auto topic_path = mailbox_topic(name_.c_str(), tag);
+        // Guard the create (see advertise): a second create_mailbox() of
+        // the same tag must not O_TRUNC+memset the live segment.  Returning
+        // a handle to the existing region makes the duplicate claim fail
+        // loudly in the Subscriber ctor (the single ring is already Live)
+        // instead of silently wiping the mailbox.
+        if (auto* r = find_region(shm_name))
+        {
+            touch_registry(shm_name, topic_path, channel::PubSub,
+                           registry::Mailbox, registry::Subscriber);
+            return Subscriber(*r);
+        }
         auto [it, _]  = regions_.emplace(
             shm_name,
             SharedRegion::create(shm_name.c_str(), channel::PubSub, mbx_cfg, name_.c_str()));
@@ -318,21 +340,24 @@ namespace kickmsg
     std::string Node::make_topic_name(char const* topic) const
     {
         // namespace_ is pre-sanitized in the ctor; topic is user-supplied on
-        // each call and may be a ROS-style "/a/b/c" path.
-        return "/" + namespace_ + "_" + sanitize_shm_component(topic, "topic");
+        // each call and may be a ROS-style "/a/b/c" path.  compose_shm_name
+        // handles the platform shm-name limit (hash on macOS, readable on
+        // Linux, throw on overflow).
+        return compose_shm_name(namespace_,
+                                sanitize_shm_component(topic, "topic"));
     }
 
     std::string Node::make_broadcast_name(char const* channel) const
     {
-        return "/" + namespace_ + "_broadcast_"
-             + sanitize_shm_component(channel, "channel");
+        return compose_shm_name(namespace_,
+            "broadcast_" + sanitize_shm_component(channel, "channel"));
     }
 
     std::string Node::make_mailbox_name(char const* owner, char const* tag) const
     {
-        return "/" + namespace_ + "_"
-             + sanitize_shm_component(owner, "mailbox owner") + "_mbx_"
-             + sanitize_shm_component(tag, "mailbox tag");
+        return compose_shm_name(namespace_,
+            sanitize_shm_component(owner, "mailbox owner") + "_mbx_"
+            + sanitize_shm_component(tag, "mailbox tag"));
     }
 
     SharedRegion* Node::find_region(std::string const& shm_name)

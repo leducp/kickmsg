@@ -58,14 +58,16 @@ step "Stress tests — single pass"
 "$BUILD_PATH/kickmsg_stress_test"
 success "Stress tests passed"
 
-# Repeat the stress suite several times with shuffled order.  The whole
-# point of running on ARM64 is that memory-ordering bugs appear
-# intermittently — a single run that happens to pass tells us nothing.
-# Ten passes with shuffled ordering is the 80/20 of catching real races
-# without blowing out the wall-clock budget.
-step "Stress tests — shuffled repeat x10 (ARM64 memory-ordering probe)"
-"$BUILD_PATH/kickmsg_stress_test" --gtest_repeat=10 --gtest_shuffle
-success "Shuffled stress repeat passed"
+# Repeat the stress suite several times.  The whole point of running on
+# ARM64 is that memory-ordering bugs appear intermittently -- a single
+# run that happens to pass tells us nothing.  kickmsg_stress_test is not
+# a GoogleTest binary (it has its own main and already randomizes timing
+# within each pass), so repetition is a shell loop, not --gtest_repeat.
+step "Stress tests — repeat x10 (ARM64 memory-ordering probe)"
+for _ in $(seq 1 10); do
+    "$BUILD_PATH/kickmsg_stress_test"
+done
+success "Stress repeat x10 passed"
 
 step "Crash / recovery tests"
 "$BUILD_PATH/kickmsg_crash_test"
