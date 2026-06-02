@@ -29,6 +29,20 @@ using namespace kickmsg;
     constexpr int TSAN_SCALE = 1;
 #endif
 
+// Target TOTAL contention threads (publishers + subscribers) as a percentage
+// of the host core count. Default 150 (~1.5x cores: oversubscribed enough to
+// contend, bounded enough to finish). Settable from the stress binary's
+// command line so a run can be dialed up or down. Read by contention_count().
+extern uint16_t g_oversub_pct;
+
+// Per-side thread count for a contention scenario, derived from the host core
+// count and g_oversub_pct. This SCALES with the machine (a 192-core box gets
+// hundreds of threads, still oversubscribed) instead of a fixed count that
+// would leave a big box undersubscribed -- while staying bounded on a 2-core
+// CI runner. Floored at 2. Callers must size max_subs / max_subscribers to
+// match the returned value.
+uint16_t contention_count();
+
 struct Payload
 {
     static constexpr uint32_t MAGIC = 0xCAFEBABE;
