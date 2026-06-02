@@ -4,14 +4,17 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
-#include <cstdint>
 #include <limits.h>
 #include <stdexcept>
-#include <string>
 #include <system_error>
 
 #if defined(__APPLE__) || defined(__DARWIN__)
     #include <sys/posix_shm.h>
+#elif defined(_WIN32)
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>   // MAX_PATH
 #endif
 
 namespace kickmsg
@@ -70,16 +73,24 @@ namespace kickmsg
         out.resize(PSHMNAMLEN - 1);
         return out;
 #else
-        // shm_open accepts '/' + up to NAME_MAX bytes for the filename portion on tmpfs.
+        // Readable "/ns_suffix" name. Linux shm_open counts NAME_MAX bytes for
+        // the filename portion (the leading '/' is not part of it); Windows
+        // CreateFileMapping caps the whole object name at MAX_PATH.
         std::string out = "/";
         out += ns;
         out += '_';
         out += suffix;
-        // -1 because / is not taken into account
-        if (out.size() - 1 > static_cast<std::size_t>(NAME_MAX))
+    #if defined(_WIN32)
+        std::size_t const len   = out.size();
+        std::size_t const limit = static_cast<std::size_t>(MAX_PATH);
+    #else
+        std::size_t const len   = out.size() - 1;
+        std::size_t const limit = static_cast<std::size_t>(NAME_MAX);
+    #endif
+        if (len > limit)
         {
             throw std::system_error(ENAMETOOLONG, std::generic_category(),
-                "kickmsg::compose_shm_name: shm name exceeds NAME_MAX");
+                "kickmsg::compose_shm_name: shm name exceeds platform limit");
         }
         return out;
 #endif

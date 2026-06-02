@@ -8,6 +8,11 @@
 
 #if defined(__APPLE__) || defined(__DARWIN__)
     #include <sys/posix_shm.h>
+#elif defined(_WIN32)
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>   // MAX_PATH
 #endif
 
 using kickmsg::sanitize_shm_component;
@@ -134,6 +139,8 @@ TEST(ComposeShmName, FitsPlatformLimit)
     EXPECT_EQ(name[0], '/');
 #if defined(__APPLE__) || defined(__DARWIN__)
     EXPECT_LE(name.size(), static_cast<std::size_t>(PSHMNAMLEN) - 1);
+#elif defined(_WIN32)
+    EXPECT_LE(name.size(), static_cast<std::size_t>(MAX_PATH));
 #else
     EXPECT_LE(name.size() - 1, static_cast<std::size_t>(NAME_MAX));
 #endif
@@ -178,11 +185,12 @@ TEST(ComposeShmName, FitsEvenWhenInputsAreLong)
 }
 
 #if !defined(__APPLE__) && !defined(__DARWIN__)
-TEST(ComposeShmName, ThrowsOnLinuxWhenExceedingNameMax)
+TEST(ComposeShmName, ThrowsWhenExceedingPlatformLimit)
 {
-    // Linux: pre-composed name longer than NAME_MAX must throw clearly
-    // (system_error/ENAMETOOLONG) instead of silently truncating or
-    // failing inside shm_open with an opaque OS error.
+    // Non-macOS (readable names): a pre-composed name longer than the
+    // platform limit (Linux NAME_MAX, Windows MAX_PATH) must throw clearly
+    // instead of truncating or failing with an opaque OS error. 400+ chars
+    // exceeds both. macOS hashes to a fixed length, so it never throws here.
     std::string ns(200, 'n');
     std::string sx(200, 's');
     EXPECT_THROW(compose_shm_name(ns, sx), std::system_error);

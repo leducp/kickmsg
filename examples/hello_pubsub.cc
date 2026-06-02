@@ -8,10 +8,7 @@
 /// Single-process for simplicity; in production, each node lives in
 /// its own process sharing the same namespace.
 
-#include <cstdint>
-#include <cstring>
 #include <iostream>
-#include <thread>
 
 #include <kickmsg/Node.h>
 

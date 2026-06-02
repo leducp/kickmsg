@@ -28,6 +28,12 @@ target_link_libraries(kickmsg_stress_test PRIVATE kickmsg)
 set_target_properties(kickmsg_stress_test
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+# Registered so ctest (and the TSAN job) actually exercise the lock-free
+# contention paths -- the Treiber free-stack and pool exhaustion races only
+# show up here, not in the unit suite. Generous timeout: TSAN scales the
+# iteration counts up ~100x.
+add_test(NAME stress COMMAND kickmsg_stress_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(stress PROPERTIES TIMEOUT 900)
 
 # Crash test uses fork/waitpid/SIGKILL — POSIX only
 if(NOT WIN32)
@@ -36,10 +42,14 @@ if(NOT WIN32)
     set_target_properties(kickmsg_crash_test
         PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    add_test(NAME crash COMMAND kickmsg_crash_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    set_tests_properties(crash PROPERTIES TIMEOUT 300)
 
     add_executable(kickmsg_registry_stress_test registry_stress_test.cc)
     target_link_libraries(kickmsg_registry_stress_test PRIVATE kickmsg)
     set_target_properties(kickmsg_registry_stress_test
         PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    add_test(NAME registry_stress COMMAND kickmsg_registry_stress_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    set_tests_properties(registry_stress PROPERTIES TIMEOUT 300)
 endif()

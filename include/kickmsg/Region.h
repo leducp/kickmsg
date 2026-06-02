@@ -1,8 +1,6 @@
 #ifndef KICKMSG_REGION_H
 #define KICKMSG_REGION_H
 
-#include <optional>
-#include <string>
 #include <vector>
 
 #include "kickmsg/types.h"
@@ -197,8 +195,11 @@ namespace kickmsg
         /// action, not a routine maintenance call.
         bool reset_schema_claim();
 
-        /// Lightweight read-only health check. Safe under live traffic.
-        /// Counts locked entries and ring states without any writes.
+        /// Read-only health check. Safe under live traffic; does NOT mutate
+        /// the region. Counts locked entries and ring states, and probes
+        /// per-ring owner liveness (a bounded number of cheap OS calls, one
+        /// per occupied ring -- intended for a periodic health timer, not a
+        /// hot path).
         ///
         /// Supervisor policy:
         ///  - locked_entries > 0: crash residue, call repair_locked_entries()
@@ -206,19 +207,22 @@ namespace kickmsg
         ///    confirming the crashed publisher is gone
         ///  - draining_rings > 0: usually transient (subscriber tearing down),
         ///    persistent counts may indicate a stuck teardown
+        ///  - dead_rings > 0: a subscriber holding a Live/Draining ring died;
+        ///    call reclaim_dead_rings() to recover the ring slot
         ///  - live_rings: normal occupancy
-        ///  - schema_stuck: a claimant crashed between Unset → Claiming and
-        ///    the Set release-store.  Every future try_claim_schema() will
-        ///    return false after its bounded wait until an operator calls
-        ///    reset_schema_claim() (only safe after confirming the original
-        ///    claimant is gone).
+        ///  - schema_stuck: a claimant is in the Claiming state. This is a
+        ///    point-in-time read, so a healthy in-progress try_claim_schema()
+        ///    can transiently set it -- treat it as advisory and act
+        ///    (reset_schema_claim()) only if it persists AND the claimant is
+        ///    confirmed gone.
         struct HealthReport
         {
             uint32_t locked_entries;   ///< Entries stuck at LOCKED_SEQUENCE
             uint32_t retired_rings;    ///< Free rings with stale in_flight > 0
             uint32_t draining_rings;   ///< Draining rings with in_flight > 0
+            uint32_t dead_rings;       ///< Live/Draining rings whose owner process is gone
             uint32_t live_rings;       ///< Active subscriber rings
-            bool     schema_stuck;     ///< schema_state wedged at Claiming (crashed claimant)
+            bool     schema_stuck;     ///< schema_state at Claiming (advisory; may be a live claim)
         };
         HealthReport diagnose();
 
@@ -241,6 +245,21 @@ namespace kickmsg
         /// action, not a routine maintenance call.
         /// Returns the number of rings reset.
         std::size_t reset_retired_rings();
+
+        /// Reclaim rings whose owning subscriber process has died (a Live or
+        /// Draining ring left behind by a crash). The owner pid + start time
+        /// recorded at claim time are checked against the OS; only rings with
+        /// a provably-dead owner are reclaimed, so this is safe under live
+        /// traffic -- a slow-but-alive subscriber is never touched. in_flight
+        /// is preserved (a mid-commit publisher must still fetch_sub), so a
+        /// reclaimed ring may land in the retired state for reset_retired_rings()
+        /// to finish; committed slot refs are recovered by
+        /// reclaim_orphaned_slots(). Returns the number of rings reclaimed.
+        ///
+        /// Residual: a subscriber that crashes in the few instructions between
+        /// winning the claim CAS and recording its pid leaves owner_pid == 0,
+        /// which this cannot attribute and so will not reclaim.
+        std::size_t reclaim_dead_rings();
 
         /// Runtime counter snapshot — safe under live traffic.
         ///

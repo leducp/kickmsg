@@ -24,9 +24,7 @@
 /// check works the same way across process boundaries because the
 /// descriptor lives in shared memory.
 
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <iostream>
 #include <string>
 

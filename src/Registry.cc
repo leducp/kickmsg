@@ -1,7 +1,6 @@
 #include "kickmsg/Registry.h"
 
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -77,6 +76,17 @@ namespace kickmsg
                     {
                         throw std::runtime_error(
                             "Registry version mismatch on " + name);
+                    }
+                    // capacity is read from shared memory and drives every
+                    // entries[0..capacity) walk; a corrupt value would send
+                    // snapshot()/sweep_stale() off the mapping. Bound it
+                    // (overflow-safe) against the actual segment size.
+                    std::size_t avail = shm.size() - sizeof(RegistryHeader);
+                    if (shm.size() < sizeof(RegistryHeader)
+                        or h->capacity > avail / sizeof(ParticipantEntry))
+                    {
+                        throw std::runtime_error(
+                            "Registry capacity exceeds segment on " + name);
                     }
                     Registry out;
                     out.name_ = name;

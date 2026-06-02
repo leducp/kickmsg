@@ -1,12 +1,9 @@
 #ifndef KICKMSG_SUBSCRIBER_H
 #define KICKMSG_SUBSCRIBER_H
 
-#include <optional>
-#include <vector>
 
 #include "kickmsg/types.h"
 #include "kickmsg/Region.h"
-#include "kickmsg/os/Futex.h"
 
 namespace kickmsg
 {

@@ -1,6 +1,6 @@
 #include "kickmsg/Publisher.h"
-
-#include <cstring>
+#include "kickmsg/os/Futex.h"
+#include "kickmsg/os/Time.h"
 
 namespace kickmsg
 {
@@ -208,7 +208,13 @@ namespace kickmsg
             ring->state_flight.fetch_sub(ring::IN_FLIGHT_ONE,
                                          std::memory_order_release);
 
-            // Conditional wake: skip the syscall when no subscriber is blocking.
+            // seq_cst fence orders the write_pos fetch_add before the
+            // has_waiter load: without it a weakly-ordered CPU can read
+            // has_waiter == 0 stale and skip the wake to a subscriber already
+            // parked in futex_wait (a lost wakeup until its timeout). Pairs
+            // with the subscriber's fence. x86's locked RMW already fences,
+            // which is why this never surfaced on x86.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             if (ring->has_waiter.load(std::memory_order_relaxed))
             {
                 futex_wake_all(ring->write_pos);
@@ -278,6 +284,12 @@ namespace kickmsg
 
     void Publisher::release_slot(uint32_t idx)
     {
+        // idx is read from a ring entry a peer wrote; a crashed or hostile
+        // publisher can leave it out of range (this also covers INVALID_SLOT).
+        if (idx >= header_->pool_size)
+        {
+            return;
+        }
         auto*    s    = slot_at(base_, header_, idx);
         uint32_t prev = s->refcount.fetch_sub(1, std::memory_order_acq_rel);
         if (prev == 1)

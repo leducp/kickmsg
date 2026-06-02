@@ -3,7 +3,6 @@
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
-#include <cstring>
 
 class PublisherTest : public ::testing::Test
 {

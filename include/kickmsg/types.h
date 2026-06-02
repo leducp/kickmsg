@@ -20,7 +20,7 @@ namespace kickmsg
         "Kickmsg requires lock-free 32-bit atomics.");
 
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
-    constexpr uint32_t    VERSION         = 5;
+    constexpr uint32_t    VERSION         = 6;
     constexpr uint32_t    INVALID_SLOT    = UINT32_MAX;
     constexpr uint64_t    LOCKED_SEQUENCE = UINT64_MAX;
     constexpr std::size_t CACHE_LINE      = 64;
@@ -248,15 +248,20 @@ namespace kickmsg
     struct SubRingHeader
     {
         alignas(CACHE_LINE) std::atomic<uint32_t> state_flight; ///< Packed [in_flight:30 | state:2]
+        std::atomic<uint64_t> owner_pid;                        ///< Claiming subscriber's pid; 0 when Free (liveness recovery)
+        std::atomic<uint64_t> owner_starttime;                  ///< owner_pid's start time; pid-reuse guard for reclaim_dead_rings
         alignas(CACHE_LINE) std::atomic<uint64_t> write_pos;    ///< Monotonically increasing position counter
         std::atomic<uint32_t> has_waiter;                       ///< Set by subscriber before futex_wait
         std::atomic<uint64_t> dropped_count;                    ///< Cumulative publisher drops on this ring (all publishers)
         std::atomic<uint64_t> lost_count;                       ///< Cumulative subscriber losses on this ring (all subscribers)
     };
+    // owner_pid/owner_starttime live in state_flight's cache-line padding, so
+    // the struct stays 2 lines and the ring-stride math is unchanged. They are
+    // cold (written once on claim, read only by reclaim_dead_rings), so sharing
+    // the line with the hot state_flight costs nothing in steady state.
     static_assert(sizeof(SubRingHeader) == 2 * CACHE_LINE,
-        "SubRingHeader must stay 2 cache lines — the counter fields fit in "
-        "the existing write_pos line padding; expanding this struct requires "
-        "reconsidering ring-stride math in Region.cc");
+        "SubRingHeader must stay 2 cache lines — expanding it past the "
+        "write_pos line padding requires reconsidering ring-stride math in Region.cc");
 
     /// Slot header: prepended to each payload buffer in the pool.
     /// Packed to guarantee binary layout across compilers.

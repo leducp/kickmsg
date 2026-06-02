@@ -24,13 +24,8 @@
 /// is entirely policy.  Replace it with whatever fits the deployment
 /// (timeout, exponential backoff, futex, etc).
 
-#include <atomic>
-#include <chrono>
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <iostream>
-#include <string>
 #include <thread>
 
 #include <kickmsg/Hash.h>

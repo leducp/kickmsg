@@ -289,6 +289,18 @@ free_top [gen:17 | idx:3]
 - **Push** (release a slot): CAS `free_top` from `[gen|head]` to
   `[gen+1|slot]` after setting `slot.next = head`.
 
+**Accepted ABA bound.** The generation is 32-bit, so the ABA window is not
+formally closed: it requires a thread to read `free_top`, stall, and then
+have exactly 2^32 push/pop operations complete (returning the head to the
+same `[gen|idx]`) before it resumes its CAS. At realistic pool churn that is
+on the order of tens of seconds of uninterrupted contention landing inside a
+single preemption of one thread -- astronomically unlikely, and no real
+workload approaches it. We accept this rather than pay for a 128-bit DWCAS
+(`cmpxchg16b` / `LDXP`-`STXP`), which is not lock-free in the `std::atomic`
+sense on every target and costs on the hot alloc/free path. If a future
+target makes the window reachable, widen `free_top` to a 128-bit tagged
+pointer (a `VERSION` bump).
+
 
 ## Subscriber Ring
 
@@ -510,18 +522,18 @@ Publisher
    |                                in_flight == 0.
    |
    '-- if has_waiter:               Conditional wake: skip the syscall
-         futex_wake_all(write_pos)  when no subscriber is blocking.
-                                    has_waiter uses relaxed ordering on
-                                    both sides (publisher load, subscriber
-                                    store). This can race: the publisher
-                                    may not see has_waiter=1 if the
-                                    subscriber just set it. But the race
-                                    is benign — futex_wait(write_pos, cur)
-                                    checks *addr != expected atomically
-                                    in the kernel; if write_pos already
-                                    advanced, it returns immediately.
-                                    Worst case: one unnecessary round-trip
-                                    through futex (not a lost wake).
+         futex_wake_all(write_pos)  when no subscriber is blocking. A
+                                    seq_cst fence precedes the has_waiter
+                                    load and pairs with one before the
+                                    subscriber's futex_wait, ordering the
+                                    write_pos fetch_add ahead of the load.
+                                    This is a Dekker StoreLoad pair: with
+                                    relaxed ordering alone a weakly-ordered
+                                    CPU could read has_waiter == 0 stale
+                                    and drop the wake to an already-parked
+                                    subscriber (lost wakeup until timeout).
+                                    x86's locked RMW fences implicitly;
+                                    ARM does not, hence the explicit fence.
 
 5. Batch excess: fetch_sub(excess) on slot refcount.
    One atomic RMW for all non-delivered rings, instead of N
@@ -1000,11 +1012,16 @@ auto report = region.diagnose();
 // report.locked_entries:  entries stuck at LOCKED_SEQUENCE
 // report.retired_rings:   Free rings with stale in_flight > 0
 // report.draining_rings:  Draining rings with in_flight > 0 (usually transient)
+// report.dead_rings:      Live/Draining rings whose owner process is gone
 // report.live_rings:      active subscriber rings
 
 // Safe under live traffic — repairs poisoned ring entries.
 // Can be called freely on a health-check timer.
 std::size_t repaired = region.repair_locked_entries();
+
+// Reclaims rings whose owning subscriber process has died. Safe under
+// live traffic: only provably-dead owners (pid + start time) are touched.
+std::size_t dead = region.reclaim_dead_rings();
 
 // Resets retired rings (Free | in_flight>0) so new subscribers can
 // claim them. Only safe after confirming the crashed publisher is gone.
@@ -1023,10 +1040,21 @@ periodically; persistent nonzero counts signal recovery is needed.
 `INVALID_SLOT`. Safe under live traffic (benign double-store if a
 slow publisher commits at the same time). Can run on a timer.
 
+**`reclaim_dead_rings()`** — reclaims `Live`/`Draining` rings whose
+owning subscriber process has died, identified by the `owner_pid` +
+`owner_starttime` recorded on the ring at claim time and checked
+against the OS (same liveness test as `Registry::sweep_stale`). Safe
+under live traffic: a slow-but-alive subscriber is never touched.
+`in_flight` is preserved (a mid-commit publisher must still
+`fetch_sub`), so a reclaimed ring with leftover `in_flight` lands in
+the retired state for `reset_retired_rings()` to finish.
+
 **`reset_retired_rings()`** — resets stuck rings (`Free | in_flight>0`
 → `Free | in_flight=0`). Only safe after confirming the crashed
 publisher is gone. Unlike `repair_locked_entries()`, this is a
-deliberate post-crash action.
+deliberate post-crash action. For a dead *subscriber* prefer
+`reclaim_dead_rings()`, which is liveness-checked and cannot underflow
+`in_flight` against a slow publisher.
 
 **`reclaim_orphaned_slots()`** — walks all rings to build a
 referenced-slot set, then frees any unreferenced slot with
@@ -1038,14 +1066,45 @@ quiesced and no outstanding `SampleView` objects.
 ```
 1. diagnose() → persistent nonzero counts (check twice, gap > commit_timeout)
 2. repair_locked_entries()          — safe under live traffic
-3. reset_retired_rings()            — after confirming crashed publisher is gone
-4. (optional) pause all publishers
-5. reclaim_orphaned_slots()         — requires quiescence
-6. resume publishers
+3. reclaim_dead_rings()             — safe under live traffic (dead subscribers)
+4. reset_retired_rings()            — after confirming crashed publisher is gone
+5. (optional) pause all publishers
+6. reclaim_orphaned_slots()         — requires quiescence
+7. resume publishers
 ```
 
-Steps 4–6 are only needed if the pool is exhausted from leaked slots.
-In most cases, steps 2–3 restore the channel to full operation.
+Steps 5–7 are only needed if the pool is exhausted from leaked slots.
+In most cases, steps 2–4 restore the channel to full operation.
+
+### Recovery limits and residual windows
+
+The recovery primitives close the common crash classes but have a few
+documented edges, all bounded:
+
+- **`reclaim_orphaned_slots()` is not crash-safe mid-pass.** It resets a
+  slot's refcount to 0 and pushes it to the free stack as two separate
+  stores. If the *recovering* process is killed between them, the slot is
+  neither referenced nor free-listed (refcount 0), and a re-run skips it
+  (the `refcount > 0` guard no longer matches) — a permanent leak of that
+  one slot. Run recovery from a supervisor that is not itself under the
+  OOM/kill pressure that triggered recovery.
+
+- **`reset_retired_rings()` trusts the operator.** It zeroes `in_flight`;
+  if called while a misclassified slow-but-alive publisher still owes a
+  `fetch_sub`, that decrement underflows the packed counter into the state
+  bits. It is a post-crash-only action. For a dead *subscriber*,
+  `reclaim_dead_rings()` is the liveness-checked alternative and avoids
+  this entirely.
+
+- **Claim-window residual (rings and registry).** Liveness recovery keys on
+  an owner identity (`owner_pid` for rings, `pid` for registry entries)
+  recorded *after* the claiming CAS. A process that crashes in the few
+  instructions between winning the CAS and recording its pid leaves the
+  slot owned by pid 0 — unattributable, so neither `reclaim_dead_rings()`
+  nor `sweep_stale()` reclaims it. The window is a handful of instructions
+  and closing it fully would need a separate intent log; in practice the
+  slot is lost only on a crash landing in that exact gap, and the pool /
+  registry tolerate many such losses before exhaustion.
 
 
 ## ABA Safety

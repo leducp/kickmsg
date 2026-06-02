@@ -3,7 +3,6 @@
 
 #include "kickmsg/types.h"
 #include "kickmsg/Region.h"
-#include "kickmsg/os/Futex.h"
 
 namespace kickmsg
 {
