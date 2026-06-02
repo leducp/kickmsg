@@ -1,11 +1,16 @@
 #ifndef KICKMSG_NAMING_H
 #define KICKMSG_NAMING_H
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace kickmsg
 {
+    /// Lowercase 16-char hex representation of a 64-bit value, zero-padded.
+    std::string to_hex(uint64_t v);
+
+
     /// Sanitize a user-supplied name component (namespace / topic / channel /
     /// owner / tag) into something POSIX shm_open will accept.
     ///
@@ -29,6 +34,13 @@ namespace kickmsg
     /// like "/prefix_" that silently collide across callers.  \p what is
     /// interpolated into the exception message ("namespace", "topic", etc.).
     std::string sanitize_shm_component(std::string_view s, char const* what);
+
+    /// Compose the final shm name from a sanitized namespace and suffix.
+    /// macOS: "/" + hex(fnv1a64(ns)) + hex(fnv1a64(suffix)), capped at
+    /// PSHMNAMLEN - 1.  Linux: "/" + ns + "_" + suffix, throws
+    /// std::system_error(ENAMETOOLONG) past NAME_MAX.
+    std::string compose_shm_name(std::string_view sanitized_namespace,
+                                 std::string_view sanitized_suffix);
 }
 
 #endif

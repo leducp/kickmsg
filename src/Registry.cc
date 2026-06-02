@@ -19,8 +19,9 @@ namespace kickmsg
 
     std::string Registry::make_shm_name(std::string const& kmsg_namespace)
     {
-        return "/" + sanitize_shm_component(kmsg_namespace, "namespace")
-             + "_registry";
+        return compose_shm_name(
+            sanitize_shm_component(kmsg_namespace, "namespace"),
+            "registry");
     }
 
     RegistryHeader* Registry::header()

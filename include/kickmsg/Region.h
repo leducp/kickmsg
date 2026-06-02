@@ -65,8 +65,36 @@ namespace kickmsg
 
         SharedRegion(SharedRegion const&) = delete;
         SharedRegion& operator=(SharedRegion const&) = delete;
-        SharedRegion(SharedRegion&&) noexcept = default;
-        SharedRegion& operator=(SharedRegion&&) noexcept = default;
+
+        // Hand-written move ops so the moved-from object's base_/size_
+        // are reset to a default-constructed state.  A defaulted move
+        // would leave them aliasing the destination's live memory —
+        // base() on the moved-from object would silently return a
+        // dangling-looking-live pointer instead of nullptr.
+        SharedRegion(SharedRegion&& other) noexcept
+            : shm_{std::move(other.shm_)}
+            , name_{std::move(other.name_)}
+            , base_{other.base_}
+            , size_{other.size_}
+        {
+            other.base_ = nullptr;
+            other.size_ = 0;
+        }
+
+        SharedRegion& operator=(SharedRegion&& other) noexcept
+        {
+            if (this != &other)
+            {
+                shm_   = std::move(other.shm_);
+                name_  = std::move(other.name_);
+                base_  = other.base_;
+                size_  = other.size_;
+                other.base_ = nullptr;
+                other.size_ = 0;
+            }
+            return *this;
+        }
+
         ~SharedRegion() = default;
 
         static SharedRegion create(char const* name, channel::Type type,
@@ -85,13 +113,44 @@ namespace kickmsg
                                            channel::Config const& cfg,
                                            char const* creator_name = "");
 
+        /// Number of bytes the caller must provide to back a region with
+        /// this config and creator name.  The address passed to
+        /// attach_create() must be at least CACHE_LINE aligned and span
+        /// at least this many bytes.
+        static std::size_t required_size(channel::Config const& cfg,
+                                         char const* creator_name = "");
+
+        /// Stamp a fresh region into caller-provided memory.  The library
+        /// does not take ownership: the caller's buffer must outlive the
+        /// returned SharedRegion and any Publisher/Subscriber attached to
+        /// it.  unlink() is a no-op on the returned region.  `label`, if
+        /// non-empty, is surfaced via info().shm_name for logging.
+        ///
+        /// Throws if address is not CACHE_LINE aligned or size is less
+        /// than required_size(cfg, creator_name).
+        static SharedRegion attach_create(void* address, std::size_t size,
+                                          channel::Type type,
+                                          channel::Config const& cfg,
+                                          char const* creator_name = "",
+                                          char const* label = "");
+
+        /// Attach to caller-provided memory that already contains a valid
+        /// region (validates MAGIC + VERSION, and that size is at least
+        /// the embedded total_size).  No ownership taken; unlink() is a
+        /// no-op.  `label` is surfaced via info().shm_name for logging.
+        ///
+        /// Throws if address is not CACHE_LINE aligned, magic/version do
+        /// not match, or size is smaller than the embedded total_size.
+        static SharedRegion attach_open(void* address, std::size_t size,
+                                        char const* label = "");
+
         void unlink();
 
-        void*       base()       { return shm_.address(); }
-        void const* base() const { return shm_.address(); }
+        void*       base()       { return base_; }
+        void const* base() const { return base_; }
 
-        Header*       header()       { return static_cast<Header*>(shm_.address()); }
-        Header const* header() const { return static_cast<Header const*>(shm_.address()); }
+        Header*       header()       { return static_cast<Header*>(base_); }
+        Header const* header() const { return static_cast<Header const*>(base_); }
 
         channel::Type channel_type() const { return header()->channel_type; }
 
@@ -228,6 +287,8 @@ namespace kickmsg
 
         SharedMemory shm_;
         std::string  name_;
+        void*        base_{nullptr};
+        std::size_t  size_{0};
     };
 }
 

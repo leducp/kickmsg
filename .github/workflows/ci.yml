@@ -32,6 +32,11 @@ jobs:
             label: benchmarks
             configure_args: "--with=benchmarks"
 
+          # macOS (Apple Silicon)
+          - os: macos-14
+            label: macos-tests
+            configure_args: "--with=unit_tests --with=examples"
+
           # Windows
           - os: windows-latest
             label: windows
@@ -40,8 +45,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-conan
 
-      - name: Configure and build (Linux)
-        if: runner.os == 'Linux'
+      - name: Configure and build (POSIX)
+        if: runner.os != 'Windows'
         run: |
           scripts/configure.sh build ${{ matrix.configure_args }}
           scripts/setup_build.sh build --build-type ${{ env.BUILD_TYPE }}

@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -127,6 +128,208 @@ namespace kickmsg
         h->magic.store(MAGIC, std::memory_order_release);
     }
 
+    namespace
+    {
+        /// Validate that an already-attached Header has internally
+        /// consistent geometry.
+        ///
+        /// Threat model.  attach_open() lets the caller hand kickmsg
+        /// arbitrary bytes.  validate_opened()'s magic/version/total_size
+        /// checks filter obvious garbage, but every other Header field
+        /// (offsets, strides, counts, lengths) is then used unchecked by
+        /// Publisher, Subscriber, info(), diagnose(), stats() and the
+        /// repair paths to compute pointers into the buffer.  A buffer
+        /// whose first 24 bytes happen to satisfy the trio but whose
+        /// geometry fields are junk (corruption, crash residue, hostile
+        /// input, a region produced by a different kickmsg build) would
+        /// cause those callers to compute wild pointers — at best SEGV
+        /// on first publish, at worst silent OOB reads via info()'s
+        /// std::string::assign(tail, creator_name_len) or sub_ring_at()
+        /// stride math.
+        ///
+        /// This function applies the invariants compute_layout() and
+        /// stamp_new_region() always satisfy: a region kickmsg itself
+        /// stamps ALWAYS passes.  Only corrupt or hostile input can fail
+        /// it.  Cheap (a handful of integer compares, no syscalls), runs
+        /// once at attach, never on the hot path.
+        ///
+        /// shm-backed open() runs this too — defense in depth in case a
+        /// peer process writes garbage into the segment after stamping,
+        /// or a stale segment is reused across version bumps.
+        void validate_header_geometry(Header const* h)
+        {
+            // Pre: validate_opened() has already ensured
+            //   - buffer_size >= sizeof(Header)
+            //   - h->magic == MAGIC, h->version == VERSION
+            //   - buffer_size >= h->total_size
+            // Every offset comparison below uses h->total_size as the
+            // trusted upper bound; we re-check it here in case total_size
+            // itself is junk smaller than the struct.
+            if (h->total_size < sizeof(Header))
+            {
+                throw std::runtime_error(
+                    "Header geometry: total_size smaller than Header");
+            }
+
+            // No zero counts or strides — divide-by-zero protection for
+            // the bound checks below depends on these, and stamp_new_region
+            // never produces a zero here.
+            if (h->max_subs == 0 or h->pool_size == 0
+                or h->slot_data_size == 0 or h->sub_ring_capacity == 0
+                or h->slot_stride == 0    or h->sub_ring_stride == 0)
+            {
+                throw std::runtime_error(
+                    "Header geometry: zero-cardinality field");
+            }
+
+            if (not is_power_of_two(h->sub_ring_capacity))
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_capacity not a power of 2");
+            }
+            if (h->sub_ring_mask != h->sub_ring_capacity - 1)
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_mask inconsistent with capacity");
+            }
+
+            // creator_name tail bytes live at offset sizeof(Header).
+            if (h->creator_name_len > h->total_size - sizeof(Header))
+            {
+                throw std::runtime_error(
+                    "Header geometry: creator_name_len exceeds region");
+            }
+
+            // Sub-rings span [sub_rings_offset, pool_offset); pool spans
+            // [pool_offset, total_size).
+            if (h->sub_rings_offset < sizeof(Header)
+                or h->sub_rings_offset >= h->pool_offset
+                or h->pool_offset >= h->total_size)
+            {
+                throw std::runtime_error(
+                    "Header geometry: ring/pool offsets out of range");
+            }
+
+            // Bound sub_ring_capacity by total_size before multiplying so
+            // the min_ring_stride product can't overflow on a junk value.
+            if (h->sub_ring_capacity > h->total_size / sizeof(Entry))
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_capacity exceeds region");
+            }
+            std::size_t const min_ring_stride =
+                sizeof(SubRingHeader) + h->sub_ring_capacity * sizeof(Entry);
+            if (h->sub_ring_stride < min_ring_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: sub_ring_stride too small");
+            }
+            std::size_t const min_slot_stride =
+                sizeof(SlotHeader) + h->slot_data_size;
+            if (h->slot_stride < min_slot_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: slot_stride too small");
+            }
+
+            // max_subs * sub_ring_stride must fit in the rings region.
+            // Division-based bound avoids mul-overflow on a junk max_subs.
+            std::size_t const rings_space = h->pool_offset - h->sub_rings_offset;
+            if (h->max_subs > rings_space / h->sub_ring_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: subscriber rings overflow pool_offset");
+            }
+
+            // pool_size * slot_stride must fit in the pool region.
+            std::size_t const pool_space = h->total_size - h->pool_offset;
+            if (h->pool_size > pool_space / h->slot_stride)
+            {
+                throw std::runtime_error(
+                    "Header geometry: slot pool overflow total_size");
+            }
+        }
+
+        // Validate an already-mapped region: throws on a buffer too small
+        // to even hold a Header, bad magic, bad version, buffer too small
+        // for the embedded total_size, or geometry fields that would make
+        // downstream pointer math wild.
+        void validate_opened(void* address, std::size_t size)
+        {
+            if (size < sizeof(Header))
+            {
+                throw std::runtime_error(
+                    "Buffer smaller than region Header");
+            }
+            auto* h = static_cast<Header*>(address);
+            if (h->magic.load(std::memory_order_acquire) != MAGIC)
+            {
+                throw std::runtime_error("Invalid shared memory (bad magic)");
+            }
+            if (h->version != VERSION)
+            {
+                throw std::runtime_error("Version mismatch");
+            }
+            if (size < h->total_size)
+            {
+                throw std::runtime_error(
+                    "Buffer smaller than embedded region total_size");
+            }
+            validate_header_geometry(h);
+        }
+    }
+
+    std::size_t SharedRegion::required_size(channel::Config const& cfg,
+                                            char const* creator_name)
+    {
+        validate_config(channel::PubSub, cfg);
+        return compute_layout(cfg, creator_name).total_size;
+    }
+
+    SharedRegion SharedRegion::attach_create(void* address, std::size_t size,
+                                             channel::Type type,
+                                             channel::Config const& cfg,
+                                             char const* creator_name,
+                                             char const* label)
+    {
+        validate_config(type, cfg);
+        if (reinterpret_cast<std::uintptr_t>(address) % CACHE_LINE != 0)
+        {
+            throw std::runtime_error("attach_create: address not CACHE_LINE aligned");
+        }
+        RegionLayout layout = compute_layout(cfg, creator_name);
+        if (size < layout.total_size)
+        {
+            throw std::runtime_error("attach_create: buffer smaller than required_size");
+        }
+
+        SharedRegion region;
+        region.base_ = address;
+        region.size_ = size;
+        region.name_ = label;
+        region.stamp_new_region(type, cfg, creator_name,
+                                layout.total_size, layout.sub_rings_offset,
+                                layout.pool_offset, layout.ring_stride,
+                                layout.slot_stride, layout.creator_len);
+        return region;
+    }
+
+    SharedRegion SharedRegion::attach_open(void* address, std::size_t size,
+                                           char const* label)
+    {
+        if (reinterpret_cast<std::uintptr_t>(address) % CACHE_LINE != 0)
+        {
+            throw std::runtime_error("attach_open: address not CACHE_LINE aligned");
+        }
+
+        SharedRegion region;
+        region.base_ = address;
+        region.size_ = size;
+        region.name_ = label;
+        validate_opened(region.base_, region.size_);
+        return region;
+    }
+
     SharedRegion SharedRegion::create(char const* name, channel::Type type,
                                      channel::Config const& cfg,
                                      char const* creator_name)
@@ -137,6 +340,8 @@ namespace kickmsg
         SharedRegion region;
         region.name_ = name;
         region.shm_.create(name, layout.total_size);
+        region.base_ = region.shm_.address();
+        region.size_ = layout.total_size;
         region.stamp_new_region(type, cfg, creator_name,
                                 layout.total_size, layout.sub_rings_offset,
                                 layout.pool_offset, layout.ring_stride,
@@ -149,17 +354,9 @@ namespace kickmsg
         SharedRegion region;
         region.name_ = name;
         region.shm_.open(name);
-
-        auto* h = region.header();
-        if (h->magic.load(std::memory_order_acquire) != MAGIC)
-        {
-            throw std::runtime_error("Invalid shared memory (bad magic)");
-        }
-        if (h->version != VERSION)
-        {
-            throw std::runtime_error("Version mismatch");
-        }
-
+        region.base_ = region.shm_.address();
+        region.size_ = region.shm_.size();
+        validate_opened(region.base_, region.size_);
         return region;
     }
 
@@ -181,6 +378,8 @@ namespace kickmsg
         region.name_ = name;
         if (region.shm_.try_create(name, layout.total_size))
         {
+            region.base_ = region.shm_.address();
+            region.size_ = layout.total_size;
             region.stamp_new_region(type, cfg, creator_name,
                                     layout.total_size, layout.sub_rings_offset,
                                     layout.pool_offset, layout.ring_stride,
@@ -208,6 +407,8 @@ namespace kickmsg
                     SharedRegion region;
                     region.name_ = name;
                     region.shm_  = std::move(shm);
+                    region.base_ = region.shm_.address();
+                    region.size_ = region.shm_.size();
                     return region;
                 }
                 // SHM exists but magic/version not ready yet — creator
@@ -223,7 +424,17 @@ namespace kickmsg
 
     void SharedRegion::unlink()
     {
-        if (not name_.empty())
+        // Release the OS-level name backing this region.  Existing
+        // mappings — this process and every peer that already opened
+        // the region — keep working until their last reference drops;
+        // only the region's discoverability by name is affected.  Any
+        // holder, creator or opener, may call this.  Future open-by-
+        // name behaviour is OS-dependent and intentionally left to the
+        // backend.
+        //
+        // Skipped for injected regions (shm_ never opened): the caller
+        // owns the memory; kickmsg has no OS-level name to release.
+        if (shm_.is_open() and not name_.empty())
         {
             SharedMemory::unlink(name_);
         }

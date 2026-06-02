@@ -1,9 +1,14 @@
+#include <limits.h>
 #include <stdexcept>
 #include <string>
 
 #include <gtest/gtest.h>
 
 #include "kickmsg/Naming.h"
+
+#if defined(__APPLE__) || defined(__DARWIN__)
+    #include <sys/posix_shm.h>
+#endif
 
 using kickmsg::sanitize_shm_component;
 
@@ -117,3 +122,82 @@ TEST(SanitizeShmComponent, WhatIsIncludedInErrorMessage)
         EXPECT_NE(msg.find("namespace"), std::string::npos) << msg;
     }
 }
+
+// --- compose_shm_name ----------------------------------------------------
+
+using kickmsg::compose_shm_name;
+
+TEST(ComposeShmName, FitsPlatformLimit)
+{
+    auto name = compose_shm_name("ns", "topic");
+    ASSERT_FALSE(name.empty());
+    EXPECT_EQ(name[0], '/');
+#if defined(__APPLE__) || defined(__DARWIN__)
+    EXPECT_LE(name.size(), static_cast<std::size_t>(PSHMNAMLEN) - 1);
+#else
+    EXPECT_LE(name.size() - 1, static_cast<std::size_t>(NAME_MAX));
+#endif
+}
+
+TEST(ComposeShmName, Deterministic)
+{
+    // Same inputs must always produce the same shm name — peers in
+    // different processes need to agree on the name.
+    auto a = compose_shm_name("demo", "temperature");
+    auto b = compose_shm_name("demo", "temperature");
+    EXPECT_EQ(a, b);
+}
+
+TEST(ComposeShmName, DistinctNamespacesProduceDistinctNames)
+{
+    // Two namespaces with the same suffix must NOT collide — that would
+    // let a process in namespace "alpha" stomp on namespace "beta"'s
+    // region.
+    auto a = compose_shm_name("alpha", "temperature");
+    auto b = compose_shm_name("beta",  "temperature");
+    EXPECT_NE(a, b);
+}
+
+TEST(ComposeShmName, DistinctSuffixesProduceDistinctNames)
+{
+    auto a = compose_shm_name("demo", "temperature");
+    auto b = compose_shm_name("demo", "pressure");
+    EXPECT_NE(a, b);
+}
+
+TEST(ComposeShmName, FitsEvenWhenInputsAreLong)
+{
+    std::string long_ns(80,  'a');
+    std::string long_sx(120, 'b');
+#if defined(__APPLE__) || defined(__DARWIN__)
+    auto name = compose_shm_name(long_ns, long_sx);
+    EXPECT_LE(name.size(), static_cast<std::size_t>(PSHMNAMLEN) - 1);
+#else
+    EXPECT_NO_THROW(compose_shm_name(long_ns, long_sx));
+#endif
+}
+
+#if !defined(__APPLE__) && !defined(__DARWIN__)
+TEST(ComposeShmName, ThrowsOnLinuxWhenExceedingNameMax)
+{
+    // Linux: pre-composed name longer than NAME_MAX must throw clearly
+    // (system_error/ENAMETOOLONG) instead of silently truncating or
+    // failing inside shm_open with an opaque OS error.
+    std::string ns(200, 'n');
+    std::string sx(200, 's');
+    EXPECT_THROW(compose_shm_name(ns, sx), std::system_error);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__DARWIN__)
+TEST(ComposeShmName, HashFormOnMacOS)
+{
+    // On macOS the composed name is hash-only (no embedded plaintext).
+    // Pin the shape so a future refactor doesn't accidentally regress
+    // back to a readable form that overflows PSHMNAMLEN.
+    auto name = compose_shm_name("ns", "topic");
+    EXPECT_EQ(name[0], '/');
+    EXPECT_EQ(name.find("ns"),    std::string::npos);
+    EXPECT_EQ(name.find("topic"), std::string::npos);
+}
+#endif
