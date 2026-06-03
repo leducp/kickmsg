@@ -1,4 +1,5 @@
 #include "common.h"
+#include "../shm_cleanup.h"
 #include "kickmsg/version.h"
 
 #include <argparse/argparse.hpp>
@@ -55,6 +56,18 @@ int main(int argc, char** argv)
                 static_cast<unsigned>(g_oversub_pct),
                 std::thread::hardware_concurrency(),
                 static_cast<unsigned>(contention_count()));
+
+    // Unlink the scenario segments if interrupted (Ctrl-C / kill), so a killed
+    // run leaves a clean /dev/shm.  Keep in sync with the scenarios' shm_name.
+    for (char const* name : {"/kickmsg_treiber_stress", "/kickmsg_churn_test",
+                             "/kickmsg_gc_test", "/kickmsg_fairness_test",
+                             "/kickmsg_stress_test", "/kickmsg_pool_exhaustion",
+                             "/kickmsg_live_repair", "/kickmsg_single_slot_ring",
+                             "/kickmsg_sub_saturation"})
+    {
+        kickmsg_test::register_cleanup_shm(name);
+    }
+    kickmsg_test::install_signal_cleanup();
 
     TestRunner runner;
 

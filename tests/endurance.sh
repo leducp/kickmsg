@@ -38,8 +38,10 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
     fi
     SUMMARY=$(echo "$OUTPUT" | grep "Summary:" | tail -1 || true)
     if [ -n "$SUMMARY" ]; then
-        RUN_PASS=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
-        RUN_FAIL=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')
+        # Guarded: a garbled/interleaved Summary line (possible under heavy
+        # sanitizer contention) must not let set -e kill the whole soak.
+        RUN_PASS=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || true)
+        RUN_FAIL=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || true)
     else
         # No summary line (e.g. crash test): tally by exit code.
         if [ "$RC" -eq 0 ]; then
@@ -53,15 +55,25 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
     RUN_PASS=${RUN_PASS:-0}
     RUN_FAIL=${RUN_FAIL:-0}
     RUN_REORDER=$(echo "$OUTPUT" | { grep -c "REORDER" || true; })
+    # Sanitizer reports (TSAN/ASAN/UBSAN) go to stderr and do NOT bump the
+    # suite's "failed" count -- detect them explicitly or they get swallowed.
+    RUN_SANITIZER=$(echo "$OUTPUT" | { grep -c -E "ThreadSanitizer|AddressSanitizer|runtime error:" || true; })
+    if [ "$RUN_SANITIZER" -gt 0 ] && [ "$RUN_FAIL" -eq 0 ]; then
+        RUN_FAIL=1
+    fi
     PASS=$((PASS + RUN_PASS))
     FAIL=$((FAIL + RUN_FAIL))
     REORDERS=$((REORDERS + RUN_REORDER))
     ELAPSED=$(($(date +%s) - END_TIME + DURATION_SECS))
-    printf "\r[%ds/%ds] runs=%d pass=%d fail=%d reorders=%d" \
-           "$ELAPSED" "$DURATION_SECS" "$RUNS" "$PASS" "$FAIL" "$REORDERS"
-    if [ "$RUN_FAIL" -gt 0 ]; then
+    printf "\r[%ds/%ds] runs=%d pass=%d fail=%d reorders=%d san=%d" \
+           "$ELAPSED" "$DURATION_SECS" "$RUNS" "$PASS" "$FAIL" "$REORDERS" "$RUN_SANITIZER"
+    if [ "$RUN_FAIL" -gt 0 ] || [ "$RC" -ne 0 ]; then
+        # Persist the full run output -- the evidence is otherwise lost.
+        FAILDIR="${FAILDIR:-endurance_fails}"
+        mkdir -p "$FAILDIR"
+        printf '%s\n' "$OUTPUT" > "$FAILDIR/run_${RUNS}_rc${RC}.log"
         echo ""
-        echo "$OUTPUT" | grep -E "REORDER|FAIL|WARN" || true
+        echo "$OUTPUT" | grep -E "REORDER|FAIL|WARN|ThreadSanitizer|runtime error:" || true
     fi
 done
 echo ""
