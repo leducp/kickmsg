@@ -16,7 +16,7 @@ namespace kickmsg
         if (fd_ < 0)
         {
             throw std::system_error(errno, std::system_category(),
-                                    "SharedMemory: shm_open(create)");
+                                    "SharedMemory: shm_open(create) '" + name + "'");
         }
         map(size);
     }

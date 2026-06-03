@@ -47,8 +47,8 @@ int main(int argc, char** argv)
     // Build stamp + resolved contention so a run is self-describing:
     // __DATE__/__TIME__ is this harness TU's compile time; the ABI version
     // confirms the layout; oversub/cores show the contention actually used.
-    std::printf("kickmsg %s | shm ABI v%u | harness built %s %s\n",
-                KICKMSG_VERSION_STRING,
+    std::printf("kickmsg %s (%s) | shm ABI v%u | harness built %s %s\n",
+                KICKMSG_VERSION_STRING, KICKMSG_GIT_DESCRIBE,
                 static_cast<unsigned>(kickmsg::VERSION),
                 __DATE__, __TIME__);
     std::printf("contention: %u%% of %u cores -> %u threads/side\n\n",

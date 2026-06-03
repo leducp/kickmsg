@@ -1,13 +1,21 @@
 #include "kickmsg/os/SharedMemory.h"
 
+#include <string>
 #include <system_error>
 
 namespace kickmsg
 {
-    static void throw_last_error(char const* context)
+    static void throw_last_error(char const* context, std::string const& name = "")
     {
+        // Append the mapping name so the failure points at the offending
+        // region rather than just naming the API call.
+        std::string msg = context;
+        if (not name.empty())
+        {
+            msg += " '" + name + "'";
+        }
         throw std::system_error(
-            static_cast<int>(GetLastError()), std::system_category(), context);
+            static_cast<int>(GetLastError()), std::system_category(), msg);
     }
 
     SharedMemory::SharedMemory(SharedMemory&& other) noexcept
@@ -68,7 +76,7 @@ namespace kickmsg
         fd_ = create_file_mapping(name, size);
         if (fd_ == INVALID_SHM_HANDLE)
         {
-            throw_last_error("SharedMemory: CreateFileMappingA(create)");
+            throw_last_error("SharedMemory: CreateFileMappingA(create)", name);
         }
         map(size);
     }
@@ -78,7 +86,7 @@ namespace kickmsg
         fd_ = create_file_mapping(name, size);
         if (fd_ == INVALID_SHM_HANDLE)
         {
-            throw_last_error("SharedMemory: CreateFileMappingA(try_create)");
+            throw_last_error("SharedMemory: CreateFileMappingA(try_create)", name);
         }
         if (GetLastError() == ERROR_ALREADY_EXISTS)
         {
@@ -94,7 +102,7 @@ namespace kickmsg
     {
         if (not try_open(name))
         {
-            throw_last_error("SharedMemory: OpenFileMappingA(open)");
+            throw_last_error("SharedMemory: OpenFileMappingA(open)", name);
         }
     }
 
@@ -107,7 +115,7 @@ namespace kickmsg
             {
                 return false;
             }
-            throw_last_error("SharedMemory: OpenFileMappingA(try_open)");
+            throw_last_error("SharedMemory: OpenFileMappingA(try_open)", name);
         }
 
         address_ = MapViewOfFile(fd_, FILE_MAP_ALL_ACCESS, 0, 0, 0);

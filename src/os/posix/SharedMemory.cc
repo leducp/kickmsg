@@ -14,9 +14,17 @@ namespace kickmsg
 {
     namespace
     {
-        [[noreturn]] void throw_system_error(char const* context)
+        [[noreturn]] void throw_system_error(char const* context,
+                                             std::string const& name = "")
         {
-            throw std::system_error(errno, std::system_category(), context);
+            // Append the shm name so the failure points at the offending
+            // region rather than just naming the syscall.
+            std::string msg = context;
+            if (not name.empty())
+            {
+                msg += " '" + name + "'";
+            }
+            throw std::system_error(errno, std::system_category(), msg);
         }
     }
 
@@ -85,7 +93,7 @@ namespace kickmsg
                 fd_ = INVALID_SHM_HANDLE;
                 return false;
             }
-            throw_system_error("SharedMemory: shm_open(try_create)");
+            throw_system_error("SharedMemory: shm_open(try_create)", name);
         }
         map(size);
         return true;
@@ -95,7 +103,7 @@ namespace kickmsg
     {
         if (not try_open(name))
         {
-            throw_system_error("SharedMemory: shm_open(open)");
+            throw_system_error("SharedMemory: shm_open(open)", name);
         }
     }
 
@@ -109,7 +117,7 @@ namespace kickmsg
                 fd_ = INVALID_SHM_HANDLE;
                 return false;
             }
-            throw_system_error("SharedMemory: shm_open(try_open)");
+            throw_system_error("SharedMemory: shm_open(try_open)", name);
         }
 
         struct stat st{};
