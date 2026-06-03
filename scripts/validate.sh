@@ -39,7 +39,7 @@ info "Platform: $(uname -s) $(uname -m)"
 
 step "Installing Conan dependencies → $BUILD_DIR"
 cd "$PROJECT_DIR"
-conan install conanfile.py -of="$BUILD_DIR" --build=missing -o unit_tests=True
+conan install conan/conanfile.py -of="$BUILD_DIR" --build=missing -o unit_tests=True
 
 step "Configuring CMake (Release, unit + crash tests)"
 cmake -S "$PROJECT_DIR" -B "$BUILD_PATH" \

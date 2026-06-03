@@ -76,6 +76,9 @@ target_include_directories(kickmsg
 
 target_link_libraries(kickmsg PUBLIC ${OS_LIBRARIES})
 
+# --- Version header (generated from git: cmake/version.cmake) ---
+include(cmake/version.cmake)
+
 # --- Install, pkg-config, find_package ---
 include(cmake/install.cmake)
 

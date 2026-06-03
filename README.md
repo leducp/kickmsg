@@ -187,7 +187,7 @@ for frame in diag.watch("/kickmsg_telemetry", interval=1.0):
 ```bash
 # Install dependencies
 pip install conan
-conan install conanfile.py -of=build --build=missing -o unit_tests=True
+conan install conan/conanfile.py -of=build --build=missing -o unit_tests=True
 
 # Configure and build
 cmake -S . -B build \
@@ -218,6 +218,10 @@ python examples/python/hello_schema.py
 python examples/python/cli_playground.py           # long-running, drive the `kickmsg` CLI against it
 ```
 
+To prove kickmsg works on your own hardware -- the validation ladder from a
+quick `ctest` gate to a multi-hour contention soak with a single
+`VERDICT: ALL CLEAN` -- see [tests/README.md](tests/README.md).
+
 ### As a subdirectory
 
 ```cmake
@@ -242,7 +246,7 @@ target_link_libraries(my_app PRIVATE kickmsg)
 | macOS | `shm_open` / `mmap` | `__ulock_wait` / `__ulock_wake` |
 | Windows | `CreateFileMapping` / `MapViewOfFile` | `WaitOnAddress` / `WakeByAddressAll` |
 
-Actively validated on Linux x86-64, Linux ARM64 (Raspberry Pi 4B, 12 h continuous stress), and Darwin ARM64 (Apple Silicon) via `scripts/validate.sh`.
+Actively validated on Linux x86-64, Linux ARM64 (Raspberry Pi 4B, 12 h continuous stress), and Darwin ARM64 (Apple Silicon, 12 h continuous stress: 2660 passes, 0 failures, 0 reorders) via `scripts/validate.sh` and `tests/endurance.sh`.
 
 ## Architecture
 

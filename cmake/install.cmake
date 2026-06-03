@@ -8,6 +8,11 @@ include(CMakePackageConfigHelpers)
 install(DIRECTORY include/kickmsg
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+# version.h is generated (cmake/version.cmake), not committed -- install it
+# alongside the committed headers.
+install(FILES ${KICKMSG_VERSION_H}
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kickmsg
+)
 
 # --- Library target + export ---
 set_target_properties(kickmsg PROPERTIES EXPORT_NAME kickmsg)
@@ -40,7 +45,7 @@ configure_package_config_file(
 
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/kickmsgConfigVersion.cmake
-    VERSION 1.0.0
+    VERSION ${KICKMSG_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 
