@@ -46,8 +46,16 @@ namespace kickmsg
                                             std::memory_order_relaxed);
                 ring->owner_pid.store(pid, std::memory_order_release);
                 ring_idx_  = i;
+                // Pre-CAS wp can be stale (no HB edge to the previous
+                // tenant): keep it as the drain floor, but consume from the
+                // freshest value or we'd replay the previous tenancy.
+                uint64_t wp2 = ring->write_pos.load(std::memory_order_acquire);
                 start_pos_ = wp;
-                read_pos_  = start_pos_;
+                read_pos_  = wp;
+                if (wp2 > wp)
+                {
+                    read_pos_ = wp2;
+                }
                 break;
             }
         }
@@ -67,7 +75,7 @@ namespace kickmsg
 
         auto* ring = sub_ring_at(base_, header_, ring_idx_);
 
-        // Transition Live → Draining, preserving in_flight count.
+        // Transition Live -> Draining, preserving in_flight count.
         uint32_t old = ring->state_flight.load(std::memory_order_acquire);
         while (true)
         {
@@ -102,7 +110,7 @@ namespace kickmsg
         if (quiesced)
         {
             drain_unconsumed(ring);
-            // in_flight == 0 — safe to store directly.
+            // in_flight == 0 -- safe to store directly.
             ring->state_flight.store(ring::make_packed(ring::Free),
                                      std::memory_order_release);
         }
@@ -207,10 +215,18 @@ namespace kickmsg
             uint64_t seq1 = e.sequence.load(std::memory_order_acquire);
             if (seq1 != read_pos_ + 1)
             {
-                if (seq1 == LOCKED_SEQUENCE or seq1 < read_pos_ + 1)
+                if (seq_is_skip(seq1) and seq_pos(seq1) == read_pos_ + 1)
                 {
-                    // Publisher is mid-commit (LOCKED_SEQUENCE) or has not
-                    // committed yet. Come back later.
+                    // Skip marker: metadata untrustworthy by design.
+                    ++lost_;
+                    ring->lost_count.fetch_add(1, std::memory_order_relaxed);
+                    ++read_pos_;
+                    continue;
+                }
+                if (seq_is_locked(seq1) or seq_pos(seq1) < read_pos_ + 1)
+                {
+                    // Publisher is mid-commit (position-tagged lock) or has
+                    // not committed yet. Come back later.
                     return std::nullopt;
                 }
                 // Entry was overwritten (seq > expected): advance and retry.
@@ -303,6 +319,7 @@ namespace kickmsg
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
         nanoseconds start = kickmsg::monotonic_ns();
 
+        int idle_spins = 0;
         while (true)
         {
             auto sample = try_receive();
@@ -316,15 +333,12 @@ namespace kickmsg
             {
                 return std::nullopt;
             }
+            nanoseconds remaining = timeout - elapsed;
 
             uint64_t cur = ring->write_pos.load(std::memory_order_relaxed);
             if (cur <= read_pos_)
             {
-                nanoseconds remaining = timeout - elapsed;
-                if (remaining <= 0ns)
-                {
-                    return std::nullopt;
-                }
+                idle_spins = 0;
                 ring->has_waiter.store(1, std::memory_order_relaxed);
                 // Pairs with the publisher's seq_cst fence: orders this store
                 // before futex_wait's kernel read of write_pos so a concurrent
@@ -332,6 +346,26 @@ namespace kickmsg
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 futex_wait(ring->write_pos, cur, remaining);
                 ring->has_waiter.store(0, std::memory_order_relaxed);
+            }
+            else
+            {
+                // Head claimed but uncommitted: no futex edge fires for the
+                // commit itself, so poll -- bounded, or a crashed publisher
+                // turns this into a hot spin for the whole timeout.
+                ++idle_spins;
+                if (idle_spins <= 64)
+                {
+                    kickmsg::yield();
+                }
+                else
+                {
+                    nanoseconds nap = 100us;
+                    if (remaining < nap)
+                    {
+                        nap = remaining;
+                    }
+                    kickmsg::sleep(nap);
+                }
             }
         }
     }
@@ -370,7 +404,14 @@ namespace kickmsg
             uint64_t seq1 = e.sequence.load(std::memory_order_acquire);
             if (seq1 != read_pos_ + 1)
             {
-                if (seq1 == LOCKED_SEQUENCE or seq1 < read_pos_ + 1)
+                if (seq_is_skip(seq1) and seq_pos(seq1) == read_pos_ + 1)
+                {
+                    ++lost_;
+                    ring->lost_count.fetch_add(1, std::memory_order_relaxed);
+                    ++read_pos_;
+                    continue;
+                }
+                if (seq_is_locked(seq1) or seq_pos(seq1) < read_pos_ + 1)
                 {
                     return std::nullopt;
                 }
@@ -447,6 +488,7 @@ namespace kickmsg
         auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
         nanoseconds start = kickmsg::monotonic_ns();
 
+        int idle_spins = 0;
         while (true)
         {
             auto sample = try_receive_view();
@@ -460,15 +502,12 @@ namespace kickmsg
             {
                 return std::nullopt;
             }
+            nanoseconds remaining = timeout - elapsed;
 
             uint64_t cur = ring->write_pos.load(std::memory_order_relaxed);
             if (cur <= read_pos_)
             {
-                nanoseconds remaining = timeout - elapsed;
-                if (remaining <= 0ns)
-                {
-                    return std::nullopt;
-                }
+                idle_spins = 0;
                 ring->has_waiter.store(1, std::memory_order_relaxed);
                 // Pairs with the publisher's seq_cst fence: orders this store
                 // before futex_wait's kernel read of write_pos so a concurrent
@@ -476,6 +515,26 @@ namespace kickmsg
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 futex_wait(ring->write_pos, cur, remaining);
                 ring->has_waiter.store(0, std::memory_order_relaxed);
+            }
+            else
+            {
+                // Head claimed but uncommitted: no futex edge fires for the
+                // commit itself, so poll -- bounded, or a crashed publisher
+                // turns this into a hot spin for the whole timeout.
+                ++idle_spins;
+                if (idle_spins <= 64)
+                {
+                    kickmsg::yield();
+                }
+                else
+                {
+                    nanoseconds nap = 100us;
+                    if (remaining < nap)
+                    {
+                        nap = remaining;
+                    }
+                    kickmsg::sleep(nap);
+                }
             }
         }
     }

@@ -24,19 +24,20 @@ bool run_fairness_test()
     auto region = kickmsg::SharedRegion::create(
         shm_name, kickmsg::channel::PubSub, cfg, "fairness");
 
+    g_subscribers_ready    = 0;
+    g_subscribers_expected = NUM_SUBS;
+
     std::vector<SubResult> results(NUM_SUBS);
     std::vector<std::thread> sub_threads;
 
     for (int i = 0; i < NUM_SUBS; ++i)
     {
-        sub_threads.emplace_back([&region, i, &results, NUM_MSGS]()
+        sub_threads.emplace_back([&region, i, &results]()
         {
             results[static_cast<std::size_t>(i)] =
                 subscriber_thread_copy(region, i, 1, NUM_MSGS);
         });
     }
-
-    kickmsg::sleep(10ms);
 
     std::thread pub_thread(publisher_thread, std::ref(region), 0, NUM_MSGS);
     pub_thread.join();
@@ -63,6 +64,17 @@ bool run_fairness_test()
                          r.sub_id, r.corrupted, r.bad_pub_id, r.reordered);
             ok = false;
         }
+
+        // Exact conservation: the readiness barrier means every ring is Live
+        // before the first send, and subscribers drain to completion.
+        uint64_t accounted = r.received + r.lost + r.corrupted + r.bad_pub_id + r.reordered;
+        if (accounted != NUM_MSGS)
+        {
+            std::fprintf(stderr, "  [FAIL] sub%d: received+lost+corrupt+bad_pid+reorder (%" PRIu64
+                         ") != total_sent (%u)!\n",
+                         r.sub_id, accounted, NUM_MSGS);
+            ok = false;
+        }
     }
 
     std::printf("  Received range: [%" PRIu64 ", %" PRIu64 "] (spread: %" PRIu64 ")\n",
@@ -74,17 +86,7 @@ bool run_fairness_test()
         ok = false;
     }
 
-    std::size_t repaired = region.repair_locked_entries();
-    if (repaired > 0)
-    {
-        std::printf("  GC repaired %zu locked entries\n", repaired);
-    }
-    std::size_t reclaimed = region.reclaim_orphaned_slots();
-    if (reclaimed > 0)
-    {
-        std::printf("  GC reclaimed %zu orphaned slots\n", reclaimed);
-    }
-
+    ok &= verify_gc_zero(region, cfg);
     ok &= verify_refcounts_zero(region, cfg);
     ok &= verify_pool_free(region, cfg);
     ok &= verify_rings_inactive(region, cfg);

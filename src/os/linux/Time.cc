@@ -1,5 +1,3 @@
-// Linux-specific sleep().  Other Time entry points live in
-// src/os/posix/Time.cc.
 #include "kickmsg/os/Time.h"
 
 #include <cerrno>

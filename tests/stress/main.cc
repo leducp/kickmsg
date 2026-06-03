@@ -1,4 +1,5 @@
 #include "common.h"
+#include "../shm_cleanup.h"
 #include "kickmsg/version.h"
 
 #include <argparse/argparse.hpp>
@@ -13,6 +14,7 @@ bool run_pool_exhaustion();
 bool run_live_repair();
 bool run_single_slot_ring();
 bool run_subscriber_saturation();
+bool run_big_payload();
 
 int main(int argc, char** argv)
 {
@@ -56,6 +58,18 @@ int main(int argc, char** argv)
                 std::thread::hardware_concurrency(),
                 static_cast<unsigned>(contention_count()));
 
+    // Unlink the scenario segments if interrupted (Ctrl-C / kill), so a killed
+    // run leaves a clean /dev/shm.  Keep in sync with the scenarios' shm_name.
+    for (char const* name : {"/kickmsg_treiber_stress", "/kickmsg_churn_test",
+                             "/kickmsg_gc_test", "/kickmsg_fairness_test",
+                             "/kickmsg_stress_test", "/kickmsg_pool_exhaustion",
+                             "/kickmsg_live_repair", "/kickmsg_single_slot_ring",
+                             "/kickmsg_sub_saturation", "/kickmsg_big_payload"})
+    {
+        kickmsg_test::register_cleanup_shm(name);
+    }
+    kickmsg_test::install_signal_cleanup();
+
     TestRunner runner;
 
     runner.run("treiber_stress",       run_treiber_stress);
@@ -67,6 +81,7 @@ int main(int argc, char** argv)
     runner.run("live_repair",          run_live_repair);
     runner.run("single_slot_ring",     run_single_slot_ring);
     runner.run("subscriber_saturation", run_subscriber_saturation);
+    runner.run("big_payload",          run_big_payload);
 
     return runner.summary();
 }

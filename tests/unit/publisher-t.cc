@@ -96,6 +96,29 @@ TEST_F(PublisherTest, SendReturnsEmsgsize)
     EXPECT_EQ(pub.send(buf, cfg.max_payload_size + 1), -EMSGSIZE);
 }
 
+TEST_F(PublisherTest, PublishOversizedLenReturnsZeroAndRecyclesSlot)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 4;
+    cfg.pool_size         = 1;
+    cfg.max_payload_size  = 8;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    auto a = pub.allocate();
+    ASSERT_NE(a.data, nullptr);
+    EXPECT_EQ(pub.publish(cfg.max_payload_size + 1), 0u);
+
+    // The oversized publish must have recycled the pending slot: with
+    // pool_size == 1, a leak would make this allocate() fail.
+    auto b = pub.allocate();
+    ASSERT_NE(b.data, nullptr);
+    EXPECT_EQ(pub.publish(sizeof(uint32_t)), 1u);
+}
+
 TEST_F(PublisherTest, SendReturnsEagainOnPoolExhaustion)
 {
     kickmsg::channel::Config cfg;
@@ -191,12 +214,12 @@ TEST_F(PublisherTest, MultipleSubscribersEachReceive)
 
 TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
 {
-    // Simulate Case A: a publisher CAS-locked an entry (LOCKED_SEQUENCE)
-    // then crashed before committing.  The next publisher that wraps to
-    // this position should:
-    //   1. time out in wait_and_capture_slot
-    //   2. fail the CAS lock (entry is LOCKED_SEQUENCE, not prev_seq)
-    //   3. self-repair the entry (advance seq to expected)
+    // Simulate Case A: a publisher CAS-locked an entry (position-tagged
+    // lock) then crashed before committing.  The next publisher that wraps
+    // to this position should:
+    //   1. time out in wait_for_commit (observing one stable lock value)
+    //   2. fail the CAS lock (entry is locked, not prev_seq)
+    //   3. self-repair the entry (steal + advance seq to expected)
     //   4. drop delivery for this wrap
     // After that, the NEXT publisher at this position should succeed
     // without any timeout.
@@ -206,7 +229,7 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
     cfg.sub_ring_capacity = 4;    // capacity = 4
     cfg.pool_size         = 16;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000};  // 1 ms — fast test
+    cfg.commit_timeout    = std::chrono::microseconds{1000};  // 1 ms -- fast test
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 
@@ -230,20 +253,20 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
     // Advance write_pos past pos=4 so the ring has wrapped.
     ring->write_pos.store(5, std::memory_order_release);
     // Lock entry at idx=0 as if a publisher crashed mid-commit at pos=4.
-    entries[0].sequence.store(kickmsg::LOCKED_SEQUENCE,
+    entries[0].sequence.store(kickmsg::seq_lock(4),
                               std::memory_order_release);
 
-    // Next publish: pos=5 → idx=1 (clean entry, succeeds).
+    // Next publish: pos=5 -> idx=1 (clean entry, succeeds).
     uint32_t val = 100;
     ASSERT_GE(pub.send(&val, sizeof(val)), 0);
 
-    // pos=6 → idx=2 (clean), pos=7 → idx=3 (clean).
+    // pos=6 -> idx=2 (clean), pos=7 -> idx=3 (clean).
     val = 101;
     ASSERT_GE(pub.send(&val, sizeof(val)), 0);
     val = 102;
     ASSERT_GE(pub.send(&val, sizeof(val)), 0);
 
-    // pos=8 → idx=0 → POISONED.  Publisher times out + drops + self-repairs.
+    // pos=8 -> idx=0 -> POISONED.  Publisher times out + drops + self-repairs.
     auto before = std::chrono::steady_clock::now();
     val = 103;
     pub.send(&val, sizeof(val));  // may drop, but should NOT hang forever
@@ -256,10 +279,10 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
         << "Publisher should have waited ~1 ms for the stuck entry";
 
     // After self-repair, entry at idx=0 should be advanced.
-    // The entry was stuck at LOCKED_SEQUENCE for pos=4.  The publisher at
-    // pos=8 expects seq=5 and should have repaired it to 9 (pos=8 + 1).
+    // The entry was stuck locked at pos=4.  The publisher at pos=8 expects
+    // seq=5 and should have repaired it to 9 (pos=8 + 1).
     uint64_t seq0 = entries[0].sequence.load(std::memory_order_acquire);
-    EXPECT_NE(seq0, kickmsg::LOCKED_SEQUENCE)
+    EXPECT_FALSE(kickmsg::seq_is_locked(seq0))
         << "Self-repair should have advanced the stuck entry";
 
     // Now the NEXT publish at idx=0 (pos=12) should succeed WITHOUT timeout.
@@ -270,7 +293,7 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
         ASSERT_GE(pub.send(&val, sizeof(val)), 0);
     }
 
-    // pos=12 → idx=0.  If self-repair worked, this should be fast.
+    // pos=12 -> idx=0.  If self-repair worked, this should be fast.
     before = std::chrono::steady_clock::now();
     val = 203;
     ASSERT_GE(pub.send(&val, sizeof(val)), 0);
@@ -280,7 +303,7 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
                      after - before).count();
     EXPECT_LT(elapsed_us, 500)
         << "After self-repair, the next publisher at this position should "
-           "succeed instantly — not wait for another timeout";
+           "succeed instantly -- not wait for another timeout";
 }
 
 TEST_F(PublisherTest, SelfRepairCaseB_StaleEntry)
@@ -322,9 +345,9 @@ TEST_F(PublisherTest, SelfRepairCaseB_StaleEntry)
 
     // Entry idx=0 still has seq=1.  A publisher at pos=8 (idx=0) expects
     // seq=5.  seq=1 + cap=4 = 5 which is NOT < 5, so it needs to be
-    // strictly more than one wrap.  At pos=12, expected=9.  1+4=5 < 9 → stale.
+    // strictly more than one wrap.  At pos=12, expected=9.  1+4=5 < 9 -> stale.
 
-    // Publish at pos=12 → idx=0: should timeout + self-repair + drop.
+    // Publish at pos=12 -> idx=0: should timeout + self-repair + drop.
     uint32_t val = 999;
     pub.send(&val, sizeof(val));  // drops at idx=0 but self-repairs
 
@@ -344,7 +367,7 @@ TEST_F(PublisherTest, SelfRepairCaseB_StaleEntry)
 
     auto before = std::chrono::steady_clock::now();
     val = 303;
-    pub.send(&val, sizeof(val));  // pos=16 → idx=0, should be fast
+    pub.send(&val, sizeof(val));  // pos=16 -> idx=0, should be fast
     auto after = std::chrono::steady_clock::now();
 
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(

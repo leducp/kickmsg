@@ -13,6 +13,8 @@ bool run_stress_test(TestConfig const& tc)
                 tc.pool_size, tc.ring_capacity);
 
     g_all_publishers_done = false;
+    g_subscribers_ready   = 0;
+    g_subscribers_expected = tc.num_subscribers;
 
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = tc.max_subs;
@@ -43,8 +45,6 @@ bool run_stress_test(TestConfig const& tc)
                 fn(region, i, tc.num_publishers, tc.msgs_per_pub);
         });
     }
-
-    kickmsg::sleep(10ms);
 
     std::vector<std::thread> pub_threads;
     for (int i = 0; i < tc.num_publishers; ++i)
@@ -112,31 +112,22 @@ bool run_stress_test(TestConfig const& tc)
             std::fprintf(stderr, "  [FAIL] sub%d: received 0 messages!\n", r.sub_id);
             all_ok = false;
         }
-        // Completeness check: received + lost should account for all messages
-        // this subscriber saw. The lost counter tracks ring-level losses;
-        // received + lost may be less than total_sent (subscriber starts from
-        // write_pos at construction, missing earlier messages), but should
-        // never exceed it.
-        if (r.received + r.lost > total_sent)
+        // Exact conservation: the readiness barrier guarantees every ring is
+        // Live before the first send, so each subscriber's ring sees every
+        // message. Every ring position is consumed (received / corrupted /
+        // bad_pub_id / reordered, exactly one bucket each) or counted in
+        // lost; any other total means messages vanished or were duplicated.
+        uint64_t accounted = r.received + r.lost + r.corrupted + r.bad_pub_id + r.reordered;
+        if (accounted != total_sent)
         {
-            std::fprintf(stderr, "  [FAIL] sub%d: received+lost (%" PRIu64
-                         ") > total_sent (%" PRIu64 ")!\n",
-                         r.sub_id, r.received + r.lost, total_sent);
+            std::fprintf(stderr, "  [FAIL] sub%d: received+lost+corrupt+bad_pid+reorder (%" PRIu64
+                         ") != total_sent (%" PRIu64 ")!\n",
+                         r.sub_id, accounted, total_sent);
             all_ok = false;
         }
     }
 
-    std::size_t repaired = region.repair_locked_entries();
-    if (repaired > 0)
-    {
-        std::printf("  GC repaired %zu locked entries\n", repaired);
-    }
-    std::size_t reclaimed = region.reclaim_orphaned_slots();
-    if (reclaimed > 0)
-    {
-        std::printf("  GC reclaimed %zu orphaned slots\n", reclaimed);
-    }
-
+    all_ok &= verify_gc_zero(region, cfg);
     all_ok &= verify_refcounts_zero(region, cfg);
     all_ok &= verify_pool_free(region, cfg);
     all_ok &= verify_rings_inactive(region, cfg);

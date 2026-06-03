@@ -9,7 +9,7 @@
 
 namespace kickmsg
 {
-    /// Optional hash helpers.  Not used on any hot path — intended for
+    /// Optional hash helpers.  Not used on any hot path -- intended for
     /// users filling SchemaInfo::identity without bringing their own
     /// hash implementation, and for building up descriptor fingerprints
     /// in user code more generally.
@@ -32,13 +32,10 @@ namespace kickmsg
         /// 64-bit FNV-1a of a raw byte range.  `seed` defaults to the
         /// standard offset basis for one-shot hashing; pass a previous
         /// hash value to chain additional bytes into it.
-        uint64_t fnv1a_64(void const* data, std::size_t len,
-                          uint64_t seed = FNV1A_64_OFFSET_BASIS) noexcept;
+        uint64_t fnv1a_64(void const* data, std::size_t len, uint64_t seed = FNV1A_64_OFFSET_BASIS) noexcept;
 
-        /// 64-bit FNV-1a of a string.  Thin wrapper around the raw-range
-        /// overload; preserved as a separate entry point because
-        /// descriptor-string hashing is by far the most common use.
-        uint64_t fnv1a_64(std::string_view s) noexcept;
+        /// 64-bit FNV-1a of a string.  Thin wrapper around the raw-range version.
+        uint64_t fnv1a_64(std::string_view s, uint64_t seed = FNV1A_64_OFFSET_BASIS) noexcept;
 
         /// 64-bit FNV-1a of a trivially-copyable scalar or POD.  Lets
         /// callers chain fields without spelling out `&v, sizeof(v)`:

@@ -57,9 +57,11 @@ bool run_live_repair()
 
     // Subscriber threads: receive continuously until done
     std::vector<SubResult> sub_results(NUM_SUBS);
+    std::vector<uint32_t> sub_rings(NUM_SUBS, UINT32_MAX);
     auto sub_worker = [&](int sub_id)
     {
         kickmsg::Subscriber sub{region};
+        sub_rings[static_cast<std::size_t>(sub_id)] = sub.ring_index();
         SubResult result{};
         result.sub_id = sub_id;
 
@@ -105,7 +107,8 @@ bool run_live_repair()
         sub_results[static_cast<std::size_t>(sub_id)] = result;
     };
 
-    // Injector thread: every 10ms, poison ring 0's next entry with LOCKED_SEQUENCE
+    // Injector thread: every 10ms, poison ring 0's next entry with a
+    // stale position-tagged lock (as a crashed publisher would leave it)
     auto injector = [&]()
     {
         while (not stop)
@@ -114,14 +117,32 @@ bool run_live_repair()
 
             auto* ring    = kickmsg::sub_ring_at(base, hdr, 0);
             auto* entries = kickmsg::ring_entries(ring);
-            uint64_t wp   = ring->write_pos.load(std::memory_order_acquire);
 
-            // Advance write_pos by 1 and poison the new entry
-            ring->write_pos.store(wp + 1, std::memory_order_release);
-            entries[(wp) & hdr->sub_ring_mask].sequence.store(
-                kickmsg::LOCKED_SEQUENCE, std::memory_order_release);
+            // fetch_add, NOT load+store: real publishers fetch_add this
+            // counter concurrently and a lost increment would hand two
+            // publishers the same position (harness-induced corruption).
+            uint64_t wp = ring->write_pos.fetch_add(1, std::memory_order_acq_rel);
+            auto&    e  = entries[(wp) & hdr->sub_ring_mask];
 
-            inject_count.fetch_add(1, std::memory_order_relaxed);
+            // CAS like a real publisher, never a blind store: a descheduled
+            // injector's late store would land over an already-repaired
+            // entry below every scan window -- an unstealable lock no real
+            // crash can produce.  If the entry moved on first, skip the
+            // injection (the claimed position heals as Case-B residue).
+            uint64_t prev = 0;
+            if (wp >= hdr->sub_ring_capacity)
+            {
+                prev = wp - hdr->sub_ring_capacity + 1;
+            }
+            uint64_t observed = e.sequence.load(std::memory_order_acquire);
+            if (not kickmsg::seq_is_locked(observed)
+                and kickmsg::seq_pos(observed) == prev
+                and e.sequence.compare_exchange_strong(observed,
+                        kickmsg::seq_lock(wp),
+                        std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                inject_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     };
 
@@ -187,6 +208,36 @@ bool run_live_repair()
 
     bool ok = true;
 
+    if (heal_count.load() == 0)
+    {
+        // Publishers' self-repair can win every race against the healer
+        // (it steals ~10 ms after the poison; the healer needs cadence +
+        // grace) -- effectiveness is asserted below via total_steals.
+        std::printf("  [NOTE] healer repaired nothing (publishers self-healed first)\n");
+    }
+
+    // The injector poisons ring 0: if repair never unblocked it, its
+    // subscriber starves. Receiving anything proves traffic flowed past
+    // the injected locks.
+    bool ring0_seen = false;
+    for (int i = 0; i < NUM_SUBS; ++i)
+    {
+        if (sub_rings[static_cast<std::size_t>(i)] == 0)
+        {
+            ring0_seen = true;
+            if (sub_results[static_cast<std::size_t>(i)].received == 0)
+            {
+                std::fprintf(stderr, "  [FAIL] ring-0 subscriber (sub%d) received nothing\n", i);
+                ok = false;
+            }
+        }
+    }
+    if (not ring0_seen)
+    {
+        std::fprintf(stderr, "  [FAIL] no subscriber claimed ring 0\n");
+        ok = false;
+    }
+
     // Check for corruption and reorders in subscriber results
     for (auto const& r : sub_results)
     {
@@ -209,6 +260,24 @@ bool run_live_repair()
     if (repaired > 0)
     {
         std::printf("  GC final repaired %zu locked entries\n", repaired);
+    }
+
+    // Effectiveness, timing-independent: every injected lock must have been
+    // stolen by SOMEONE (publisher self-repair, the healer, or the final
+    // pass above), and no poison may survive.
+    uint64_t steals = region.stats().total_steals;
+    if (steals < inject_count.load())
+    {
+        std::fprintf(stderr, "  [FAIL] %" PRIu64 " injections but only %" PRIu64 " steals\n",
+                     inject_count.load(), steals);
+        ok = false;
+    }
+    auto post = region.diagnose();
+    if (post.locked_entries > 0)
+    {
+        std::fprintf(stderr, "  [FAIL] %u locked entries survived repair\n",
+                     post.locked_entries);
+        ok = false;
     }
     std::size_t reclaimed = region.reclaim_orphaned_slots();
     if (reclaimed > 0)

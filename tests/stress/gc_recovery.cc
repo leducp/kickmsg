@@ -21,7 +21,7 @@ bool run_gc_recovery()
 
     bool ok = true;
 
-    // Simulate a publisher crash mid-commit: poison one entry with LOCKED_SEQUENCE.
+    // Simulate a publisher crash mid-commit: poison one entry with a stale lock.
     // To have a valid ring entry, we need an active subscriber and a committed entry first.
     {
         kickmsg::Subscriber sub(region);
@@ -38,7 +38,7 @@ bool run_gc_recovery()
         uint64_t wp   = ring->write_pos.load(std::memory_order_acquire);
         if (wp > 0)
         {
-            entries[(wp - 1) & h->sub_ring_mask].sequence = kickmsg::LOCKED_SEQUENCE;
+            entries[(wp - 1) & h->sub_ring_mask].sequence = kickmsg::seq_lock(wp - 1);
         }
     }
 

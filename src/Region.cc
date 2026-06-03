@@ -113,19 +113,21 @@ namespace kickmsg
 
         // Optional payload schema: publish directly before the magic store.
         // No claim state machine needed at creation because (a) we are the
-        // only writer — no concurrent claimant can race — and (b) the
+        // only writer -- no concurrent claimant can race -- and (b) the
         // release-store of MAGIC below carries all preceding writes,
         // including the memcpy into schema_data and this relaxed store of
         // schema_state, across to any reader that acquire-loads MAGIC.
         // The relaxed is therefore correct; do NOT "fix" it to release in
-        // isolation — MAGIC is the sole publication fence for this region.
+        // isolation -- MAGIC is the sole publication fence for this region.
         if (cfg.schema.has_value())
         {
             std::memcpy(&h->schema_data, &*cfg.schema, sizeof(SchemaInfo));
             h->schema_state.store(schema::Set, std::memory_order_relaxed);
         }
 
-        h->free_top = tagged_pack(0, INVALID_SLOT);
+        h->free_top      = tagged_pack(0, INVALID_SLOT);
+        h->steal_count   = 0;
+        h->identity_hash = cfg.identity;
 
         for (uint32_t i = 0; i < cfg.pool_size; ++i)
         {
@@ -170,7 +172,7 @@ namespace kickmsg
                     "Header geometry: total_size smaller than Header");
             }
 
-            // No zero counts or strides — divide-by-zero protection for
+            // No zero counts or strides -- divide-by-zero protection for
             // the bound checks below depends on these, and stamp_new_region
             // never produces a zero here.
             if (h->max_subs == 0 or h->pool_size == 0
@@ -374,7 +376,7 @@ namespace kickmsg
         return region;
     }
 
-    SharedRegion SharedRegion::open(char const* name)
+    SharedRegion SharedRegion::open(char const* name, uint64_t expected_identity)
     {
         SharedRegion region;
         region.name_ = name;
@@ -382,6 +384,13 @@ namespace kickmsg
         region.base_ = region.shm_.address();
         region.size_ = region.shm_.size();
         validate_opened(region.base_, region.size_);
+        uint64_t stamped = region.header()->identity_hash;
+        if (expected_identity != 0 and stamped != 0 and stamped != expected_identity)
+        {
+            throw std::runtime_error(
+                std::string{"Identity mismatch on existing region (shm name collision): "}
+                + name);
+        }
         return region;
     }
 
@@ -393,7 +402,7 @@ namespace kickmsg
         RegionLayout layout = compute_layout(cfg, creator_name);
 
         // Try to be the creator.  On success, try_create leaves the
-        // SharedMemory fully mapped — we stamp the header directly rather
+        // SharedMemory fully mapped -- we stamp the header directly rather
         // than closing and re-entering SharedMemory::create, which would
         // require either O_TRUNC (rejected on Darwin) or shm_unlink +
         // recreate (introduces a tiny race window where a concurrent
@@ -429,22 +438,29 @@ namespace kickmsg
                         throw std::runtime_error(
                             std::string{"Config mismatch on existing region: "} + name);
                     }
+                    if (cfg.identity != 0 and h->identity_hash != 0
+                        and h->identity_hash != cfg.identity)
+                    {
+                        throw std::runtime_error(
+                            std::string{"Identity mismatch on existing region "
+                                        "(shm name collision): "} + name);
+                    }
                     SharedRegion region;
                     region.name_ = name;
                     region.shm_  = std::move(shm);
                     region.base_ = region.shm_.address();
                     region.size_ = region.shm_.size();
                     // config_hash covers the cfg fields but NOT total_size,
-                    // offsets, or strides — validate the geometry like
+                    // offsets, or strides -- validate the geometry like
                     // open()/attach_open() so a corrupt or partially-stamped
                     // creator can't hand us junk that later pointer math trusts.
                     validate_opened(region.base_, region.size_);
                     return region;
                 }
-                // SHM exists but magic/version not ready yet — creator
+                // SHM exists but magic/version not ready yet -- creator
                 // is still mid-init.  Close and retry.
             }
-            // try_open returned false (ENOENT) or magic not ready → retry.
+            // try_open returned false (ENOENT) or magic not ready -> retry.
             kickmsg::sleep(10ms);
         }
 
@@ -455,8 +471,8 @@ namespace kickmsg
     void SharedRegion::unlink()
     {
         // Release the OS-level name backing this region.  Existing
-        // mappings — this process and every peer that already opened
-        // the region — keep working until their last reference drops;
+        // mappings -- this process and every peer that already opened
+        // the region -- keep working until their last reference drops;
         // only the region's discoverability by name is affected.  Any
         // holder, creator or opener, may call this.  Future open-by-
         // name behaviour is OS-dependent and intentionally left to the
@@ -478,7 +494,7 @@ namespace kickmsg
 
         // Schema slot wedged at Claiming: crashed claimant that CAS'd but
         // never reached Set.  Mirrors the operator-surface pattern of
-        // retired_rings/locked_entries — reset_schema_claim() recovers it.
+        // retired_rings/locked_entries -- reset_schema_claim() recovers it.
         report.schema_stuck =
             (h->schema_state.load(std::memory_order_acquire) == schema::Claiming);
 
@@ -500,9 +516,9 @@ namespace kickmsg
                 uint64_t seq = e.sequence.load(std::memory_order_acquire);
 
                 // Case A: explicitly locked, never committed.
-                // Case B: more than one full wrap behind — stale from a
+                // Case B: more than one full wrap behind -- stale from a
                 //         publisher that crashed before the CAS lock.
-                if (seq == LOCKED_SEQUENCE or seq + cap < pos + 1)
+                if (seq_is_locked(seq) or seq_pos(seq) + cap < pos + 1)
                 {
                     ++report.locked_entries;
                 }
@@ -525,10 +541,13 @@ namespace kickmsg
                 ++report.draining_rings;
             }
 
-            // A Live or Draining ring whose owner process is gone is an
-            // orphan no other count surfaces (a dead Live ring otherwise
-            // reads as healthy). reclaim_dead_rings() recovers it.
-            if ((state == ring::Live or state == ring::Draining)
+            // A Live/Draining/Reclaiming ring whose owner process is gone
+            // is an orphan no other count surfaces (a dead Live ring
+            // otherwise reads as healthy; Reclaiming is the residue of a
+            // reclaimer that crashed mid-pass). reclaim_dead_rings()
+            // recovers all three.
+            if ((state == ring::Live or state == ring::Draining
+                 or state == ring::Reclaiming)
                 and ring_owner_dead(ring))
             {
                 ++report.dead_rings;
@@ -543,6 +562,14 @@ namespace kickmsg
         auto* b   = base();
         auto* h   = header();
         std::size_t repaired = 0;
+
+        struct LockedCandidate
+        {
+            Entry*   entry;
+            uint64_t pos;
+            uint64_t seq;
+        };
+        std::vector<LockedCandidate> candidates;
 
         for (uint64_t i = 0; i < h->max_subs; ++i)
         {
@@ -562,38 +589,44 @@ namespace kickmsg
                 uint64_t seq      = e.sequence.load(std::memory_order_acquire);
                 uint64_t expected = pos + 1;
 
-                if (seq == LOCKED_SEQUENCE)
+                if (seq_is_locked(seq))
                 {
-                    // Case A: publisher CAS'd Unset → LOCKED_SEQUENCE then
-                    // crashed before the release-store of (pos + 1).  The
-                    // crashed publisher may have written garbage into
-                    // slot_idx/payload_len.  Mark the entry as having no
-                    // valid slot so subscribers skip it and future evictions
-                    // don't release a stale index.
-                    e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
-                    e.payload_len.store(0, std::memory_order_relaxed);
-                    e.sequence.store(expected, std::memory_order_release);
-                    ++repaired;
+                    // Case A: may be a healthy in-flight commit -- never
+                    // steal on first sight, defer to the grace pass.
+                    candidates.push_back({&e, pos, seq});
                 }
-                else if (seq + cap < expected)
+                else if (seq_pos(seq) + cap < expected)
                 {
-                    // Case B: publisher claimed write_pos (fetch_add) then
-                    // crashed before the CAS lock.  The entry still carries
-                    // its committed sequence from a previous wrap — more
-                    // than one full ring revolution behind.  No live
-                    // publisher can be mid-commit for longer than one wrap
-                    // (the commit path is a few instructions between
-                    // fetch_add and the CAS), so > 1 wrap behind is
-                    // definitively stale.
-                    //
-                    // slot_idx may reference a still-live slot from the
-                    // previous cycle; mark INVALID_SLOT to avoid a double
-                    // release.
-                    e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
-                    e.payload_len.store(0, std::memory_order_relaxed);
-                    e.sequence.store(expected, std::memory_order_release);
-                    ++repaired;
+                    // Case B: committed >1 wrap behind (claimant crashed
+                    // before its lock CAS).
+                    if (entry_steal_and_clear(e, pos, seq))
+                    {
+                        h->steal_count.fetch_add(1, std::memory_order_relaxed);
+                        ++repaired;
+                    }
                 }
+            }
+        }
+
+        if (candidates.empty())
+        {
+            return repaired;
+        }
+
+        // Grace pass: an unchanged lock value across a full commit_timeout
+        // proves its (unique) holder exceeded the commit budget.
+        kickmsg::sleep(microseconds{h->commit_timeout_us});
+
+        for (auto const& c : candidates)
+        {
+            if (c.entry->sequence.load(std::memory_order_acquire) != c.seq)
+            {
+                continue;
+            }
+            if (entry_steal_and_clear(*c.entry, c.pos, c.seq))
+            {
+                h->steal_count.fetch_add(1, std::memory_order_relaxed);
+                ++repaired;
             }
         }
 
@@ -637,7 +670,10 @@ namespace kickmsg
             uint32_t    packed = ring->state_flight.load(std::memory_order_acquire);
             ring::State state  = ring::get_state(packed);
 
-            if (state != ring::Live and state != ring::Draining)
+            // Reclaiming residue (reclaimer crashed mid-pass) is only
+            // recoverable here.
+            if (state != ring::Live and state != ring::Draining
+                and state != ring::Reclaiming)
             {
                 continue;
             }
@@ -646,27 +682,58 @@ namespace kickmsg
                 continue;
             }
 
-            // Owner is gone. Flip the state bits to Free but PRESERVE
-            // in_flight: a publisher mid-commit to this ring will still
-            // fetch_sub, and zeroing in_flight here would underflow it into
-            // the state bits. A leftover Free | in_flight>0 is then a job
-            // for reset_retired_rings() once the publisher is confirmed gone;
-            // committed entries' slot refs are recovered by
-            // reclaim_orphaned_slots(). Clear owner last (Free + stale owner
-            // is harmless; the next claimer overwrites it).
-            uint32_t old = packed;
-            while (true)
+            // Two-phase, mirroring Registry::sweep_stale: a naive CAS retry
+            // is value-ABA-prone (ring freed and re-claimed between checks
+            // would be stomped).  Single-shot CAS to Reclaiming, re-verify
+            // death under that exclusivity; in_flight churn just defers the
+            // ring to the next pass.
+            uint32_t fresh = ring->state_flight.load(std::memory_order_acquire);
+            if (ring::get_state(fresh) != state)
             {
-                uint32_t desired = (old & ~ring::STATE_MASK) | ring::Free;
-                if (ring->state_flight.compare_exchange_weak(old, desired,
-                        std::memory_order_release, std::memory_order_acquire))
+                continue;
+            }
+            uint32_t claim = (fresh & ~ring::STATE_MASK) | ring::Reclaiming;
+            if (not ring->state_flight.compare_exchange_strong(fresh, claim,
+                    std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                continue;
+            }
+
+            if (ring_owner_dead(ring))
+            {
+                // Free but PRESERVE in_flight (zeroing would underflow into
+                // the state bits on a late fetch_sub); owner cleared only
+                // after Free, or a crash here leaves an unattributable ring.
+                uint32_t old = claim;
+                while (ring::get_state(old) == ring::Reclaiming)
                 {
-                    break;
+                    uint32_t desired = (old & ~ring::STATE_MASK) | ring::Free;
+                    if (ring->state_flight.compare_exchange_weak(old, desired,
+                            std::memory_order_release, std::memory_order_acquire))
+                    {
+                        ring->owner_pid.store(0, std::memory_order_relaxed);
+                        ring->owner_starttime.store(0, std::memory_order_relaxed);
+                        ++reclaimed;
+                        break;
+                    }
                 }
             }
-            ring->owner_pid.store(0, std::memory_order_relaxed);
-            ring->owner_starttime.store(0, std::memory_order_relaxed);
-            ++reclaimed;
+            else
+            {
+                // Displaced a live owner (freed + re-claimed between checks):
+                // restore it, but only while still Reclaiming -- the owner's
+                // own teardown may have moved the state.
+                uint32_t old = claim;
+                while (ring::get_state(old) == ring::Reclaiming)
+                {
+                    uint32_t desired = (old & ~ring::STATE_MASK) | state;
+                    if (ring->state_flight.compare_exchange_weak(old, desired,
+                            std::memory_order_release, std::memory_order_acquire))
+                    {
+                        break;
+                    }
+                }
+            }
         }
 
         return reclaimed;
@@ -678,7 +745,7 @@ namespace kickmsg
         uint32_t    state = h->schema_state.load(std::memory_order_acquire);
         if (state != schema::Set)
         {
-            // Unset or a claim is mid-write — no stable payload to return.
+            // Unset or a claim is mid-write -- no stable payload to return.
             return std::nullopt;
         }
         SchemaInfo out;
@@ -714,8 +781,8 @@ namespace kickmsg
 
         // Someone else won the claim.  If they're mid-write, wait briefly
         // for the state to settle at Set so a follow-up schema() read is
-        // meaningful — but bound the wait: a claimant that crashed between
-        // CAS→Claiming and store→Set leaves the slot wedged.  Operators
+        // meaningful -- but bound the wait: a claimant that crashed between
+        // CAS->Claiming and store->Set leaves the slot wedged.  Operators
         // recover such a wedge with reset_schema_claim(), and diagnose()
         // surfaces it via HealthReport::schema_stuck.
         //
@@ -741,7 +808,7 @@ namespace kickmsg
         // confirming the original claimant is gone; otherwise a slow-but-
         // alive writer could finish its memcpy into schema_data and then
         // release-store Set, while a new claimant is concurrently using
-        // the slot — producing torn bytes.
+        // the slot -- producing torn bytes.
         uint32_t expected = schema::Claiming;
         return header()->schema_state.compare_exchange_strong(
             expected, schema::Unset,
@@ -755,13 +822,14 @@ namespace kickmsg
         auto const* h = header();
 
         RegionStats out{};
-        out.pool_size = h->pool_size;
+        out.pool_size    = h->pool_size;
+        out.total_steals = h->steal_count.load(std::memory_order_relaxed);
         out.rings.reserve(h->max_subs);
 
         for (uint64_t i = 0; i < h->max_subs; ++i)
         {
             // sub_ring_at needs a non-const base*/header*, but the operation
-            // is read-only — const_cast is safe here.
+            // is read-only -- const_cast is safe here.
             auto* ring = sub_ring_at(const_cast<void*>(b),
                                      h, static_cast<uint32_t>(i));
             uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
@@ -796,7 +864,7 @@ namespace kickmsg
         // bounded by pool_size so a concurrent push/pop storm can't fool us
         // into an unbounded loop.  Under churn we can undercount (a slot
         // being popped mid-walk) or overcount (a slot's next_free pointing
-        // to a just-pushed node we've already counted) — acceptable for a
+        // to a just-pushed node we've already counted) -- acceptable for a
         // diagnostic view.
         uint64_t top = h->free_top.load(std::memory_order_acquire);
         uint32_t idx = tagged_idx(top);
@@ -862,10 +930,12 @@ namespace kickmsg
                 auto&    e   = entries[pos & h->sub_ring_mask];
                 uint64_t seq = e.sequence.load(std::memory_order_acquire);
 
-                // Skip uncommitted and locked entries.
-                if (seq >= pos + 1 and seq != LOCKED_SEQUENCE)
+                // Skip uncommitted, locked, and skip-marker entries (the
+                // latter carry untrustworthy metadata by design).
+                if (not seq_is_locked(seq) and not seq_is_skip(seq)
+                    and seq >= pos + 1)
                 {
-                    uint32_t idx = e.slot_idx;
+                    uint32_t idx = e.slot_idx.load(std::memory_order_acquire);
                     if (idx < h->pool_size)
                     {
                         referenced[idx] = true;
@@ -874,23 +944,34 @@ namespace kickmsg
             }
         }
 
-        // Reclaim unreferenced slots with refcount > 0.
+        // Free-stack membership (exact under the quiescence contract)
+        // recovers rc == 0 orphans a refcount-only scan never could;
+        // bounded against corrupt next_free cycles.
+        std::vector<bool> on_stack(h->pool_size, false);
+        uint64_t walked = 0;
+        uint32_t idx32  = tagged_idx(h->free_top.load(std::memory_order_acquire));
+        while (idx32 != INVALID_SLOT and idx32 < h->pool_size
+               and walked < h->pool_size)
+        {
+            on_stack[idx32] = true;
+            idx32 = slot_at(b, h, idx32)->next_free.load(std::memory_order_relaxed);
+            ++walked;
+        }
+
+        // Reclaim slots that are neither ring-referenced nor on the free
+        // stack, regardless of refcount.
         std::size_t reclaimed = 0;
         for (uint64_t idx = 0; idx < h->pool_size; ++idx)
         {
-            if (referenced[idx])
+            if (referenced[idx] or on_stack[idx])
             {
                 continue;
             }
 
-            auto*    slot = slot_at(b, h, static_cast<uint32_t>(idx));
-            uint32_t rc   = slot->refcount.load(std::memory_order_acquire);
-            if (rc > 0)
-            {
-                slot->refcount.store(0, std::memory_order_release);
-                treiber_push(h->free_top, slot, static_cast<uint32_t>(idx));
-                ++reclaimed;
-            }
+            auto* slot = slot_at(b, h, static_cast<uint32_t>(idx));
+            slot->refcount.store(0, std::memory_order_release);
+            treiber_push(h->free_top, slot, static_cast<uint32_t>(idx));
+            ++reclaimed;
         }
 
         return reclaimed;

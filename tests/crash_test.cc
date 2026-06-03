@@ -1,16 +1,16 @@
 /// @file crash_test.cc
 /// @brief Multi-process crash recovery test for kickmsg.
 ///
-/// Phase 1 — publisher crash rounds (the original scenario): fork a child
+/// Phase 1 -- publisher crash rounds (the original scenario): fork a child
 /// publisher, kill it mid-commit with SIGKILL, verify the channel
 /// recovers via diagnose() + repair_locked_entries() +
 /// reset_retired_rings() + reclaim_orphaned_slots().  A subscriber
 /// running throughout validates that no corruption occurs.
 ///
-/// Phase 2 — subscriber crash: a subscriber that SIGKILLs itself while
+/// Phase 2 -- subscriber crash: a subscriber that SIGKILLs itself while
 /// holding live SampleView pins.  Exercises reclaim_orphaned_slots().
 ///
-/// Phase 3 — multi-publisher simultaneous crash: four publishers all
+/// Phase 3 -- multi-publisher simultaneous crash: four publishers all
 /// killed at once.  Exercises the repair sequence when Case-A (locked
 /// sequences) and Case-B (retired rings) residue coexist at multiple
 /// ring positions.
@@ -24,6 +24,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "shm_cleanup.h"
 #include "kickmsg/os/Time.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
@@ -43,6 +44,48 @@ struct CrashPayload
 static uint32_t compute_checksum(CrashPayload const& p)
 {
     return p.magic ^ p.seq ^ 0xBAADF00D;
+}
+
+// --- Seeded kill-timing fuzzer ---------------------------------------------
+// Each kill fires at a random instant so a long soak explores new crash
+// windows instead of re-hitting a fixed schedule.  The seed is logged at
+// startup; set KICKMSG_CRASH_SEED to replay a specific run.
+namespace
+{
+    uint64_t g_rng_state = 0;
+
+    uint64_t next_rand() // splitmix64
+    {
+        g_rng_state += 0x9E3779B97F4A7C15ull;
+        uint64_t z = g_rng_state;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+
+    // Sleep a random duration in [lo_us, hi_us] inclusive (microsecond grain).
+    void sleep_rand(uint64_t lo_us, uint64_t hi_us)
+    {
+        uint64_t span = hi_us - lo_us + 1;
+        kickmsg::sleep(microseconds{static_cast<int64_t>(lo_us + next_rand() % span)});
+    }
+
+    uint64_t seed_fuzzer()
+    {
+        uint64_t seed;
+        char const* env = std::getenv("KICKMSG_CRASH_SEED");
+        if (env != nullptr)
+        {
+            seed = std::strtoull(env, nullptr, 0);
+        }
+        else
+        {
+            seed = static_cast<uint64_t>(monotonic_ns().count())
+                 ^ (static_cast<uint64_t>(::getpid()) << 32);
+        }
+        g_rng_state = seed;
+        return seed;
+    }
 }
 
 /// Child publisher: publishes as fast as possible using allocate() + publish()
@@ -114,8 +157,8 @@ static void child_subscriber_main(int result_fd, int signal_fd)
     ssize_t written = write(result_fd, &result, sizeof(result));
     close(result_fd);
     close(signal_fd);
-    // Partial write → parent would read zero-initialized bytes and
-    // interpret that as "no corruption" — a silent false pass.  Exit
+    // Partial write -> parent would read zero-initialized bytes and
+    // interpret that as "no corruption" -- a silent false pass.  Exit
     // non-zero so waitpid surfaces the anomaly.
     if (written != sizeof(result))
     {
@@ -128,6 +171,7 @@ struct RoundResult
     bool recovered_entries;
     bool recovered_rings;
     bool recovered_slots;
+    bool repair_ok;
     bool subscriber_ok;
 };
 
@@ -156,8 +200,8 @@ static RoundResult run_one_round(int round)
         _exit(0); // never reached
     }
 
-    // Let publisher run for 20-50ms
-    kickmsg::sleep(milliseconds{20 + (round % 30)});
+    // Kill at a fuzzed instant in the publisher's lifecycle (0.2-50ms).
+    sleep_rand(200, 50000);
 
     // Kill publisher mid-flight
     kill(pub_pid, SIGKILL);
@@ -186,7 +230,8 @@ static RoundResult run_one_round(int round)
 
     // Verify clean after repair
     auto post = region.diagnose();
-    if (post.locked_entries > 0 or post.retired_rings > 0)
+    result.repair_ok = (post.locked_entries == 0 and post.retired_rings == 0);
+    if (not result.repair_ok)
     {
         std::fprintf(stderr, "  [FAIL] Round %d: repair incomplete "
                      "(locked=%u, retired=%u)\n",
@@ -220,7 +265,7 @@ static RoundResult run_one_round(int round)
     return result;
 }
 
-/// Phase 2: subscriber SIGKILLed while holding SampleView pins —
+/// Phase 2: subscriber SIGKILLed while holding SampleView pins --
 /// `reclaim_orphaned_slots` must release them.
 static bool test_subscriber_crash()
 {
@@ -244,7 +289,7 @@ static bool test_subscriber_crash()
     {
         auto r = kickmsg::SharedRegion::open(SUB_SHM);
         kickmsg::Subscriber sub(r);
-        // receive_view() returns SampleView which pins the slot — exactly
+        // receive_view() returns SampleView which pins the slot -- exactly
         // what we want to orphan on SIGKILL.
         std::vector<kickmsg::Subscriber::SampleView> pins;
         while (true)
@@ -335,7 +380,7 @@ static bool test_subscriber_crash()
     return clean and writable;
 }
 
-/// Phase 3: four publishers SIGKILLed simultaneously — repair sequence
+/// Phase 3: four publishers SIGKILLed simultaneously -- repair sequence
 /// must handle Case-A + Case-B residue coexisting at multiple positions.
 static bool test_multi_publisher_crash()
 {
@@ -382,7 +427,7 @@ static bool test_multi_publisher_crash()
         }
     }
 
-    kickmsg::sleep(30ms);
+    sleep_rand(2000, 50000);
 
     for (int i = 0; i < N_PUBS; ++i)
     {
@@ -452,7 +497,17 @@ static bool test_multi_publisher_crash()
 
 int main()
 {
-    std::printf("=== Kickmsg Multi-Process Crash Test ===\n\n");
+    std::printf("=== Kickmsg Multi-Process Crash Test ===\n");
+    // Clean up segments if interrupted (Ctrl-C / kill) before the test's own
+    // unlink runs.  Installed before forking so children inherit it too.
+    kickmsg_test::register_cleanup_shm("/kickmsg_crash_test");
+    kickmsg_test::register_cleanup_shm("/kickmsg_crash_test_sub");
+    kickmsg_test::register_cleanup_shm("/kickmsg_crash_test_multi");
+    kickmsg_test::install_signal_cleanup();
+
+    uint64_t const seed = seed_fuzzer();
+    std::printf("crash fuzz seed=%llu (set KICKMSG_CRASH_SEED to replay)\n\n",
+                static_cast<unsigned long long>(seed));
 
     kickmsg::SharedMemory::unlink(SHM_NAME);
 
@@ -490,7 +545,15 @@ int main()
     // Let subscriber attach
     kickmsg::sleep(50ms);
 
-    constexpr int NUM_ROUNDS = 10;
+    int NUM_ROUNDS = 30;
+    if (char const* r = std::getenv("KICKMSG_CRASH_ROUNDS"))
+    {
+        int v = std::atoi(r);
+        if (v > 0)
+        {
+            NUM_ROUNDS = v;
+        }
+    }
     int any_recovery = 0;
     bool all_ok = true;
 
@@ -501,6 +564,10 @@ int main()
         {
             ++any_recovery;
         }
+        if (not result.repair_ok)
+        {
+            all_ok = false;
+        }
     }
 
     // Signal subscriber to exit
@@ -508,7 +575,7 @@ int main()
 
     // Read subscriber results.  A short read means the child either
     // crashed before writing its result struct or we lost bytes on the
-    // pipe — either way, we can't trust a zero-initialised sub_result
+    // pipe -- either way, we can't trust a zero-initialised sub_result
     // and should fail rather than silently pass the corruption check.
     struct { uint64_t recv; uint64_t corrupt; } sub_result{};
     ssize_t got = read(result_pipe[0], &sub_result, sizeof(sub_result));

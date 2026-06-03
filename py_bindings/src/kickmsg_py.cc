@@ -245,6 +245,10 @@ namespace kickmsg
                 { c.commit_timeout = us; },
                 "Commit timeout as a timedelta (microsecond resolution).")
             .def_rw("schema", &channel::Config::schema)
+            .def_rw("identity", &channel::Config::identity,
+                "Optional logical-identity fingerprint stamped into the "
+                "region header at create time and verified at open when "
+                "both sides are nonzero. Not part of the config hash.")
             .def("__repr__", [](channel::Config const& c)
             {
                 return std::string{"Config(max_subscribers="} +
@@ -366,9 +370,10 @@ namespace kickmsg
                 char const* state_name = "?";
                 switch (r.state)
                 {
-                    case ring::Free:     state_name = "Free";     break;
-                    case ring::Live:     state_name = "Live";     break;
-                    case ring::Draining: state_name = "Draining"; break;
+                    case ring::Free:       { state_name = "Free";       break; }
+                    case ring::Live:       { state_name = "Live";       break; }
+                    case ring::Draining:   { state_name = "Draining";   break; }
+                    case ring::Reclaiming: { state_name = "Reclaiming"; break; }
                 }
                 return std::string{"RingStats(state="} + state_name +
                        ", in_flight=" + std::to_string(r.in_flight) +
@@ -382,6 +387,7 @@ namespace kickmsg
             .def_ro("total_writes", &RegionStats::total_writes)
             .def_ro("total_drops",  &RegionStats::total_drops)
             .def_ro("total_losses", &RegionStats::total_losses)
+            .def_ro("total_steals", &RegionStats::total_steals)
             .def_ro("live_rings",   &RegionStats::live_rings)
             .def_ro("pool_free",    &RegionStats::pool_free)
             .def_ro("pool_size",    &RegionStats::pool_size)
@@ -392,6 +398,7 @@ namespace kickmsg
                        ", total_writes=" + std::to_string(s.total_writes) +
                        ", total_drops=" + std::to_string(s.total_drops) +
                        ", total_losses=" + std::to_string(s.total_losses) +
+                       ", total_steals=" + std::to_string(s.total_steals) +
                        ", pool_free=" + std::to_string(s.pool_free) +
                        "/" + std::to_string(s.pool_size) + ")";
             });
@@ -430,6 +437,7 @@ namespace kickmsg
                 "name"_a, "type"_a, "cfg"_a, "creator"_a = std::string{""},
                 nb::rv_policy::move)
             .def_static("open", &SharedRegion::open, "name"_a,
+                "expected_identity"_a = uint64_t{0},
                 nb::rv_policy::move)
             .def_static("create_or_open",
                 [](char const* name, channel::Type type,
@@ -492,9 +500,9 @@ namespace kickmsg
                 char const* role_name = "?";
                 switch (p.role)
                 {
-                    case registry::Publisher:  role_name = "Publisher";  break;
-                    case registry::Subscriber: role_name = "Subscriber"; break;
-                    case registry::Both:       role_name = "Both";       break;
+                    case registry::Publisher:  { role_name = "Publisher";  break; }
+                    case registry::Subscriber: { role_name = "Subscriber"; break; }
+                    case registry::Both:       { role_name = "Both";       break; }
                 }
                 return std::string{"Participant(topic='"} + p.topic_name +
                        "', node='" + p.node_name +

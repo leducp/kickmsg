@@ -168,6 +168,7 @@ namespace kickmsg
 
         uint64_t lost() const { return lost_; }
         uint64_t drain_timeouts() const { return drain_timeouts_; }
+        uint32_t ring_index() const { return ring_idx_; }
 
     private:
         void release_ring();

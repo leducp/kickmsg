@@ -39,6 +39,15 @@ namespace kickmsg
 
     std::size_t Publisher::publish(std::size_t len)
     {
+        // Oversized len would otherwise be truncated by the uint32_t store
+        // into payload_len -- possibly to a small VALID length, bypassing
+        // the subscriber's bound check and delivering a silently wrong
+        // length.  Recycle the pending slot and report zero deliveries.
+        if (len > header_->slot_data_size)
+        {
+            release_pending();
+            return 0;
+        }
         if (pending_slot_ == INVALID_SLOT)
         {
             return 0;
@@ -94,7 +103,7 @@ namespace kickmsg
                     admitted = true;
                     break;
                 }
-                // CAS failed — old was updated. Re-check state.
+                // CAS failed -- old was updated. Re-check state.
             }
 
             if (not admitted)
@@ -113,96 +122,100 @@ namespace kickmsg
             auto* entries = ring_entries(ring);
             auto& e       = entries[idx];
 
-            // If the ring has wrapped, the entry we are about to overwrite
-            // may still reference a live slot. Capture its slot_idx for
-            // release AFTER we successfully lock the entry.
-            //
-            // We defer the release because of a TOCTOU race: between
-            // wait_and_capture_slot reading the slot_idx and our lock CAS,
-            // another publisher can overwrite the entry (evict + commit).
-            // If our CAS then fails, releasing the captured slot_idx would
-            // corrupt a live entry's refcount. Deferring until after lock
-            // success guarantees we own the entry.
-            uint32_t old_slot = INVALID_SLOT;
-            if (pos >= capacity)
-            {
-                uint64_t expected_seq = pos - capacity + 1;
-                old_slot = wait_and_capture_slot(e, expected_seq, commit_timeout_);
-            }
-
-            // Two-phase commit: CAS sequence to LOCKED_SEQUENCE to exclusively
-            // own the entry, write data, then release-store the final sequence.
-            // This prevents concurrent publishers from interleaving slot_idx writes.
             uint64_t prev_seq = 0;
             if (pos >= capacity)
             {
                 prev_seq = pos - capacity + 1;
             }
+
+            // Wait for the previous wrap's occupant; also records whether one
+            // lock value spanned the whole timeout (self_repair's steal proof).
+            CommitWait wait{0, false};
+            if (pos >= capacity)
+            {
+                wait = wait_for_commit(e, prev_seq, commit_timeout_);
+            }
+
+            // Two-phase commit: CAS to our lock, write data, CAS-commit.
+            // A repairer's theft makes both CASes fail instead of being
+            // blind-stored over.
+            uint64_t const lock_val = seq_lock(pos);
+            uint64_t observed = 0;
+            if (pos >= capacity)
+            {
+                observed = wait.last_seq;
+            }
+            bool prev_was_skip = false;
             bool locked = false;
             for (int attempt = 0; attempt < 64; ++attempt)
             {
-                uint64_t expected = prev_seq;
-                // Acquire on success: we need to see the previous writer's stores.
-                if (e.sequence.compare_exchange_weak(expected, LOCKED_SEQUENCE,
-                        std::memory_order_acquire, std::memory_order_relaxed))
+                if (not seq_is_locked(observed) and seq_pos(observed) == prev_seq)
                 {
-                    locked = true;
-                    break;
+                    // CAS from the exact observed value (plain or skip-tagged).
+                    uint64_t expected = observed;
+                    // Acquire on success: we need to see the previous writer's stores.
+                    if (e.sequence.compare_exchange_weak(expected, lock_val,
+                            std::memory_order_acquire, std::memory_order_relaxed))
+                    {
+                        prev_was_skip = seq_is_skip(observed);
+                        locked = true;
+                        break;
+                    }
+                    observed = expected;
+                    continue;
                 }
-                if (expected != LOCKED_SEQUENCE)
+                if (not seq_is_locked(observed))
                 {
-                    // Entry was committed by another publisher, not just locked.
-                    break;
+                    break;  // committed elsewhere: stale residue, can't lock
                 }
-                // Another publisher holds the lock; it will release quickly.
+                observed = e.sequence.load(std::memory_order_relaxed);
             }
             if (not locked)
             {
-                // Self-repair: if the entry is stuck (LOCKED_SEQUENCE from
-                // a crashed publisher, or stale from a publisher that
-                // crashed before the CAS lock), advance it so the NEXT
-                // publisher at this position succeeds without timeout.
-                // Cost: three stores (~10 ns) after an already-expensive
-                // timeout (~10 ms).  Always the right thing — leaving the
-                // entry stuck just punishes the next publisher for the
-                // same crash.
-                uint64_t seq = e.sequence.load(std::memory_order_acquire);
-                uint64_t expected = pos + 1;
-                if (seq == LOCKED_SEQUENCE or seq + capacity < expected)
-                {
-                    e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
-                    e.payload_len.store(0, std::memory_order_relaxed);
-                    e.sequence.store(expected, std::memory_order_release);
-                }
-
-                ++dropped_;
-                ring->dropped_count.fetch_add(1, std::memory_order_relaxed);
+                // Heal a provably-stale entry so the next publisher here
+                // does not pay the timeout again.
+                self_repair(e, pos, capacity, wait);
+                abandon_delivery(ring);
                 ++excess;
-                ring->state_flight.fetch_sub(ring::IN_FLIGHT_ONE,
-                                             std::memory_order_release);
                 continue;
             }
 
-            // Lock succeeded: we exclusively own this entry. Release the
-            // previous occupant's slot reference for this ring, unless
-            // drain_unconsumed already released it (marked by INVALID_SLOT).
-            if (old_slot != INVALID_SLOT)
+            // Release the previous occupant's slot from the post-lock read
+            // (sees even a commit that landed after our wait timed out; a
+            // drain's INVALID marker fails the bound check).  Never for a
+            // skip predecessor (untrustworthy metadata), never below one
+            // wrap (zero-init slot_idx would read as valid slot 0).
+            if (pos >= capacity and not prev_was_skip)
             {
-                uint32_t current_slot = e.slot_idx.load(std::memory_order_acquire);
-                if (current_slot != INVALID_SLOT)
+                uint32_t prev_slot = e.slot_idx.load(std::memory_order_acquire);
+                if (prev_slot < header_->pool_size)
                 {
-                    release_slot(old_slot);
+                    release_slot(prev_slot);
                 }
             }
 
-            // We exclusively own this entry. No other publisher can CAS from
-            // LOCKED_SEQUENCE since they expect prev_seq.
+            // Theft guard: a repairer may have stolen our lock during a
+            // stall; storing data now would tear the repaired entry.
+            if (e.sequence.load(std::memory_order_acquire) != lock_val)
+            {
+                abandon_delivery(ring);
+                ++excess;
+                continue;
+            }
+
             e.slot_idx.store(slot_idx, std::memory_order_relaxed);
             e.payload_len.store(static_cast<uint32_t>(len), std::memory_order_relaxed);
 
-            // Release-store commits the entry: subscribers and future publishers
-            // at this position will see all preceding stores.
-            e.sequence.store(pos + 1, std::memory_order_release);
+            // CAS-commit: fails only on theft after the guard above.
+            // Release on success publishes the data stores.
+            uint64_t expected_lock = lock_val;
+            if (not e.sequence.compare_exchange_strong(expected_lock, pos + 1,
+                    std::memory_order_release, std::memory_order_relaxed))
+            {
+                abandon_delivery(ring);
+                ++excess;
+                continue;
+            }
 
             // Release admission.
             ring->state_flight.fetch_sub(ring::IN_FLIGHT_ONE,
@@ -257,28 +270,73 @@ namespace kickmsg
         return static_cast<int32_t>(len);
     }
 
-    uint32_t Publisher::wait_and_capture_slot(Entry& e, uint64_t expected_seq,
-                                              microseconds timeout)
+    Publisher::CommitWait Publisher::wait_for_commit(Entry& e, uint64_t expected_seq,
+                                                     microseconds timeout)
     {
         constexpr int CHECK_INTERVAL = 1024;
         nanoseconds start = kickmsg::monotonic_ns();
 
+        uint64_t first = e.sequence.load(std::memory_order_acquire);
+        uint64_t seq   = first;
         int i = 0;
         while (true)
         {
-            uint64_t seq = e.sequence.load(std::memory_order_acquire);
-            if (seq >= expected_seq and seq != LOCKED_SEQUENCE)
+            if (not seq_is_locked(seq) and seq_pos(seq) >= expected_seq)
             {
-                return e.slot_idx.load(std::memory_order_acquire);
+                return CommitWait{seq, false};
             }
             ++i;
             if ((i & (CHECK_INTERVAL - 1)) == 0)
             {
                 if (kickmsg::elapsed_time(start) >= timeout)
                 {
-                    return INVALID_SLOT;
+                    // Same lock value at both ends proves one holder spanned
+                    // the window (steal precondition).
+                    bool stable = seq_is_locked(first) and seq == first;
+                    return CommitWait{seq, stable};
                 }
             }
+            seq = e.sequence.load(std::memory_order_acquire);
+        }
+    }
+
+    void Publisher::abandon_delivery(SubRingHeader* ring)
+    {
+        ++dropped_;
+        ring->dropped_count.fetch_add(1, std::memory_order_relaxed);
+        ring->state_flight.fetch_sub(ring::IN_FLIGHT_ONE,
+                                     std::memory_order_release);
+        // write_pos already advanced and the position may now carry a skip
+        // marker: without the wake a parked subscriber sleeps its timeout.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (ring->has_waiter.load(std::memory_order_relaxed))
+        {
+            futex_wake_all(ring->write_pos);
+        }
+    }
+
+    void Publisher::self_repair(Entry& e, uint64_t pos, uint64_t capacity,
+                                CommitWait const& wait)
+    {
+        uint64_t seq  = e.sequence.load(std::memory_order_acquire);
+        uint64_t done = pos + 1;
+
+        if (seq_is_locked(seq))
+        {
+            // A lock that appeared mid-wait may be a healthy commit -- only
+            // steal one proven stable across the full wait.
+            if (not wait.stable_lock or seq != wait.last_seq)
+            {
+                return;
+            }
+        }
+        else if (seq_pos(seq) + capacity >= done)
+        {
+            return;  // at most one wrap behind: normal contention residue
+        }
+        if (entry_steal_and_clear(e, pos, seq))
+        {
+            header_->steal_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
 

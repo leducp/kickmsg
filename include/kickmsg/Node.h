@@ -24,7 +24,7 @@ namespace kickmsg
     /// Lifetime: the Node owns the underlying shared-memory mappings. All
     /// Publisher, Subscriber, and BroadcastHandle objects returned by this
     /// Node hold raw pointers into the mapped memory. They MUST NOT outlive
-    /// the Node that created them — destroying the Node unmaps the memory
+    /// the Node that created them -- destroying the Node unmaps the memory
     /// and silently invalidates all outstanding handles.
     class Node
     {
@@ -33,7 +33,7 @@ namespace kickmsg
         // owner, tag) are sanitized into a POSIX-shm-compatible form:
         // leading '/' is stripped, interior '/' becomes '.', and any char
         // outside [A-Za-z0-9._-] becomes '_'. This lets callers pass
-        // ROS-style paths like "/robot/arm/joint1" directly — the region
+        // ROS-style paths like "/robot/arm/joint1" directly -- the region
         // ends up at "/<namespace>_robot.arm.joint1" in /dev/shm, still
         // human-readable (no hashing). A component that sanitizes to the
         // empty string throws std::invalid_argument.
@@ -61,7 +61,7 @@ namespace kickmsg
         //
         // The *_or_* variants relax that: either side may be the first to
         // materialize the region, mirroring join_broadcast()'s behavior.
-        // Useful when startup order is unknown — e.g. a listener service
+        // Useful when startup order is unknown -- e.g. a listener service
         // starting before its data source.
         //
         // These variants take `cfg` by reference with NO default: either
@@ -77,12 +77,12 @@ namespace kickmsg
         // The freshly-opened SharedRegion from the second call is
         // discarded.  Two Publisher handles on the same topic from the
         // same Node are NOT designed for concurrent use from separate
-        // threads — use one handle per thread instead.
+        // threads -- use one handle per thread instead.
         //
         // NOTE on cfg.schema: only the *creator* of the region bakes
         // cfg.schema into the header.  On the open branch (region already
         // exists) cfg.schema is IGNORED and the existing region's schema
-        // is preserved — schema is orthogonal to channel geometry and
+        // is preserved -- schema is orthogonal to channel geometry and
         // never part of the create_or_open config-mismatch check.  Use
         // try_claim_topic_schema() afterwards to publish a descriptor
         // regardless of which side ended up creating the region.
@@ -114,7 +114,7 @@ namespace kickmsg
         // Thin wrappers that call SharedMemory::unlink() with the same name
         // formatting used by advertise / subscribe / join_broadcast /
         // create_mailbox.  Safe to call whether or not this node currently
-        // holds a region for that name — unlink is a filesystem-level
+        // holds a region for that name -- unlink is a filesystem-level
         // operation on the SHM entry, independent of in-process handles.
 
         void unlink_topic(char const* topic) const;
@@ -124,7 +124,7 @@ namespace kickmsg
 
         // --- Optional payload schema descriptor ---
         //
-        // The library never interprets schema bytes — these accessors just
+        // The library never interprets schema bytes -- these accessors just
         // forward to the SharedRegion backing the topic. Mismatch policy
         // is entirely the caller's.
 
@@ -145,6 +145,12 @@ namespace kickmsg
         std::string make_topic_name(char const* topic) const;
         std::string make_broadcast_name(char const* channel) const;
         std::string make_mailbox_name(char const* owner, char const* tag) const;
+
+        // Identity hashes over the raw (pre-sanitization) coordinates plus
+        // a kind tag; shm-name collisions are then detected at open.
+        uint64_t make_topic_identity(char const* topic) const;
+        uint64_t make_broadcast_identity(char const* channel) const;
+        uint64_t make_mailbox_identity(char const* owner, char const* tag) const;
 
         // unordered_map guarantees reference stability for elements
         // (only iterators are invalidated on rehash), so pointers
@@ -180,7 +186,7 @@ namespace kickmsg
         // humanoid robot can easily hold 100-300 topics (joints × (meas,
         // target) + cameras + IMUs + force sensors + hands), so O(N)
         // linear search over a vector/deque starts to matter.  The
-        // duplication with SharedRegion::name() costs ~30 B per entry —
+        // duplication with SharedRegion::name() costs ~30 B per entry --
         // negligible at any scale we care about.  unordered_map also
         // guarantees reference stability for elements (the mmap addresses
         // used by Publisher/Subscriber don't move on rehash).

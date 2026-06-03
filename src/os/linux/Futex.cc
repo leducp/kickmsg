@@ -9,6 +9,12 @@
 
 namespace kickmsg
 {
+    // The futex word is the LOW 32 bits of the 64-bit counter; on a
+    // big-endian target &word addresses the HIGH half and the kernel-side
+    // value check silently breaks (lost wakeups until timeout).
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+        "futex word aliasing assumes the low half of write_pos at offset 0");
+
     bool futex_wait(std::atomic<uint64_t>& word, uint64_t expected, nanoseconds timeout)
     {
         auto* addr = reinterpret_cast<uint32_t*>(&word);

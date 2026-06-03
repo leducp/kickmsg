@@ -7,6 +7,8 @@
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
+#else
+    #include <sys/types.h>
 #endif
 
 namespace kickmsg
@@ -17,6 +19,10 @@ namespace kickmsg
 #else
     using os_shm_handle = int;
     constexpr os_shm_handle INVALID_SHM_HANDLE = -1;
+
+    /// Creation mode for shm objects: 0600 unless overridden via
+    /// KICKMSG_SHM_MODE (octal).
+    mode_t kickmsg_shm_mode();
 #endif
 
     /// RAII wrapper around a named shared-memory region.
@@ -31,7 +37,10 @@ namespace kickmsg
         SharedMemory& operator=(SharedMemory&& other) noexcept;
         ~SharedMemory();
 
-        /// Create a new shared-memory region. Truncates to \p size bytes.
+        /// Create a new region of \p size bytes.  An existing object under
+        /// this name is unlinked and replaced: peers keep their old mapping,
+        /// never a truncated one.  Single-creator only; concurrent creators
+        /// must go through try_create.
         void create(std::string const& name, std::size_t size);
 
         /// Attempt to create a new shared-memory region.

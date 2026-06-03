@@ -343,31 +343,31 @@ TEST_F(RegionTest, RepairLockedEntryUnblocksPublishing)
 
     // Advance write_pos to simulate that a publisher claimed pos=1
     ring->write_pos.store(2, std::memory_order_release);
-    auto& e1 = entries[1]; // pos=1 → idx=1
-    e1.sequence.store(kickmsg::LOCKED_SEQUENCE, std::memory_order_release);
+    auto& e1 = entries[1]; // pos=1 -> idx=1
+    e1.sequence.store(kickmsg::seq_lock(1), std::memory_order_release);
 
     // Repair should fix the locked entry
     std::size_t repaired = region.repair_locked_entries();
     EXPECT_EQ(repaired, 1u);
 
-    // The repaired entry should have seq = pos + 1 = 2
+    // The repaired entry carries the skip marker for pos = 1
     uint64_t seq = e1.sequence.load(std::memory_order_acquire);
-    EXPECT_EQ(seq, 2u);
+    EXPECT_EQ(seq, kickmsg::seq_skip(1));
 
     // The repaired entry should have INVALID_SLOT
     uint32_t slot_idx = e1.slot_idx.load(std::memory_order_acquire);
     EXPECT_EQ(slot_idx, kickmsg::INVALID_SLOT);
 
     // Now publish enough to wrap around: pos 2, 3, 4, 5
-    // pos=4 wraps to idx=0 and expects prev_seq=1 (pos 0's committed seq) — OK
-    // pos=5 wraps to idx=1 and expects prev_seq=2 (the repaired seq) — this
+    // pos=4 wraps to idx=0 and expects prev_seq=1 (pos 0's committed seq) -- OK
+    // pos=5 wraps to idx=1 and expects prev_seq=2 (the repaired seq) -- this
     // would fail with the old code that stored prev_seq instead of pos+1
     for (int i = 0; i < 4; ++i)
     {
         val = static_cast<uint32_t>(200 + i);
         ASSERT_GE(pub.send(&val, sizeof(val)), 0)
             << "Publishing failed at iteration " << i
-            << " — repaired entry likely blocked the ring";
+            << " -- repaired entry likely blocked the ring";
     }
 
     // Subscriber should receive the new messages (some may be lost due to wrapping)
@@ -417,9 +417,9 @@ TEST_F(RegionTest, RepairStaleEntryFromCrashedPublisherBeforeCasLock)
     // becomes > 1 wrap stale.
     // write_pos after the 4 real publishes is 4.  Set it to 4 + 2*cap = 12.
     ring->write_pos.store(12, std::memory_order_release);
-    // Don't touch entries — they keep their old sequences.  Entry idx=0
+    // Don't touch entries -- they keep their old sequences.  Entry idx=0
     // has seq=1, but expected seq at pos=8 (the slot in the scan window)
-    // is 9.  (pos=8 maps to idx=0 because 8 & 3 = 0.)  1 + 4 < 9 → stale.
+    // is 9.  (pos=8 maps to idx=0 because 8 & 3 = 0.)  1 + 4 < 9 -> stale.
 
     auto report = region.diagnose();
     EXPECT_GT(report.locked_entries, 0u)
@@ -429,11 +429,11 @@ TEST_F(RegionTest, RepairStaleEntryFromCrashedPublisherBeforeCasLock)
     EXPECT_GT(repaired, 0u)
         << "repair_locked_entries() should advance the stale entry";
 
-    // After repair, the entry at idx=0 should have seq = expected.
-    // The expected pos for idx=0 in the window [12-4, 12) = [8, 12) is pos=8.
+    // After repair, the entry at idx=0 carries the skip marker for pos=8
+    // (the slot in the scan window [12-4, 12) that maps to idx=0).
     uint64_t seq0 = entries[0].sequence.load(std::memory_order_acquire);
-    EXPECT_EQ(seq0, 9u)  // pos=8 → expected = 8 + 1 = 9
-        << "Stale entry should be advanced to pos + 1";
+    EXPECT_EQ(seq0, kickmsg::seq_skip(8))
+        << "Stale entry should be advanced to the pos=8 skip marker";
 
     // Publishing should now succeed past the repaired slot.
     for (int i = 0; i < 8; ++i)
@@ -441,7 +441,7 @@ TEST_F(RegionTest, RepairStaleEntryFromCrashedPublisherBeforeCasLock)
         uint32_t val = static_cast<uint32_t>(100 + i);
         ASSERT_GE(pub.send(&val, sizeof(val)), 0)
             << "Publishing failed at iteration " << i
-            << " — repaired entry may still be stuck";
+            << " -- repaired entry may still be stuck";
     }
 }
 
@@ -464,15 +464,16 @@ TEST_F(RegionTest, RepairLockedEntryAtPositionZero)
     auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
     auto* entries = kickmsg::ring_entries(ring);
     ring->write_pos.store(1, std::memory_order_release);
-    entries[0].sequence.store(kickmsg::LOCKED_SEQUENCE, std::memory_order_release);
+    entries[0].sequence.store(kickmsg::seq_lock(0), std::memory_order_release);
 
     std::size_t repaired = region.repair_locked_entries();
     EXPECT_EQ(repaired, 1u);
-    EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire),
+              kickmsg::seq_skip(0));
     EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire), kickmsg::INVALID_SLOT);
 
     // Publishing should work: pos=1,2,3 use fresh indices, pos=4 wraps to idx=0
-    // and expects prev_seq=1 — matches the repaired value
+    // and expects prev_seq=1 -- matches the repaired value
     kickmsg::Publisher pub(region);
     for (int i = 0; i < 5; ++i)
     {
@@ -522,7 +523,7 @@ TEST_F(RegionTest, DiagnoseDetectsLockedEntries)
     auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
     auto* entries = kickmsg::ring_entries(ring);
     ring->write_pos.store(2, std::memory_order_release);
-    entries[1].sequence.store(kickmsg::LOCKED_SEQUENCE, std::memory_order_release);
+    entries[1].sequence.store(kickmsg::seq_lock(1), std::memory_order_release);
 
     auto report = region.diagnose();
     EXPECT_EQ(report.locked_entries, 1u);
@@ -584,13 +585,13 @@ TEST_F(RegionTest, ResetRetiredRingsLeavesDrainingUntouched)
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 
-    // Ring 0: retired (Free | in_flight=1) — should be reset
+    // Ring 0: retired (Free | in_flight=1) -- should be reset
     auto* ring0 = kickmsg::sub_ring_at(region.base(), region.header(), 0);
     ring0->state_flight.store(
         kickmsg::ring::make_packed(kickmsg::ring::Free, 1),
         std::memory_order_release);
 
-    // Ring 1: draining (Draining | in_flight=1) — must NOT be touched
+    // Ring 1: draining (Draining | in_flight=1) -- must NOT be touched
     auto* ring1 = kickmsg::sub_ring_at(region.base(), region.header(), 1);
     ring1->state_flight.store(
         kickmsg::ring::make_packed(kickmsg::ring::Draining, 1),
@@ -794,7 +795,7 @@ TEST_F(RegionTest, SchemaClaimRejectsSecondClaimant)
     auto region = kickmsg::SharedRegion::create(
                       SHM_NAME, kickmsg::channel::PubSub, cfg);
 
-    // Second process tries to claim a *different* schema — library just
+    // Second process tries to claim a *different* schema -- library just
     // reports "not the claimant", it never throws.  User picks the policy.
     auto other = make_schema("other/Pose", 2, 0x00, 0x00);
     EXPECT_FALSE(region.try_claim_schema(other));
@@ -898,7 +899,7 @@ TEST_F(RegionTest, SchemaReaderDuringClaimingReturnsNullopt)
 
 TEST_F(RegionTest, SchemaResetRecoversWedgedClaimingState)
 {
-    // Crash scenario: a claimant CAS'd Unset → Claiming and died before
+    // Crash scenario: a claimant CAS'd Unset -> Claiming and died before
     // the release-store of Set.  Every try_claim_schema() caller will
     // observe Claiming and return false after bounded yields.
     // reset_schema_claim() is the operator-driven recovery.
@@ -918,7 +919,7 @@ TEST_F(RegionTest, SchemaResetRecoversWedgedClaimingState)
 
     // Operator confirms the original claimant is gone, resets the slot.
     EXPECT_TRUE(region.reset_schema_claim());
-    // Second call is a no-op — state is already Unset.
+    // Second call is a no-op -- state is already Unset.
     EXPECT_FALSE(region.reset_schema_claim());
 
     // Subsequent claim now succeeds.
@@ -968,7 +969,7 @@ TEST_F(RegionTest, SchemaCreateOrOpenIgnoresOpenerSchemaWhenCreatorHadNone)
     auto opened = kickmsg::SharedRegion::create_or_open(
                       SHM_NAME, kickmsg::channel::PubSub, opener_cfg, "opener");
 
-    // Opener's cfg.schema was discarded — slot is still Unset.
+    // Opener's cfg.schema was discarded -- slot is still Unset.
     EXPECT_FALSE(opened.schema().has_value());
 }
 
@@ -989,7 +990,7 @@ TEST_F(RegionTest, SchemaCrossHandleObservesClaim)
     EXPECT_FALSE(r2.schema().has_value());
 
     // r1 claims.  r2 must observe Set without any further fence on its
-    // side — acquire-load in schema() synchronizes with r1's release-store.
+    // side -- acquire-load in schema() synchronizes with r1's release-store.
     ASSERT_TRUE(r1.try_claim_schema(make_schema("xhandle/Type", 5, 0x9A, 0xBC)));
 
     auto got_r2 = r2.schema();
@@ -1067,11 +1068,11 @@ TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
     auto other_cfg = default_cfg();
     other_cfg.schema = make_schema("opener/Type", 2, 0xCC, 0xDD);
 
-    // Must succeed — geometry matches, schema differs but is ignored on open.
+    // Must succeed -- geometry matches, schema differs but is ignored on open.
     auto opened = kickmsg::SharedRegion::create_or_open(
                       SHM_NAME, kickmsg::channel::PubSub, other_cfg, "opener");
 
-    // Opener observes the creator's schema, not its own — library doesn't
+    // Opener observes the creator's schema, not its own -- library doesn't
     // overwrite or enforce anything.
     auto got = opened.schema();
     ASSERT_TRUE(got.has_value());
@@ -1079,7 +1080,7 @@ TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
 }
 
 // -----------------------------------------------------------------------------
-// stats() — cross-process counter snapshot
+// stats() -- cross-process counter snapshot
 // -----------------------------------------------------------------------------
 
 TEST_F(RegionTest, StatsOnFreshRegionReportsZeros)
@@ -1150,7 +1151,7 @@ TEST_F(RegionTest, StatsLostCountMatchesSubscriberLostOnOverflow)
     kickmsg::Subscriber sub(region);
     kickmsg::Publisher  pub(region);
 
-    // Publish more than the ring can hold without draining — forces the
+    // Publish more than the ring can hold without draining -- forces the
     // subscriber's drain-ahead path to bump lost_count on its next read.
     uint32_t payload = 0;
     std::size_t const to_publish = cfg.sub_ring_capacity * 3;
@@ -1167,7 +1168,7 @@ TEST_F(RegionTest, StatsLostCountMatchesSubscriberLostOnOverflow)
     EXPECT_GT(sub.lost(), 0u);
 
     auto s = region.stats();
-    // Exactly one ring is Live — its lost_count equals the subscriber's.
+    // Exactly one ring is Live -- its lost_count equals the subscriber's.
     uint64_t ring_lost = 0;
     for (auto const& r : s.rings)
     {
@@ -1196,7 +1197,7 @@ TEST_F(RegionTest, StatsPoolFreeTracksAllocations)
 }
 
 // -----------------------------------------------------------------------------
-// attach_create / attach_open — caller-provided memory
+// attach_create / attach_open -- caller-provided memory
 // -----------------------------------------------------------------------------
 
 class InjectedRegionTest : public ::testing::Test
@@ -1299,7 +1300,7 @@ TEST_F(InjectedRegionTest, AttachCreateRejectsMisalignedAddress)
 {
     auto cfg  = default_cfg();
     auto buf  = make_buffer(cfg, "x");
-    auto* bad = static_cast<char*>(buf.get()) + 1;  // off by one — not aligned
+    auto* bad = static_cast<char*>(buf.get()) + 1;  // off by one -- not aligned
 
     EXPECT_THROW(
         kickmsg::SharedRegion::attach_create(
@@ -1336,7 +1337,7 @@ TEST_F(InjectedRegionTest, UnlinkOnInjectedRegionIsNoOp)
     auto region = kickmsg::SharedRegion::attach_create(
         buf.get(), buf.size, kickmsg::channel::PubSub, cfg, "x", "should-not-be-unlinked");
 
-    // Must not call shm_unlink on the label, which would fail if it tried —
+    // Must not call shm_unlink on the label, which would fail if it tried --
     // the label is not a path.  Just checks that the call returns cleanly.
     EXPECT_NO_THROW(region.unlink());
     // And the region remains usable after a no-op unlink.
@@ -1346,7 +1347,7 @@ TEST_F(InjectedRegionTest, UnlinkOnInjectedRegionIsNoOp)
 TEST_F(InjectedRegionTest, AttachOpenRejectsBufferSmallerThanHeader)
 {
     // A buffer smaller than sizeof(Header) must be rejected BEFORE any
-    // dereference of magic/version/total_size — otherwise the load is
+    // dereference of magic/version/total_size -- otherwise the load is
     // an out-of-bounds read on hostile or accidentally-small input.
     alignas(kickmsg::CACHE_LINE) std::byte tiny[kickmsg::CACHE_LINE]{};
     static_assert(sizeof(tiny) < sizeof(kickmsg::Header));
@@ -1369,7 +1370,7 @@ TEST_F(InjectedRegionTest, MoveLeavesSourceWithNullBase)
     auto dst = std::move(src);
     EXPECT_EQ(dst.base(), live_base);
     // After move, the source must NOT still alias the destination's
-    // live memory — otherwise base()/header() on the moved-from object
+    // live memory -- otherwise base()/header() on the moved-from object
     // returns a dangling-looking-live pointer instead of nullptr.
     EXPECT_EQ(src.base(), nullptr);
 }
@@ -1518,4 +1519,137 @@ TEST_F(CorruptedHeaderTest, RejectsCreatorNameLenPastTail)
         static_cast<uint16_t>(hdr(buf)->sub_rings_offset);
     EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
                  std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Repair theft-safety: a slow-but-alive publisher whose lock is stolen must
+// be detected at its commit CAS (never blind-stored over), a healthy commit
+// must survive the grace pass, and a steal must back off if the entry
+// changes first.
+// ---------------------------------------------------------------------------
+
+#include "kickmsg/os/Time.h"
+
+TEST_F(RegionTest, RepairStealsProvenStaleLockAndResumedCommitFails)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 4;
+    cfg.pool_size         = 8;
+    cfg.max_payload_size  = 8;
+    cfg.commit_timeout    = std::chrono::microseconds{1000};
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+        ASSERT_TRUE(sub.try_receive().has_value());
+    }
+
+    auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* entries = kickmsg::ring_entries(ring);
+
+    // Stalled holder at pos=4 (idx 0): claimed the position, locked the
+    // entry, then was descheduled past commit_timeout.
+    ring->write_pos.store(5, std::memory_order_release);
+    uint64_t expected = 1;
+    ASSERT_TRUE(entries[0].sequence.compare_exchange_strong(
+        expected, kickmsg::seq_lock(4),
+        std::memory_order_acquire, std::memory_order_relaxed));
+
+    // The lock value is stable across the grace re-check -> repair steals.
+    EXPECT_EQ(region.repair_locked_entries(), 1u);
+    EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire),
+              kickmsg::seq_skip(4));
+    EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire),
+              kickmsg::INVALID_SLOT);
+    EXPECT_EQ(entries[0].payload_len.load(std::memory_order_acquire), 0u);
+
+    // The holder resumes and commits: the CAS from its own lock value must
+    // fail and leave the repaired entry untouched.  The old blind-store
+    // protocol re-stamped the same sequence here -- the torn-entry /
+    // sequence-rewind corruption this protocol exists to prevent.
+    uint64_t lock_val = kickmsg::seq_lock(4);
+    EXPECT_FALSE(entries[0].sequence.compare_exchange_strong(
+        lock_val, 5u, std::memory_order_release, std::memory_order_relaxed));
+    EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire),
+              kickmsg::seq_skip(4));
+    EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire),
+              kickmsg::INVALID_SLOT);
+}
+
+TEST_F(RegionTest, RepairGraceSparesInFlightCommit)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 4;
+    cfg.pool_size         = 8;
+    cfg.max_payload_size  = 8;
+    cfg.commit_timeout    = std::chrono::microseconds{50000};
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+        ASSERT_TRUE(sub.try_receive().has_value());
+    }
+
+    auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* entries = kickmsg::ring_entries(ring);
+
+    // Healthy holder mid-commit at pos=4.
+    ring->write_pos.store(5, std::memory_order_release);
+    uint64_t expected = 1;
+    ASSERT_TRUE(entries[0].sequence.compare_exchange_strong(
+        expected, kickmsg::seq_lock(4),
+        std::memory_order_acquire, std::memory_order_relaxed));
+
+    std::atomic<std::size_t> repaired{SIZE_MAX};
+    std::thread repairer([&] { repaired = region.repair_locked_entries(); });
+
+    // Commit while the repairer sits in its 50 ms grace sleep: the re-check
+    // sees the value changed and must NOT steal.
+    kickmsg::sleep(std::chrono::microseconds{10000});
+    entries[0].slot_idx.store(kickmsg::INVALID_SLOT, std::memory_order_relaxed);
+    entries[0].payload_len.store(0, std::memory_order_relaxed);
+    uint64_t lock_val = kickmsg::seq_lock(4);
+    EXPECT_TRUE(entries[0].sequence.compare_exchange_strong(
+        lock_val, 5u, std::memory_order_release, std::memory_order_relaxed));
+
+    repairer.join();
+    EXPECT_EQ(repaired.load(), 0u);
+    EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire), 5u);
+}
+
+TEST_F(RegionTest, StealBacksOffWhenEntryChangesFirst)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 4;
+    cfg.pool_size         = 8;
+    cfg.max_payload_size  = 8;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* entries = kickmsg::ring_entries(ring);
+
+    // A repairer observed the lock, but the holder committed first.
+    entries[0].slot_idx.store(3, std::memory_order_relaxed);
+    entries[0].payload_len.store(7, std::memory_order_relaxed);
+    entries[0].sequence.store(5, std::memory_order_release);
+
+    EXPECT_FALSE(kickmsg::entry_steal_and_clear(entries[0], 4,
+                                                kickmsg::seq_lock(4)));
+    EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire), 5u);
+    EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire), 3u);
+    EXPECT_EQ(entries[0].payload_len.load(std::memory_order_acquire), 7u);
 }

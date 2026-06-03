@@ -127,9 +127,9 @@ The region header is self-describing and forward-compatible:
 Header (at offset 0)
 ┌───────────────────────────────────────────────────────────┐
 │  magic (atomic)     0x4B49434B4D534721 ("KICKMSG!")       │
-│  version            4                                     │
+│  version            7                                     │
 │  channel_type       PubSub | Broadcast                    │
-│  total_size         total mmap size in bytes               │
+│  total_size         total mmap size in bytes              │
 │  sub_rings_offset   byte offset to first subscriber ring  │
 │  pool_offset        byte offset to slot pool              │
 │  max_subs           max subscriber slots                  │
@@ -148,6 +148,8 @@ Header (at offset 0)
 │  schema_state       Unset | Claiming | Set (atomic u32)   │
 │  schema_data        SchemaInfo — 512 B, 8 cache lines     │
 │  free_top           Treiber stack head (atomic u64)       │
+│  steal_count        stale entries stolen by repair (u64)  │
+│  identity_hash      logical-identity stamp (u64, 0=unset) │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -204,10 +206,10 @@ The descriptor is published via a three-state atomic (`schema_state`):
 
 ```
        try_claim_schema()              memcpy schema_data
-    ┌───── CAS ─────────►┌─────────────────────────►┌────────┐
-    │ Unset              │   Claiming               │  Set   │
+    ┌───── CAS ─────────►┌─────────────────────────►┌─────────┐
+    │ Unset              │   Claiming               │   Set   │
     │ (state = 0)        │   (state = 1)            │(state=2)│
-    └────────────────────┘   payload bytes written  └────────┘
+    └────────────────────┘   payload bytes written  └─────────┘
                              between Claiming and Set
 ```
 
@@ -258,14 +260,16 @@ region.
   first, here's what they wrote, you decide." The library never
   throws on schema grounds.
 
-Version bumped `4 → 5` for the cross-process runtime counters
-added to `SubRingHeader` (`dropped_count`, `lost_count` — see the
-Subscriber Ring section for their layout and semantics). The
-fields fit inside the existing `write_pos` cache-line padding, so
-`sizeof(SubRingHeader)` is unchanged, but the in-memory meaning of
-the bytes following `has_waiter` changed — v4 and v5 cannot share
-a region. Pre-v5 binaries are rejected at `open()` by the existing
-version check.
+Layout version history since the schema descriptor (v4): v5 added
+the cross-process runtime counters to `SubRingHeader`
+(`dropped_count`, `lost_count` -- see the Subscriber Ring section);
+v6 added the ring owner identity (`owner_pid`, `owner_starttime`)
+that `reclaim_dead_rings()` keys on; v7 changed the entry commit
+protocol (position-tagged locks, skip markers -- see the
+sequence-word encoding below) and added `steal_count` and
+`identity_hash` to the header. Each bump changes the in-memory
+meaning of shared bytes, so mixed-version binaries cannot share a
+region; mismatches are rejected at `open()` by the version check.
 
 
 ## Treiber Free Stack
@@ -310,7 +314,7 @@ contains a sequence number, slot index, and payload length -- all atomic.
 ```
 Ring[0]
 ┌──────────────────────────────────────────────────────────┐
-│  state: Live   in_flight: 0   write_pos: AtomicU64 = 42 │
+│  state: Live   in_flight: 0   write_pos: AtomicU64 = 42  │
 │                                                          │
 │  entries[0..7]:                                          │
 │  ┌─────┬───────────┬──────────┬─────────────┐            │
@@ -330,7 +334,7 @@ Ring[0]
 
 - **Capacity** must be a power of 2 (index masking: `pos & (cap - 1)`).
 - **state_flight** (atomic uint32): packed `[in_flight:30 | state:2]`.
-  State bits: `Free(0)`, `Live(1)`, `Draining(2)`.
+  State bits: `Free(0)`, `Live(1)`, `Draining(2)`, `Reclaiming(3)`.
   In_flight bits: number of publishers currently admitted to this ring.
   Packing into a single variable eliminates cross-variable ordering
   concerns: the publisher's CAS atomically checks state and increments
@@ -353,7 +357,7 @@ Ring[0]
   per instance.
 - **Sequence number** is monotonically increasing (`pos + 1`), used as a
   seqlock for data consistency validation and as a commit barrier between
-  publishers (see Publish Flow below).
+  publishers. The word is tag-encoded (see the encoding table below).
 - Stale entries (sequence < subscriber's expected) are detected and
   reported as lost messages.
 
@@ -362,6 +366,34 @@ cache line: the hot path already owns this line when incrementing
 `write_pos`, so bumping the counters on a rare drop/loss adds no new
 coherency traffic.  Different rings target different lines (128 B
 stride), so publishers/subscribers on distinct rings never contend.
+
+### Entry sequence-word encoding
+
+Each entry's 64-bit `sequence` packs a 2-bit tag (bit 63 = lock bit,
+bit 62 = repair bit) and a 62-bit value:
+
+```
+[tag:2 | value:62]
+  00  committed       word is pos + 1; slot_idx / payload_len valid
+  01  skip marker     word carries pos + 1; committed but EMPTY --
+                      metadata untrustworthy by design
+  10  locked          a publisher is mid-commit at pos
+                      (position-tagged lock, unique per position)
+  11  repair-locked   a repairer owns the entry mid-steal
+```
+
+Lock values are unique -- a position is claimed by exactly one
+publisher, which locks it at most once -- so an unchanged lock value
+across a full timeout window proves a single holder spanned it: the
+staleness proof every steal relies on.
+
+Stolen entries are committed as **skip markers**, not plain
+sequences. The stolen-from publisher's late metadata stores can land
+at any time after the steal, so nothing may ever trust `slot_idx` /
+`payload_len` under tag 01: subscribers count a skip-marked position
+as one lost message without reading its metadata, and the eviction
+path never releases a slot through a skip-tagged entry. The victim's
+stores are harmless by construction, not by timing.
 
 ### Subscriber join and visibility window
 
@@ -380,23 +412,33 @@ of death. A slow-but-alive publisher could still execute its
 pending `fetch_sub`, causing the same underflow.
 
 **Publisher self-repair**: when a publisher times out on a stuck
-entry, it heals the entry in place (3 stores, ~10 ns) so the next
-publisher at that position succeeds without timeout. This handles
-both Case A (LOCKED_SEQUENCE) and Case B (stale entry >1 wrap behind).
+entry, it heals the entry in place (a CAS steal, then a skip-marker
+commit) so the next publisher at that position succeeds without
+timeout. This handles both Case A (stale position-tagged lock, only
+when one lock value provably spanned the whole timeout) and Case B
+(stale entry >1 wrap behind).
 The operator primitives `repair_locked_entries()` and
 `reset_retired_rings()` remain available for defense-in-depth and
 health monitoring, but most crash residue is now self-healed by
 publishers on the hot path.
 
-**Ordering invariant**: the subscriber captures `write_pos` BEFORE
-the CAS to Live, not after (`Subscriber.cc`: `write_pos.load(acquire)`
-then `state_flight.compare_exchange_strong(Free, Live, acq_rel)`).
-Once the ring is Live, publishers can immediately
-`fetch_add(write_pos)`, racing with the subscriber's read. Capturing
-first guarantees `start_pos_ <= any position a publisher can claim
-after seeing Live`. Without this ordering, the subscriber's
-`drain_unconsumed` window `[start_pos_, wp)` can miss entries
-committed between the CAS and the read — a refcount leak.
+**Ordering invariant**: the subscriber reads `write_pos` BEFORE the
+CAS to Live (`Subscriber.cc`: `write_pos.load(acquire)` then
+`state_flight.compare_exchange_strong(Free, Live, acq_rel)`), and
+reads it AGAIN after winning the CAS. The two reads serve different
+purposes:
+
+- The pre-CAS value becomes `start_pos_`, the drain floor. Once the
+  ring is Live, publishers can immediately `fetch_add(write_pos)`,
+  racing with the read; capturing first guarantees `start_pos_ <= any
+  position a publisher can claim after seeing Live`. Without that,
+  `drain_unconsumed`'s window `[start_pos_, wp)` could miss entries
+  committed between the CAS and the read -- a refcount leak.
+- The post-CAS value seeds `read_pos_` (the larger of the two reads
+  wins). The pre-CAS value can be stale -- there is no happens-before
+  edge to the previous tenant's final position -- and consuming from
+  it would replay messages left over from the previous tenancy.
+
 **Anyone editing the Subscriber constructor must preserve this order.**
 
 A newly joined subscriber may miss a small number of in-flight
@@ -447,75 +489,108 @@ Publisher
    |                                a single LDADDAL on AArch64 (LSE).
    |
    |-- If ring full (wrap):
-   |     wait_and_capture_slot()   Spin-wait (check clock every 1024
+   |     wait_for_commit()         Spin-wait (check clock every 1024
    |     |                         iterations) up to commit_timeout
-   |     |                         (default 100ms).
-   |     |-- Committed:            Capture slot_idx (old_slot).
-   |     |                         Release is DEFERRED until after lock
-   |     |                         CAS succeeds (see below).
-   |     '-- Timeout (crash):      Previous writer crashed. old_slot =
-   |                                INVALID_SLOT. The pool slot referenced
-   |                                by the abandoned entry is leaked
-   |                                (recoverable by GC). The ring position
-   |                                is poisoned until repair_locked_entries().
+   |     |                         (default 10 ms).
+   |     |-- Committed:            Proceed to the lock CAS. The previous
+   |     |                         occupant's slot is released AFTER the
+   |     |                         lock succeeds, from a post-lock read
+   |     |                         of slot_idx (see below).
+   |     '-- Timeout (crash or     Records whether ONE position-tagged
+   |          stall):               lock value spanned the whole wait —
+   |                                the proof self-repair needs before
+   |                                stealing the lock.
    |
    |-- Two-phase commit:
    |   |
    |   | Phase 1 - CAS lock:
-   |   |   CAS entry.sequence       Atomically swap from prev_seq to
-   |   |     prev_seq -> LOCKED      LOCKED_SEQUENCE (UINT64_MAX).
-   |   |                             This exclusively owns the entry:
-   |   |                             no other publisher can CAS from
-   |   |                             LOCKED_SEQUENCE since they expect
-   |   |                             prev_seq.
-   |   |   Retry up to 64 times     If another publisher holds the lock
-   |   |     if expected ==          (entry is LOCKED_SEQUENCE), retry.
-   |   |     LOCKED_SEQUENCE         The holder will release quickly
-   |   |                             (just two relaxed stores + one
-   |   |                             release store).
-   |   |   If expected is neither    Entry was committed by another
-   |   |     prev_seq nor LOCKED     publisher. excess++, give up
-   |   |                             on this ring.
+   |   |   CAS entry.sequence       CAS from the OBSERVED previous value
+   |   |     observed ->             -- a plain commit at prev_seq OR a
+   |   |     seq_lock(pos)           skip marker carrying prev_seq -- to
+   |   |                             seq_lock(pos), the position-tagged
+   |   |                             lock [tag:2|pos:62]. This exclusively
+   |   |                             owns the entry: no other publisher
+   |   |                             can CAS from a lock value since they
+   |   |                             expect an unlocked word at prev_seq,
+   |   |                             and every locker's value is unique
+   |   |                             (one publisher per position, locks
+   |   |                             at most once). Whether the
+   |   |                             predecessor was a skip marker is
+   |   |                             remembered for the slot release
+   |   |                             below.
+   |   |   Retry up to 64 times     If another publisher holds the lock,
+   |   |     if locked               reload and retry. The holder will
+   |   |                             release quickly (two relaxed stores
+   |   |                             + one CAS commit).
+   |   |   If unlocked but not       Entry was committed by another
+   |   |     at prev_seq             writer. Lock failure path below.
    |   |
    |   | Lock failure:
-   |   |   state_flight.fetch_sub   Release admission — this ring's
-   |   |     (IN_FLIGHT_ONE, rel.)  in_flight was incremented during the
-   |   |                             CAS admission step above. Must be
-   |   |                             decremented on every exit path,
-   |   |                             otherwise the subscriber destructor
-   |   |                             spin-waits on in_flight forever.
-   |   |   Self-repair:             If the entry is stuck (LOCKED or
-   |   |     if LOCKED or stale:    >1 wrap stale), advance it so the
-   |   |       store INVALID_SLOT   NEXT publisher at this position
-   |   |       store seq = expected succeeds without timeout.
-   |   |   excess++, continue       Do NOT release old_slot — between
-   |   |                             capture and now, the entry may have
-   |   |                             been overwritten. old_slot could
-   |   |                             belong to a newer generation. The
+   |   |   Self-repair:             Steal a provably-stale entry (lock
+   |   |     CAS to seq_repair(pos)  value stable across the whole wait,
+   |   |     store INVALID_SLOT      or committed >1 wrap behind) and
+   |   |     commit seq_skip(pos)    commit it as an EMPTY SKIP MARKER so
+   |   |                             the NEXT publisher at this position
+   |   |                             succeeds without timeout. The CAS
+   |   |                             backs off if a live writer wins.
+   |   |                             Do NOT release any slot -- the entry
+   |   |                             was never ours. The stale occupant's
    |   |                             unreleased ref is a bounded leak
-   |   |                             (1 per drop), recoverable by GC.
+   |   |                             (1 per steal), recoverable by GC.
+   |   |   abandon_delivery():      Count the drop, then release
+   |   |     dropped_count++         admission -- this ring's in_flight
+   |   |     state_flight.fetch_sub  was incremented at CAS admission and
+   |   |       (IN_FLIGHT_ONE, rel.) must be decremented on every exit
+   |   |     Dekker wake             path, otherwise the subscriber
+   |   |       (fence + has_waiter   destructor spin-waits forever.
+   |   |        + futex_wake_all)    Then the SAME wake as the success
+   |   |                             path: write_pos already advanced
+   |   |                             (the position may now carry a skip
+   |   |                             marker), so without the wake a
+   |   |                             parked subscriber sleeps out its
+   |   |                             full timeout.
+   |   |   excess++, continue
    |   |
-   |   | Lock success — deferred release:
-   |   |   Re-read e.slot_idx       After locking, we own the entry.
-   |   |   If slot_idx != INVALID:  Release old_slot (this ring's
-   |   |     release_slot(old_slot) reference to the previous occupant).
-   |   |   If slot_idx == INVALID:  drain_unconsumed already released
-   |   |     skip release            this ring's reference. Releasing
-   |   |                             again would double-decrement.
-   |   |   Why deferred? TOCTOU: between wait_and_capture_slot reading
-   |   |   slot_idx and the lock CAS, another publisher (or drain) can
-   |   |   modify the entry. Releasing before lock risks corrupting a
-   |   |   live slot's refcount. After lock, no concurrent modification.
+   |   | Lock success -- release previous occupant:
+   |   |   If NOT prev_was_skip     After locking, we own the entry; the
+   |   |     and pos >= capacity:   lock-CAS acquire pairs with the
+   |   |       read e.slot_idx       previous committer's release, so even
+   |   |       if in bounds:         a commit that landed after our wait
+   |   |         release_slot(it)    timed out is seen and released here.
+   |   |                             INVALID (drain marker) fails the
+   |   |                             bound check: drain_unconsumed already
+   |   |                             released this ring's reference --
+   |   |                             releasing again would double-
+   |   |                             decrement. A SKIP predecessor is
+   |   |                             never released: its metadata is
+   |   |                             untrustworthy by design; the stolen
+   |   |                             entry's ref is left for GC. Below
+   |   |                             one wrap there is no predecessor
+   |   |                             (a zero-initialized slot_idx would
+   |   |                             read as valid slot 0).
+   |   |
+   |   | Theft guard:               If sequence != seq_lock(pos), a
+   |   |   reload entry.sequence    repairer proved our lock stale (we
+   |   |   if not ours: drop        stalled past commit_timeout) and owns
+   |   |                             the entry. Storing data now would
+   |   |                             tear the repaired entry.
    |   |
    |   | Write entry fields (relaxed, safe because we hold the lock):
    |   |   entry.slot_idx    = 3
    |   |   entry.payload_len = 128
    |   |
-   |   | Phase 2 - commit:
-   |   '   entry.sequence = 43      Release-store commits the entry.
-   |                                 Subscribers and future publishers
-   |                                 at this position will see all
-   |                                 preceding stores.
+   |   | Phase 2 - CAS commit:
+   |   '   CAS entry.sequence       CAS, not a blind store: fails only if
+   |         seq_lock(pos) -> 43     a repairer stole the lock after the
+   |                                 theft guard -- the entry is then a
+   |                                 committed skip marker, and our late
+   |                                 slot_idx/payload_len stores landed
+   |                                 under tag 01, which nothing ever
+   |                                 trusts: permanently harmless. We
+   |                                 record a drop (abandon_delivery).
+   |                                 Release on success: subscribers and
+   |                                 future publishers at this position
+   |                                 see all preceding stores.
    |
    |-- state_flight.fetch_sub       Release admission — subscriber
    |     (IN_FLIGHT_ONE, release)   destructor can now observe
@@ -546,12 +621,12 @@ Publisher
 
 Without the lock, two publishers that CAS `write_pos` to adjacent
 positions could interleave their `slot_idx` and `sequence` stores on
-overlapping entries (after a ring wrap). The `LOCKED_SEQUENCE` sentinel
+overlapping entries (after a ring wrap). The position-tagged lock
 prevents this: only one publisher at a time can write an entry's data
-fields, and the final release-store of the real sequence makes the
-entry visible atomically.
+fields, and the final CAS commit of the real sequence makes the entry
+visible atomically — or fails, detectably, if the lock was stolen.
 
-Subscribers treat `LOCKED_SEQUENCE` the same as "not yet committed"
+Subscribers treat any locked value the same as "not yet committed"
 and return `nullopt`, so the lock is invisible to them except as a
 brief delay.
 
@@ -599,17 +674,25 @@ Subscriber X (read_pos_ = 41, local)
 2. entry = entries[41 & mask]        Read the ring entry.
    seq1 = entry.sequence (acquire)
    |
-   |  Four outcomes:
+   |  Five outcomes:
    |
    |-- seq1 == expected (42)         Data ready -> proceed to read.
    |
-   |-- seq1 > expected (42)          Subscriber fell behind. The entry
-   |     (e.g. seq1 = 47)            was overwritten while we weren't
-   |     lost_ += (47 - 42)          looking. Skip ahead, count as lost.
-   |     read_pos_++                  Continue loop -> retry next entry.
-   |     continue
+   |-- seq1 is a skip marker         A repair stole this position from a
+   |     carrying expected (42)      stalled publisher. Committed but
+   |     lost_++                      EMPTY: the metadata is untrustworthy
+   |     read_pos_++                  by design and never read. Count one
+   |     continue                     lost, retry next entry.
    |
-   |-- seq1 == LOCKED_SEQUENCE       A publisher is mid-commit on this
+   |-- seq1 > expected (42)          Subscriber fell behind. The entry
+   |     lost_++                      was overwritten while we weren't
+   |     read_pos_++                  looking. Count one lost, retry next
+   |     continue                     entry. (Falling more than a full
+   |                                  ring behind is detected earlier,
+   |                                  against write_pos, and skipped in
+   |                                  bulk.)
+   |
+   |-- seq1 is a lock value          A publisher is mid-commit on this
    |     return nullopt               entry. Come back later.
    |
    '-- seq1 < expected (42)          Entry not yet committed. A publisher
@@ -618,10 +701,10 @@ Subscriber X (read_pos_ = 41, local)
                                       sequence yet. Come back later.
                                       Not a deadlock: if the publisher
                                       crashed, the next publisher at this
-                                      position will eventually overwrite
-                                      the entry (after commit_timeout),
-                                      and the subscriber will then see
-                                      seq > expected (skip path above).
+                                      position eventually steals the entry
+                                      (after commit_timeout) and commits a
+                                      skip marker, which the skip path
+                                      above consumes.
    |
    v
 3. Read slot_idx and payload_len from the entry.
@@ -632,16 +715,16 @@ Subscriber X (read_pos_ = 41, local)
    |  via CAS before reading data. This prevents the publisher    |
    |  from freeing the slot while the subscriber reads it.        |
    |                                                              |
-   |  CAS Slot.refcount: rc -> rc+1   Pin the slot (only if      |
-   |    (retry while rc > 0)          rc > 0, i.e. slot alive)   |
-   |    (if rc == 0: slot freed       between seq1 read and      |
-   |     between seq1 and now,        now. Count as lost.)       |
-   |     skip as lost message)                                   |
+   |  CAS Slot.refcount: rc -> rc+1   Pin the slot (only if       |
+   |    (retry while rc > 0)          rc > 0, i.e. slot alive)    |
+   |    (if rc == 0: slot freed       between seq1 read and       |
+   |     between seq1 and now,        now. Count as lost.)        |
+   |     skip as lost message)                                    |
    |                                                              |
-   |  seq2 = entry.sequence (acquire)  Seqlock validation: if    |
+   |  seq2 = entry.sequence (acquire)  Seqlock validation: if     |
    |  seq2 == seq1?                    the entry was overwritten  |
    |    -> yes: pin valid              after we pinned, the       |
-   |    -> no:  undo pin, count lost   slot_idx may be stale.    |
+   |    -> no:  undo pin, count lost   slot_idx may be stale.     |
    |                                                              |
    |---- Copy mode: try_receive() --------------------------------|
    |                                                              |
@@ -651,7 +734,7 @@ Subscriber X (read_pos_ = 41, local)
    |  read_pos_++                                                 |
    |  return SampleRef { recv_buf_, payload_len }                 |
    |                                                              |
-   |  Note: SampleRef points into recv_buf_ (subscriber-local    |
+   |  Note: SampleRef points into recv_buf_ (subscriber-local     |
    |  buffer). Calling try_receive() again overwrites it.         |
    |  Copy data from SampleRef before the next call.              |
    |                                                              |
@@ -724,9 +807,13 @@ resource leaks.
 ```
 Crash point                        Consequence
 ─────────────────────────────────────────────────────────────────────
-After treiber_pop, before          Pool slot leaked (popped but
-  refcount pre-set                 never published, refcount never
-                                   set). Bounded: 1 slot per crash.
+After treiber_pop, before          Pool slot orphaned (popped but
+  refcount pre-set                 never published: refcount 0, off
+                                   the free stack, in no ring).
+                                   Bounded: 1 slot per crash.
+                                   Recovered by reclaim_orphaned_
+                                   slots() via its free-stack
+                                   membership walk.
 
 After refcount pre-set, during     Refcount was set to max_subs but
   the ring-push loop (delivered    only k out of N rings were visited
@@ -735,34 +822,45 @@ After refcount pre-set, during     Refcount was set to max_subs but
                                    reference (inline for non-Live, or
                                    via eviction/consumption for Live).
                                    Remaining (max_subs - k) references
-                                   are never released. The slot is
-                                   permanently leaked.
+                                   are never released by normal paths;
+                                   the slot is leaked until reclaim_
+                                   orphaned_slots() reclaims it (once
+                                   the k ring entries have been
+                                   consumed or evicted).
 
 After CAS on write_pos, before     Two sub-cases depending on whether
   sequence store (the dangerous    the publisher reached the CAS lock:
   window)
-                                   Case A — crash after CAS lock
-                                   (entry stuck at LOCKED_SEQUENCE):
-                                   Next publisher at this position
-                                   waits commit_timeout and drops.
-                                   repair_locked_entries() advances
-                                   the entry to the expected sequence.
+                                   Case A -- crash after CAS lock
+                                   (entry stuck at a position-tagged
+                                   lock): next publisher at this
+                                   position waits commit_timeout,
+                                   observes one stable lock value across
+                                   the whole wait, steals the entry
+                                   (CAS) and commits it as a skip
+                                   marker. The external
+                                   repair_locked_entries() does the
+                                   same with a grace re-check.
 
-                                   Case B — crash before CAS lock
+                                   Case B -- crash before CAS lock
                                    (entry still at the previous
                                    cycle's committed sequence):
                                    Next publisher at this position
                                    also waits commit_timeout and drops.
                                    repair_locked_entries() detects the
                                    entry is more than one full wrap
-                                   behind and advances it.
+                                   behind and skip-commits it.
 
-                                   In both cases, the pool slot
-                                   referenced by the crashed entry
-                                   may be garbage — it is marked
-                                   INVALID_SLOT by the repair, and
-                                   recovered by reclaim_orphaned_slots.
-                                   Subscriber sees a gap (lost msg).
+                                   In both cases the position ends as
+                                   a skip marker: the subscriber
+                                   counts it as one lost message
+                                   without reading the metadata, and
+                                   any slot ref the stale entry held
+                                   is recovered by
+                                   reclaim_orphaned_slots. (The
+                                   repair's INVALID_SLOT store is a
+                                   diagnostic only -- nothing trusts
+                                   metadata under a skip tag.)
 
 After sequence store               No issue. Entry is committed.
                                    Subscribers can read it normally.
@@ -771,35 +869,52 @@ After sequence store               No issue. Entry is committed.
 ### Timeout mechanism
 
 When a publisher wraps around to a ring entry that was previously
-claimed but never committed, it calls `wait_and_capture_slot()`:
+claimed but never committed, it calls `wait_for_commit()`:
 
 ```
-wait_and_capture_slot(entry, expected_seq, timeout):
+wait_for_commit(entry, expected_seq, timeout):
+    first = entry.sequence (acquire)
     deadline = now() + timeout
     loop (check clock every 1024 iterations):
         seq = entry.sequence (acquire)
-        if seq >= expected_seq and seq != LOCKED_SEQUENCE:
-            return entry.slot_idx          (committed, capture the old slot)
+        if seq is not locked and seq_pos(seq) >= expected_seq:
+            return {seq, stable_lock: false}      (committed -- a plain
+                                                   commit or skip marker)
         if now() >= deadline:
-            return INVALID_SLOT            (timeout)
+            return {seq, stable_lock: first is locked and seq == first}
 ```
 
-The function skips entries in `LOCKED_SEQUENCE` state because another
-publisher is mid-commit on that entry and will release shortly.
+The function waits out locked entries because another publisher is
+mid-commit and will release shortly. `stable_lock` records that ONE
+position-tagged lock value was observed at both ends of the full
+window: a position is claimed by exactly one publisher and locked at
+most once, so this proves a single holder exceeded the commit budget.
 
-On timeout (returns `INVALID_SLOT`), the publisher:
-1. Skips `release_slot()` (the old `slot_idx` may be garbage)
-2. Attempts the CAS lock — if it fails, the publisher **self-repairs**
-   the stuck entry in place (stores `INVALID_SLOT` + the expected
-   sequence) so the next publisher at this position succeeds without
-   paying the timeout.  Self-repair handles both Case A (LOCKED) and
-   Case B (stale), costs ~10 ns on top of the already-spent timeout,
-   and is safe under live traffic (idempotent stores).
-3. Drops delivery for this ring and moves to the next subscriber ring.
-   The ring resumes normal operation on the next wrap.
+On timeout, the publisher:
+1. Attempts the CAS lock -- if it fails, the publisher **self-repairs**:
+   it steals a provably-stale entry (stable lock, or committed >1 wrap
+   behind) with a CAS to `seq_repair(pos)` and commits it as a skip
+   marker (`seq_skip(pos)`: tag 01, word carrying pos + 1) so the next
+   publisher at this position succeeds without paying the timeout. The
+   CAS backs off if a live writer commits first. A stolen-from
+   publisher that was merely slow detects the theft at its own theft
+   guard or CAS commit and records a drop instead of corrupting the
+   entry. Its late metadata stores -- landing at any point after the
+   steal -- fall under the skip tag, which nothing ever trusts:
+   subscribers count the position lost without reading
+   slot_idx/payload_len, and the eviction path never releases a slot
+   through a skip-tagged entry. The victim's stores are permanently
+   harmless by construction, not by timing.
+2. Drops delivery for this ring and moves to the next subscriber ring.
+   Every drop path ends in `abandon_delivery()`, which mirrors the
+   success path's Dekker wake (seq_cst fence, `has_waiter` check,
+   `futex_wake_all`): `write_pos` already advanced, so without the
+   wake a parked subscriber would sleep out its full timeout on a
+   position that will never plainly commit. The ring resumes normal
+   operation on the next wrap.
 
 The timeout is configurable per channel via `channel::Config::commit_timeout`
-(default: 100 ms). The tradeoff:
+(default: 10 ms). The tradeoff:
 
 - **Shorter timeout** → faster recovery after a crash, but higher risk
   of falsely evicting a slow-but-alive publisher under heavy scheduling
@@ -812,13 +927,21 @@ The timeout is configurable per channel via `channel::Config::commit_timeout`
 
 The subscriber never deadlocks either. If a publisher crashes
 mid-commit:
-1. The subscriber sees `seq < expected` or `seq == LOCKED_SEQUENCE`
+1. The subscriber sees `seq < expected` or a locked value
    and returns `nullopt` (data not ready yet)
-2. Eventually, another publisher wraps to the same position,
-   times out on `wait_and_capture_slot`, and overwrites the entry
-   via the two-phase commit with a higher sequence number
-3. The subscriber then sees `seq > expected` (skip path),
-   counts the gap as lost messages, and resumes
+2. Eventually another publisher wraps to the same position, times
+   out on `wait_for_commit`, and either commits its own payload via
+   the two-phase commit or steals the entry as a skip marker
+3. The subscriber then sees `seq > expected` (skip-ahead path) or a
+   skip marker at exactly `expected` (one message lost, metadata
+   never read), counts the loss, and resumes
+
+While the head position is claimed-but-uncommitted, a blocking
+`receive()` cannot park on the futex: it watches `write_pos`, and
+the commit itself produces no futex edge. It polls instead -- a
+bounded yield burst (64 spins), then 100 us naps until the entry
+commits or the timeout expires -- so a crashed publisher costs naps,
+not a hot spin for the whole timeout.
 
 ### Leak classes
 
@@ -842,7 +965,8 @@ and full-window drain:
 
 ```
 ~Subscriber():
-    1. state = Draining (seq_cst)       — publishers see non-Live, skip this ring
+    1. state = Draining                 — CAS, acq_rel, preserves in_flight;
+                                          publishers see non-Live, skip this ring
     2. spin until in_flight == 0        — bounded by commit_timeout
        a) success: quiescence achieved
        b) timeout: publisher likely crashed — skip drain (see below)
@@ -856,7 +980,9 @@ and full-window drain:
              entry.slot_idx = INVALID_SLOT (seq_cst)
            else:
              skip (evicted, uncommitted, or locked — falls into Class B)
-    4. state = Free (seq_cst)           — ring available for a new subscriber
+    4. state = Free (release)           — ring available for a new subscriber
+                                          (timeout path: CAS that preserves
+                                          the crashed publisher's in_flight)
 ```
 
 The key invariant: `in_flight` is incremented by publishers BEFORE
@@ -895,9 +1021,13 @@ Only Class B can leak slots. Each publisher crash leaks at most
 **2 pool slots**:
 
 - The slot the crashed publisher allocated (refcount stuck > 0 because
-  the remaining rings were never visited for inline release)
-- The slot referenced by the abandoned ring entry (if one existed
-  at the wrapped position and its `slot_idx` could not be trusted)
+  the remaining rings were never visited for inline release; or
+  refcount 0 and off the free stack, for a crash before the pre-set)
+- The slot referenced by the stolen ring entry, if one existed at the
+  wrapped position: the steal deliberately never releases it (the
+  stalled holder may already have batch-released this ring's ref, and
+  metadata under a skip tag is untrustworthy), so its ring ref leaks
+  until GC -- at most one per steal
 
 With a typical pool of 256+ slots, the system can tolerate dozens of
 crashes before running low. Class B leaks can be recovered by the
@@ -906,10 +1036,11 @@ garbage collector (see below).
 
 ## Garbage Collection
 
-Publisher crash leaks (Class B) leave pool slots with permanently
-inflated refcounts. Since the crashed process is gone, no normal
-code path will ever decrement them to zero. An explicit garbage
-collection pass is needed for long-running systems.
+Publisher crash leaks (Class B) leave pool slots with inflated
+refcounts -- or, for a crash in the treiber_pop window, refcount 0
+while off the free stack. Since the crashed process is gone, no
+normal code path will ever return them to the pool. An explicit
+garbage collection pass is needed for long-running systems.
 
 ### Design principles
 
@@ -928,31 +1059,69 @@ Recovery is split into two methods with different safety profiles:
 
 **`repair_locked_entries()`** — safe under live traffic.
 
-Scans all ring entries. If `sequence == LOCKED_SEQUENCE` (publisher crashed
-mid-commit), commits the entry with `slot_idx = INVALID_SLOT` and the
-correct final sequence (`pos + 1`). This unblocks future publishers
-wrapping to this position: they CAS `(pos + 1) → LOCKED`, which now
-succeeds. Subscribers and evictions skip `INVALID_SLOT` entries. The
-worst case under live traffic is a benign double-store if a slow (but
-alive) publisher commits at the same time.
+Scans all ring entries. Stale committed entries (>1 wrap behind,
+including stale skip markers) are stolen immediately; locked entries
+are collected and re-checked after a full `commit_timeout` grace
+sleep -- the same position-tagged lock value at both instants proves
+its unique holder exceeded the commit budget. Every steal takes
+ownership with a CAS to `seq_repair(pos)` before touching the entry,
+then commits the entry as a skip marker (`seq_skip(pos)`: tag 01,
+word carrying pos + 1). The `INVALID_SLOT` / zero-length stores made
+under the repair lock are diagnostics only -- nothing ever trusts
+metadata under a skip tag. A live publisher that commits first wins
+the CAS race and the repairer backs off; a stolen-from publisher that
+was merely slow detects the theft (theft guard / CAS commit) and
+records a drop. Subscribers count a skip-marked position as one lost
+message without reading its metadata; evictions never release a slot
+through one.
+
+Residuals, both bounded:
+- The victim's late metadata stores -- landing at any point after the
+  steal -- fall under the skip tag and are ignored by construction,
+  so they are harmless; there is no torn-read window.
+- The stolen entry's previous slot reference is never released by the
+  repair (the stalled holder may already have batch-released this
+  ring's ref; releasing again could double-free). At most one slot
+  ref leaks per steal, recovered by `reclaim_orphaned_slots()`.
 
 ```
 repair_locked_entries(region):
+    candidates = []
     for each ring i in [0, max_subs):
         for pos in [oldest_live, write_pos):
-            if entries[pos].sequence == LOCKED_SEQUENCE:
-                entries[pos].slot_idx = INVALID_SLOT
-                entries[pos].payload_len = 0
-                entries[pos].sequence = pos + 1    // committed sequence
+            seq = entries[pos].sequence
+            if seq is locked:
+                candidates += {entry, pos, seq}        // grace below
+            else if seq_pos(seq) + capacity < pos + 1:
+                steal(entry, pos, seq)                 // Case B, CAS-guarded
+    if candidates: sleep(commit_timeout)               // grace
+    for {entry, pos, seq} in candidates:
+        if entry.sequence == seq:                      // same holder spanned it
+            steal(entry, pos, seq)
+
+steal(entry, pos, observed):                           // entry_steal_and_clear
+    CAS entry.sequence: observed -> seq_repair(pos)    // live writer wins: back off
+    entry.slot_idx    = INVALID_SLOT                   // diagnostics only
+    entry.payload_len = 0
+    entry.sequence    = seq_skip(pos)                  // release: committed, empty
 ```
 
-**`reclaim_orphaned_slots()`** — requires full quiescence.
+**`reclaim_orphaned_slots()`** -- requires full quiescence.
 
-Scans all ring entries to build a set of referenced slot indices, then
-reclaims any slot with refcount > 0 that is not in the referenced set.
+Builds the set of slot indices referenced by plain-committed ring
+entries (locked and skip-marked entries are excluded -- skip metadata
+is untrustworthy by design), walks the free stack to record
+membership (exact under the quiescence contract, bounded by
+`pool_size` against corrupt `next_free` cycles), then reclaims every
+slot that is neither referenced nor on the stack -- regardless of
+refcount. The membership walk is what recovers rc == 0 orphans (a
+publisher crash between `treiber_pop` and the refcount pre-set, or a
+reclaimer killed between its refcount store and its push) that a
+refcount-only scan never could.
 NOT safe under live traffic. Requires:
 - All publishers quiesced (a publisher between refcount pre-set and
-  ring push has rc > 0 but no ring entry yet).
+  ring push has rc > 0 but no ring entry yet; one between treiber_pop
+  and the pre-set holds an off-stack rc == 0 slot).
 - No outstanding `SampleView` objects (a view holds a refcount pin
   without a ring entry reference; reclaiming it would free memory
   still being read).
@@ -962,11 +1131,16 @@ reclaim_orphaned_slots(region):
     referenced = {}
     for each ring i in [0, max_subs):
         for pos in [oldest_live, write_pos):
-            if entries[pos].sequence >= pos + 1:
+            seq = entries[pos].sequence
+            if seq is plain-committed (tag 00) and seq >= pos + 1:
                 referenced.insert(entries[pos].slot_idx)
 
+    on_stack = {}                            // exact under quiescence
+    for idx in chain from free_top, bounded by pool_size:
+        on_stack.insert(idx)
+
     for idx in [0, pool_size):
-        if slot[idx].refcount > 0 and idx not in referenced:
+        if idx not in referenced and idx not in on_stack:
             slot[idx].refcount = 0
             treiber_push(free_top, slot[idx], idx)
 ```
@@ -977,11 +1151,10 @@ reclaim_orphaned_slots(region):
 Crash scenario                       GC effect
 ──────────────────────────────────────────────────────────────────────
 After treiber_pop, before publish    Slot has refcount 0, not in any
-                                     ring, not in free stack. GC cannot
-                                     distinguish it from a legitimately
-                                     free slot → NOT reclaimed (Class B
-                                     unrecoverable leak, bounded to 1
-                                     slot per crash, see below).
+                                     ring, not in the free stack. The
+                                     free-stack membership walk proves
+                                     it off-stack, and it appears in no
+                                     committed entry -> reclaimed.
 
 After refcount pre-set, delivered    Slot is in k rings but refcount
   to k of N rings                    is max_subs. The k ring references
@@ -1009,14 +1182,17 @@ After write_pos CAS, before          Entry is overwritten after
 // Draining ring with publishers finishing). Call twice with a gap
 // > commit_timeout; persistent counts indicate a real crash.
 auto report = region.diagnose();
-// report.locked_entries:  entries stuck at LOCKED_SEQUENCE
+// report.locked_entries:  entries holding a position-tagged lock, or
+//                         committed >1 wrap stale (incl. stale skip markers)
 // report.retired_rings:   Free rings with stale in_flight > 0
 // report.draining_rings:  Draining rings with in_flight > 0 (usually transient)
-// report.dead_rings:      Live/Draining rings whose owner process is gone
+// report.dead_rings:      Live/Draining/Reclaiming rings whose owner is gone
 // report.live_rings:      active subscriber rings
+// report.schema_stuck:    schema slot at Claiming (advisory; may be a live claim)
 
-// Safe under live traffic — repairs poisoned ring entries.
-// Can be called freely on a health-check timer.
+// Safe under live traffic — commits poisoned ring entries as skip
+// markers (CAS steal after a grace re-check; blocks one commit_timeout
+// when locked entries exist). Can be called on a health-check timer.
 std::size_t repaired = region.repair_locked_entries();
 
 // Reclaims rings whose owning subscriber process has died. Safe under
@@ -1036,15 +1212,25 @@ std::size_t reclaimed = region.reclaim_orphaned_slots();
 counts of locked entries and stuck rings. The supervisor calls this
 periodically; persistent nonzero counts signal recovery is needed.
 
-**`repair_locked_entries()`** — commits locked entries with
-`INVALID_SLOT`. Safe under live traffic (benign double-store if a
-slow publisher commits at the same time). Can run on a timer.
+**`repair_locked_entries()`** -- commits provably-stale entries as
+skip markers. Safe under live traffic: steals are CAS-guarded and
+gated on a commit_timeout grace re-check, so a live publisher always
+wins and a slow one detects the theft. Can run on a timer.
 
-**`reclaim_dead_rings()`** — reclaims `Live`/`Draining` rings whose
-owning subscriber process has died, identified by the `owner_pid` +
-`owner_starttime` recorded on the ring at claim time and checked
-against the OS (same liveness test as `Registry::sweep_stale`). Safe
-under live traffic: a slow-but-alive subscriber is never touched.
+**`reclaim_dead_rings()`** -- reclaims `Live`/`Draining`/`Reclaiming`
+rings whose owning subscriber process has died, identified by the
+`owner_pid` + `owner_starttime` recorded on the ring at claim time
+and checked against the OS (same liveness test as
+`Registry::sweep_stale`). Safe under live traffic and against
+concurrent reclaimers: a single-shot CAS moves the ring to
+`Reclaiming`, owner death is re-verified under that exclusivity, then
+the ring is freed -- or restored, if the check turned out to have
+raced a fresh claim (the restore loop only acts while the state is
+still `Reclaiming`, so it never stomps the owner's own teardown). A
+slow-but-alive subscriber is never touched.
+A reclaimer that crashes mid-pass leaves the ring at `Reclaiming`;
+that residue is recovered by a later call (owner dead) or by the live
+owner's own teardown.
 `in_flight` is preserved (a mid-commit publisher must still
 `fetch_sub`), so a reclaimed ring with leftover `in_flight` lands in
 the retired state for `reset_retired_rings()` to finish.
@@ -1056,9 +1242,10 @@ deliberate post-crash action. For a dead *subscriber* prefer
 `reclaim_dead_rings()`, which is liveness-checked and cannot underflow
 `in_flight` against a slow publisher.
 
-**`reclaim_orphaned_slots()`** — walks all rings to build a
-referenced-slot set, then frees any unreferenced slot with
-refcount > 0. NOT safe under live traffic — requires all publishers
+**`reclaim_orphaned_slots()`** -- walks all rings to build a
+referenced-slot set and the free stack for membership, then frees any
+slot that is neither referenced nor on the stack, regardless of
+refcount. NOT safe under live traffic -- requires all publishers
 quiesced and no outstanding `SampleView` objects.
 
 ### Recommended recovery sequence
@@ -1081,13 +1268,12 @@ In most cases, steps 2–4 restore the channel to full operation.
 The recovery primitives close the common crash classes but have a few
 documented edges, all bounded:
 
-- **`reclaim_orphaned_slots()` is not crash-safe mid-pass.** It resets a
-  slot's refcount to 0 and pushes it to the free stack as two separate
-  stores. If the *recovering* process is killed between them, the slot is
-  neither referenced nor free-listed (refcount 0), and a re-run skips it
-  (the `refcount > 0` guard no longer matches) — a permanent leak of that
-  one slot. Run recovery from a supervisor that is not itself under the
-  OOM/kill pressure that triggered recovery.
+- **`reclaim_orphaned_slots()` mid-pass crash is self-healing.** It
+  resets a slot's refcount to 0 and pushes it to the free stack as two
+  separate stores. If the *recovering* process is killed between them,
+  the slot is left rc == 0, unreferenced, and off the stack -- exactly
+  the shape the next run's free-stack membership walk reclaims. No
+  permanent leak; just re-run the pass.
 
 - **`reset_retired_rings()` trusts the operator.** It zeroes `in_flight`;
   if called while a misclassified slow-but-alive publisher still owes a
@@ -1128,7 +1314,11 @@ free_top (Treiber)      64-bit tagged pointer: 32-bit generation counter
 write_pos (rings)       Monotonically increasing 64-bit counter. Only goes
                         up, never revisits a value.
 
-state (subscriber)      One-way state machine: Free → Live → Draining → Free.
+state (subscriber)      One-way claim cycle: Free -> Live -> Draining ->
+                        Free, plus a Reclaiming detour (Live/Draining ->
+                        Reclaiming -> Free, or back) that
+                        reclaim_dead_rings holds exclusively while
+                        re-verifying owner death.
                         Publishers only deliver to Live rings. The
                         packed state_flight design (state + in_flight
                         in a single uint32) eliminates cross-variable
@@ -1278,6 +1468,17 @@ open_mailbox("peer", "reply")      /{prefix}_peer_mbx_reply
 
 Mailbox paths include the owner's node name because they are personal
 reply channels -- the sender must know who to reply to.
+
+Name components are sanitized into POSIX-shm-safe fragments, and that
+mapping is many-to-one ("a:b" and "a b" both become "a_b"); the
+"broadcast_" / "_mbx_" infixes are not escaped either, and macOS shm
+names are truncated hashes.  Two distinct logical channels can
+therefore collide onto one shm name.  To detect this, the Node stamps
+`identity_hash` into the header at create time — an FNV-1a chain over
+a kind tag ("topic" / "broadcast" / "mailbox"), the namespace, and the
+RAW (pre-sanitization) logical coordinates.  Opens verify it when both
+sides are nonzero and fail with "Identity mismatch on existing region"
+instead of silently sharing the region.  Not part of `config_hash`.
 
 
 ## Registry & Discovery
@@ -1479,23 +1680,26 @@ competing for the same ring entry). In practice, the lock is held
 for two relaxed stores + one release store (~nanoseconds), so the
 64-retry budget is generous.
 
-### Unrecoverable slot leak (Class B)
+### Slot leak window on publisher crash (Class B)
 
 If a publisher crashes between `treiber_pop` (slot allocated, refcount=0)
 and `refcount.store(max_subs)`, the slot has refcount=0 and is neither
-in the free stack nor referenced by any ring entry. The GC cannot
-distinguish it from a legitimately free slot and will not reclaim it.
+in the free stack nor referenced by any ring entry. No normal code
+path will ever touch it again -- but it is not lost:
+`reclaim_orphaned_slots()` walks the free stack for membership and
+reclaims any slot that is neither referenced nor on the stack,
+regardless of refcount. A fresh `SharedRegion::create` (full
+reinitialization) also recovers it.
 
-This is a bounded leak: at most one slot per publisher crash in that
-specific window (a few instructions wide). The slot is recovered on
-the next `SharedRegion::create` (full reinitialization).
+This is a bounded leak between GC passes: at most one slot per
+publisher crash in that specific window (a few instructions wide).
 
 **Operational guidance:** if your deployment involves frequent publisher
 crashes (e.g. during development, or in a watchdog-restart architecture),
 size the pool with enough headroom to absorb the expected number of
-orphans between region recreations. For a pool of 256 slots and a
-crash rate of one per hour, the leak is negligible. If crashes are
-frequent enough to matter, the region should be recreated.
+orphans between `reclaim_orphaned_slots()` passes or region
+recreations. For a pool of 256 slots and a crash rate of one per
+hour, the leak is negligible.
 
 ### Pool and Ring Sizing
 
