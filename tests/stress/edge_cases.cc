@@ -8,6 +8,9 @@ bool run_single_slot_ring()
 
     constexpr int  NUM_PUBS = 4;
     constexpr int  NUM_SUBS = 4;
+
+    g_subscribers_ready    = 0;
+    g_subscribers_expected = NUM_SUBS;
     uint32_t const NUM_MSGS = 10000 / TSAN_SCALE;
 
     kickmsg::channel::Config cfg;
@@ -28,14 +31,12 @@ bool run_single_slot_ring()
 
     for (int i = 0; i < NUM_SUBS; ++i)
     {
-        sub_threads.emplace_back([&region, i, &sub_results, NUM_MSGS]()
+        sub_threads.emplace_back([&region, i, &sub_results]()
         {
             sub_results[static_cast<std::size_t>(i)] =
                 subscriber_thread_copy(region, i, NUM_PUBS, NUM_MSGS);
         });
     }
-
-    kickmsg::sleep(10ms);
 
     std::vector<std::thread> pub_threads;
     for (int i = 0; i < NUM_PUBS; ++i)
@@ -91,17 +92,7 @@ bool run_single_slot_ring()
         }
     }
 
-    std::size_t repaired = region.repair_locked_entries();
-    if (repaired > 0)
-    {
-        std::printf("  GC repaired %zu locked entries\n", repaired);
-    }
-    std::size_t reclaimed = region.reclaim_orphaned_slots();
-    if (reclaimed > 0)
-    {
-        std::printf("  GC reclaimed %zu orphaned slots\n", reclaimed);
-    }
-
+    ok &= verify_gc_zero(region, cfg);
     ok &= verify_refcounts_zero(region, cfg);
     ok &= verify_pool_free(region, cfg);
     ok &= verify_rings_inactive(region, cfg);
@@ -255,17 +246,7 @@ bool run_subscriber_saturation()
     // Destroy all subscribers before verification
     subs.clear();
 
-    std::size_t repaired = region.repair_locked_entries();
-    if (repaired > 0)
-    {
-        std::printf("  GC repaired %zu locked entries\n", repaired);
-    }
-    std::size_t reclaimed = region.reclaim_orphaned_slots();
-    if (reclaimed > 0)
-    {
-        std::printf("  GC reclaimed %zu orphaned slots\n", reclaimed);
-    }
-
+    ok &= verify_gc_zero(region, cfg);
     ok &= verify_refcounts_zero(region, cfg);
     ok &= verify_pool_free(region, cfg);
     ok &= verify_rings_inactive(region, cfg);

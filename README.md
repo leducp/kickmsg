@@ -238,6 +238,16 @@ target_link_libraries(my_app PRIVATE kickmsg)
 | `BUILD_BENCHMARKS` | `OFF` | Build benchmarks (requires Google Benchmark) |
 | `ENABLE_TSAN` | `OFF` | Enable ThreadSanitizer |
 
+## Security
+
+Shared-memory objects are created with mode `0600` (owner-only) on
+Linux and macOS, so channel payloads are not readable by other users
+on a multi-user host.  To share channels across users, set the
+`KICKMSG_SHM_MODE` environment variable to an octal mode (e.g.
+`KICKMSG_SHM_MODE=0666`) in every process that *creates* regions —
+openers are unaffected.  The value is parsed once per process; an
+invalid value falls back to `0600` with a warning on stderr.
+
 ## Platform Support
 
 | Platform | SharedMemory | Futex |

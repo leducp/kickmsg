@@ -61,20 +61,37 @@ namespace kickmsg
         Allocation allocate();
 
         /// Commit the currently reserved slot, recording `len` as the
-        /// payload size.  No bounds check: caller guarantees
-        /// `len <= max_size` from the preceding allocate().
+        /// payload size.
+        ///
+        /// Returns the number of rings delivered to.  0 means no pending
+        /// allocation, oversized `len` (the pending slot is recycled), or
+        /// zero live subscribers -- indistinguishable by design.
         std::size_t publish(std::size_t len);
 
         /// Allocate, copy, and publish in one call.
-        /// Returns bytes written on success, -EMSGSIZE if too large, -EAGAIN if pool exhausted.
+        /// Returns bytes written on success (NOT a delivery count: a
+        /// successful send may have reached zero subscribers), -EMSGSIZE
+        /// if too large, -EAGAIN if pool exhausted.
         int32_t send(void const* data, std::size_t len);
 
         /// Number of per-ring delivery drops (CAS lock contention or pool exhaustion).
         uint64_t dropped() const { return dropped_; }
 
     private:
-        static uint32_t wait_and_capture_slot(Entry& e, uint64_t expected_seq,
-                                              microseconds timeout);
+        /// Result of waiting for the previous wrap's occupant to commit.
+        /// stable_lock: one lock value spanned the whole timeout window,
+        /// proving its (unique) holder stale -- the steal precondition.
+        struct CommitWait
+        {
+            uint64_t last_seq;
+            bool     stable_lock;
+        };
+
+        static CommitWait wait_for_commit(Entry& e, uint64_t expected_seq,
+                                          microseconds timeout);
+        void self_repair(Entry& e, uint64_t pos, uint64_t capacity,
+                         CommitWait const& wait);
+        void abandon_delivery(SubRingHeader* ring);
         void release_slot(uint32_t idx);
         void release_pending();
 

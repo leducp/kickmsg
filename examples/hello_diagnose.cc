@@ -66,8 +66,8 @@ int main()
         uint64_t wp = ring->write_pos.load(std::memory_order_acquire);
         ring->write_pos.store(wp + 1, std::memory_order_release);
         entries[wp & hdr->sub_ring_mask].sequence.store(
-            kickmsg::LOCKED_SEQUENCE, std::memory_order_release);
-        std::cout << "  Injected: LOCKED_SEQUENCE at ring 0, pos " << wp << "\n";
+            kickmsg::seq_lock(wp), std::memory_order_release);
+        std::cout << "  Injected: stale lock at ring 0, pos " << wp << "\n";
     }
 
     // Fault 2: Stuck ring (simulates subscriber teardown timeout after publisher crash)

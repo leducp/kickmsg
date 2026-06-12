@@ -1,5 +1,3 @@
-// macOS-specific sleep().  clock_nanosleep is unavailable; nanosleep is the
-// POSIX fallback.  Other Time entry points live in src/os/posix/Time.cc.
 #include "kickmsg/os/Time.h"
 
 #include <cerrno>

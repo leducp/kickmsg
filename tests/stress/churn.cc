@@ -86,17 +86,7 @@ bool run_subscriber_churn()
     //   1. start_pos_ is captured BEFORE CAS to Live (no missed entries)
     //   2. drain_unconsumed releases all entries in [start_pos_, wp)
     // A refcount leak here indicates a gap in the drain window.
-    std::size_t repaired = region.repair_locked_entries();
-    std::size_t reclaimed = region.reclaim_orphaned_slots();
-    if (repaired > 0)
-    {
-        std::printf("  GC repaired %zu locked entries\n", repaired);
-    }
-    if (reclaimed > 0)
-    {
-        std::printf("  GC reclaimed %zu orphaned slots\n", reclaimed);
-    }
-
+    ok &= verify_gc_zero(region, cfg);
     ok &= verify_refcounts_zero(region, cfg);
     ok &= verify_pool_free(region, cfg);
 

@@ -10,11 +10,11 @@ namespace kickmsg
 {
     /// Runtime snapshot of a single subscriber ring.
     /// Values are relaxed/acquire-loaded, so the snapshot is internally
-    /// consistent per-ring but may race mildly across rings — fine for a
+    /// consistent per-ring but may race mildly across rings -- fine for a
     /// diagnostic view; not intended as a strongly-consistent read.
     struct RingStats
     {
-        uint32_t state;          ///< ring::State as a raw int (0=Free, 1=Live, 2=Draining)
+        uint32_t state;          ///< ring::State as a raw int (0=Free, 1=Live, 2=Draining, 3=Reclaiming)
         uint32_t in_flight;      ///< Publishers currently admitted to this ring
         uint64_t write_pos;      ///< Monotonic claim counter (rough throughput proxy)
         uint64_t dropped_count;  ///< Cumulative publisher drops on this ring
@@ -30,8 +30,9 @@ namespace kickmsg
         uint64_t total_writes;          ///< Max of write_pos across all rings: publish events observed by the channel, monotonic across subscriber churn
         uint64_t total_drops;           ///< Sum of dropped_count across all rings
         uint64_t total_losses;          ///< Sum of lost_count across all rings
+        uint64_t total_steals;          ///< Stale entries stolen (self-repair + repair_locked_entries); each may orphan one slot ref until reclaim_orphaned_slots()
         uint64_t live_rings;            ///< Number of rings currently Live
-        uint64_t pool_free;             ///< Approximate free-slot count (walks Treiber stack — racy under churn)
+        uint64_t pool_free;             ///< Approximate free-slot count (walks Treiber stack -- racy under churn)
         uint64_t pool_size;             ///< Total pool capacity (static)
     };
 
@@ -66,7 +67,7 @@ namespace kickmsg
 
         // Hand-written move ops so the moved-from object's base_/size_
         // are reset to a default-constructed state.  A defaulted move
-        // would leave them aliasing the destination's live memory —
+        // would leave them aliasing the destination's live memory --
         // base() on the moved-from object would silently return a
         // dangling-looking-live pointer instead of nullptr.
         SharedRegion(SharedRegion&& other) noexcept
@@ -95,14 +96,22 @@ namespace kickmsg
 
         ~SharedRegion() = default;
 
+        /// Create a fresh region under `name`, replacing any existing
+        /// object: peers keep their old (orphaned) mapping, never a
+        /// truncated one.  Single-creator only; concurrent creators must
+        /// use create_or_open().
         static SharedRegion create(char const* name, channel::Type type,
                                    channel::Config const& cfg,
                                    char const* creator_name = "");
 
-        static SharedRegion open(char const* name);
+        /// Open an existing region.  When `expected_identity` and the
+        /// stamped identity_hash are both nonzero they must match: a
+        /// mismatch (two logical channels colliding on one shm name)
+        /// throws instead of silently sharing the region.
+        static SharedRegion open(char const* name, uint64_t expected_identity = 0);
 
         /// Create the region if it doesn't exist, otherwise open the
-        /// existing one.  On the open branch, cfg.schema is IGNORED —
+        /// existing one.  On the open branch, cfg.schema is IGNORED --
         /// schema is orthogonal to channel geometry and doesn't
         /// participate in the config-hash mismatch check.  Use
         /// try_claim_schema() afterwards to publish a descriptor
@@ -167,8 +176,8 @@ namespace kickmsg
 
         /// Atomically publish a schema descriptor to the region.
         ///
-        /// Returns true if this call claimed the slot (Unset → Claiming →
-        /// Set), false if some other claimant got there first — in which
+        /// Returns true if this call claimed the slot (Unset -> Claiming ->
+        /// Set), false if some other claimant got there first -- in which
         /// case the caller should read back with schema() and apply its
         /// own mismatch policy.  When another claim is mid-write, this
         /// call briefly yields until the state settles or a small bounded
@@ -182,8 +191,8 @@ namespace kickmsg
         bool try_claim_schema(SchemaInfo const& info);
 
         /// Recover a schema slot wedged in the Claiming state by a
-        /// crashed claimant (CAS'd Unset → Claiming then died before the
-        /// release-store of Set).  Atomically CASes Claiming → Unset so a
+        /// crashed claimant (CAS'd Unset -> Claiming then died before the
+        /// release-store of Set).  Atomically CASes Claiming -> Unset so a
         /// new claim can proceed; returns true if the reset actually
         /// happened, false if the state was not Claiming.
         ///
@@ -191,7 +200,7 @@ namespace kickmsg
         /// crashed claimant is gone: a slow-but-alive writer could still
         /// be mid-memcpy into schema_data and would then release-store
         /// Set, racing a new claim into torn bytes.  Mirrors the safety
-        /// contract of reset_retired_rings() — a deliberate post-crash
+        /// contract of reset_retired_rings() -- a deliberate post-crash
         /// action, not a routine maintenance call.
         bool reset_schema_claim();
 
@@ -217,22 +226,21 @@ namespace kickmsg
         ///    confirmed gone.
         struct HealthReport
         {
-            uint32_t locked_entries;   ///< Entries stuck at LOCKED_SEQUENCE
+            uint32_t locked_entries;   ///< Entries holding a position-tagged lock, or committed >1 wrap stale
             uint32_t retired_rings;    ///< Free rings with stale in_flight > 0
             uint32_t draining_rings;   ///< Draining rings with in_flight > 0
-            uint32_t dead_rings;       ///< Live/Draining rings whose owner process is gone
+            uint32_t dead_rings;       ///< Live/Draining/Reclaiming rings whose owner process is gone
             uint32_t live_rings;       ///< Active subscriber rings
             bool     schema_stuck;     ///< schema_state at Claiming (advisory; may be a live claim)
         };
         HealthReport diagnose();
 
-        /// Repair ring entries stuck at LOCKED_SEQUENCE (publisher crashed
-        /// mid-commit). Commits the entry with INVALID_SLOT so future
-        /// publishers can wrap past it.
-        ///
-        /// Safe to call under live traffic: the worst outcome is a benign
-        /// double-store if a slow (but alive) publisher commits at the same
-        /// time. Can be called freely on a health-check timer.
+        /// Repair entries left mid-commit by a crashed publisher, committing
+        /// them as skip markers so future publishers wrap past.  Safe under
+        /// live traffic: locks are stolen only after a grace re-check proves
+        /// the holder stale (one commit_timeout, same value), every steal is
+        /// CAS-owned, and a merely-slow publisher detects the theft as a
+        /// drop.  Blocks one commit_timeout when locked entries exist.
         /// Returns the number of entries repaired.
         std::size_t repair_locked_entries();
 
@@ -246,22 +254,26 @@ namespace kickmsg
         /// Returns the number of rings reset.
         std::size_t reset_retired_rings();
 
-        /// Reclaim rings whose owning subscriber process has died (a Live or
-        /// Draining ring left behind by a crash). The owner pid + start time
-        /// recorded at claim time are checked against the OS; only rings with
-        /// a provably-dead owner are reclaimed, so this is safe under live
-        /// traffic -- a slow-but-alive subscriber is never touched. in_flight
-        /// is preserved (a mid-commit publisher must still fetch_sub), so a
-        /// reclaimed ring may land in the retired state for reset_retired_rings()
-        /// to finish; committed slot refs are recovered by
-        /// reclaim_orphaned_slots(). Returns the number of rings reclaimed.
+        /// Reclaim rings whose owner process is provably dead (pid + start
+        /// time checked against the OS); a slow-but-alive subscriber is
+        /// never touched.  Two-phase like Registry::sweep_stale: single-shot
+        /// CAS to Reclaiming, death re-verified under that exclusivity, then
+        /// freed or restored -- safe for concurrent reclaimers; in_flight
+        /// churn just defers a ring to the next call.  in_flight itself is
+        /// preserved (a mid-commit publisher must still fetch_sub), so a
+        /// reclaimed ring may land retired for reset_retired_rings();
+        /// slot refs are recovered by reclaim_orphaned_slots().
+        /// Returns the number of rings reclaimed.
         ///
-        /// Residual: a subscriber that crashes in the few instructions between
-        /// winning the claim CAS and recording its pid leaves owner_pid == 0,
-        /// which this cannot attribute and so will not reclaim.
+        /// Residuals: a subscriber that crashes in the few instructions
+        /// between winning the claim CAS and recording its pid leaves
+        /// owner_pid == 0, which this cannot attribute and so will not
+        /// reclaim.  A reclaimer that crashes mid-pass leaves the ring
+        /// Reclaiming; a later call recovers it (dead owner) or the owner's
+        /// own teardown does (live owner).
         std::size_t reclaim_dead_rings();
 
-        /// Runtime counter snapshot — safe under live traffic.
+        /// Runtime counter snapshot -- safe under live traffic.
         ///
         /// Reads the cross-process per-ring counters (`write_pos`,
         /// `dropped_count`, `lost_count`) plus ring state and an approximate
@@ -276,7 +288,7 @@ namespace kickmsg
         /// forever under racing pushes/pops.
         RegionStats stats() const;
 
-        /// Static header snapshot — geometry + creator metadata.  All
+        /// Static header snapshot -- geometry + creator metadata.  All
         /// fields are written once at creation, so this is a plain copy.
         RegionInfo info() const;
 

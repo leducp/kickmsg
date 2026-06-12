@@ -58,7 +58,7 @@ namespace kickmsg
         h->version  = registry::VERSION;
         h->capacity = capacity;
 
-        // MAGIC published last — readers spin on it with acquire.
+        // MAGIC published last -- readers spin on it with acquire.
         h->magic.store(registry::MAGIC, std::memory_order_release);
     }
 
@@ -212,7 +212,7 @@ namespace kickmsg
         {
             return slot;
         }
-        // Registry full — sweep dead-pid residue and retry.  Bounded to
+        // Registry full -- sweep dead-pid residue and retry.  Bounded to
         // avoid livelock when many registrants race on a full registry.
         for (int attempt = 0; attempt < 3; ++attempt)
         {
@@ -283,7 +283,11 @@ namespace kickmsg
                 es[i].node_name,
                 ::strnlen(es[i].node_name, sizeof(es[i].node_name)));
 
-            // Seqlock recheck: reject if state changed or generation bumped.
+            // Seqlock recheck.  The fence is load-bearing: an acquire load
+            // only orders later accesses, so without it the relaxed field
+            // reads could be satisfied after g2/s2 (cf. read_seqretry's
+            // smp_rmb).
+            std::atomic_thread_fence(std::memory_order_acquire);
             uint32_t g2 = es[i].generation.load(std::memory_order_acquire);
             uint32_t s2 = es[i].state.load(std::memory_order_acquire);
             if (s2 != registry::Active or g1 != g2)
@@ -392,7 +396,7 @@ namespace kickmsg
             uint64_t pid = es[i].pid.load(std::memory_order_acquire);
             if (pid == 0)
             {
-                // Registrant hasn't stored its pid yet — reclaiming here
+                // Registrant hasn't stored its pid yet -- reclaiming here
                 // would race with its pending field writes.
                 continue;
             }
@@ -404,7 +408,7 @@ namespace kickmsg
             }
 
             // Phase 1: CAS to Reclaiming to block concurrent registrants
-            // and close the ABA window on a direct state→Free CAS.
+            // and close the ABA window on a direct state->Free CAS.
             uint32_t expected = s;
             if (not es[i].state.compare_exchange_strong(
                     expected, registry::Reclaiming,
@@ -434,7 +438,7 @@ namespace kickmsg
                 continue;
             }
 
-            // Phase 2: finalize.  Fields are left untouched — same
+            // Phase 2: finalize.  Fields are left untouched -- same
             // reasoning as deregister().
             es[i].generation.fetch_add(1, std::memory_order_relaxed);
             es[i].state.store(registry::Free, std::memory_order_release);

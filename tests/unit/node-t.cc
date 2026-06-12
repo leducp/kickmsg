@@ -70,7 +70,7 @@ TEST_F(NodeTest, AdvertiseTwiceDoesNotWipeLiveRegion)
     kickmsg::Node sub_node("subnode", "test");
     auto sub = sub_node.subscribe("dup");  // claims a ring; region Live
 
-    // Second advertise on the same node — must reuse, not wipe.
+    // Second advertise on the same node -- must reuse, not wipe.
     auto pub2 = node.advertise("dup", small_cfg());
 
     uint32_t val = 7;
@@ -237,7 +237,7 @@ TEST_F(NodeTest, UnlinkTopicRemovesShm)
     // unlink, then verify a fresh open() fails.  On Linux this exercises
     // the unlink path (without it, the /dev/shm entry would persist); on
     // Windows the last-handle-close already removed the mapping and
-    // unlink is a harmless no-op — both produce the same post-condition.
+    // unlink is a harmless no-op -- both produce the same post-condition.
     track("/test_ephemeral");
 
     {
@@ -278,7 +278,7 @@ TEST_F(NodeTest, UnlinkBroadcastAndMailboxUseRightNames)
         (void)mbx;
     }
     {
-        // Unlink from a different node — unlink_mailbox takes an explicit
+        // Unlink from a different node -- unlink_mailbox takes an explicit
         // owner, which is also what a cleanup tool in a separate process
         // would have to supply.
         kickmsg::Node cleanup("cleanup", "test");
@@ -351,6 +351,43 @@ TEST_F(NodeTest, RosStyleTopicNamesAreSanitizedIntoShmPath)
     // form so callers can log/introspect the actual identifiers in use.
     EXPECT_EQ(pub_node.kmsg_namespace(), "test.ns");
     EXPECT_EQ(pub_node.name(),           "drv");
+}
+
+TEST_F(NodeTest, ShmNameCollisionDetectedByIdentityStamp)
+{
+    // Sanitization is many-to-one: "a:b" and "a b" both become "a_b", so
+    // two distinct logical topics land on the same shm name "/test_a_b".
+    // The identity hash stamped at create (over the RAW topic string) must
+    // reject the open instead of silently sharing the region.
+    track("/test_a_b");
+
+    kickmsg::Node pub_node("pubnode", "test");
+    auto pub = pub_node.advertise("a:b", small_cfg());
+
+    kickmsg::Node other("othernode", "test");
+    try
+    {
+        other.subscribe("a b");
+        FAIL() << "expected identity mismatch on colliding topic name";
+    }
+    catch (std::runtime_error const& e)
+    {
+        EXPECT_NE(std::string(e.what()).find("Identity mismatch"),
+                  std::string::npos) << e.what();
+    }
+
+    // create_or_open path: same config (config_hash matches), colliding
+    // logical name -- identity check must still fire.
+    EXPECT_THROW(other.subscribe_or_create("a b", small_cfg()),
+                 std::runtime_error);
+
+    // The genuine topic still opens fine.
+    kickmsg::Node reader("readernode", "test");
+    auto sub = reader.subscribe("a:b");
+    uint32_t val = 9;
+    ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+    auto got = sub.try_receive();
+    ASSERT_TRUE(got.has_value());
 }
 
 TEST_F(NodeTest, EmptyTopicNameThrows)

@@ -38,7 +38,7 @@ namespace kickmsg
     }
 
     // FNV-1a over the config fields, detecting parameter mismatches at
-    // open time.  Field order is part of the on-disk hash — do NOT
+    // open time.  Field order is part of the on-disk hash -- do NOT
     // reorder without bumping VERSION.
     uint64_t compute_config_hash(channel::Type type, channel::Config const& cfg)
     {
@@ -66,10 +66,32 @@ namespace kickmsg
             if (std::strncmp(a.name, b.name, sizeof(a.name)) != 0) d |= Name;
             if (a.identity_algo != b.identity_algo) d |= IdentityAlgo;
             if (a.layout_algo   != b.layout_algo)   d |= LayoutAlgo;
-            // Intentionally NOT compared: flags, reserved[] — see Diff
+            // Intentionally NOT compared: flags, reserved[] -- see Diff
             // doc in types.h for rationale (forward compatibility).
             return d;
         }
+    }
+
+    bool entry_steal_and_clear(Entry& e, uint64_t pos, uint64_t observed)
+    {
+        // CAS-own before touching metadata; a live writer that moves first wins.
+        uint64_t expected = observed;
+        if (not e.sequence.compare_exchange_strong(expected, seq_repair(pos),
+                std::memory_order_acquire, std::memory_order_relaxed))
+        {
+            return false;
+        }
+
+        // No slot release here: the holder may have batch-released this
+        // ring's ref already (excess path) -- releasing again could
+        // double-free.  The leak is bounded and GC-recoverable.
+        e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
+        e.payload_len.store(0, std::memory_order_relaxed);
+        // Skip tag, not a plain sequence: the holder's late metadata stores
+        // must never be trusted (see types.h).  The INVALID stores are
+        // diagnostics only.
+        e.sequence.store(seq_skip(pos), std::memory_order_release);
+        return true;
     }
 
     void treiber_push(std::atomic<uint64_t>& top, SlotHeader* slot, uint32_t slot_idx)

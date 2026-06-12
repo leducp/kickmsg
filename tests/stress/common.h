@@ -89,9 +89,25 @@ static constexpr std::size_t TRACE_SIZE = 16;
 
 inline std::atomic<bool> g_all_publishers_done{false};
 
+// Readiness barrier: subscribers signal after construction, publishers wait.
+// Every ring is then Live for the whole run, making per-subscriber
+// accounting exact.  Scenarios must reset both before spawning threads.
+inline std::atomic<int> g_subscribers_ready{0};
+inline int g_subscribers_expected{0};
+
+inline void wait_subscribers_ready()
+{
+    while (g_subscribers_ready.load(std::memory_order_acquire) < g_subscribers_expected)
+    {
+        kickmsg::yield();
+    }
+}
+
 inline void publisher_thread(kickmsg::SharedRegion& region, int pub_id, uint32_t count)
 {
     kickmsg::Publisher pub{region};
+
+    wait_subscribers_ready();
 
     for (uint32_t i = 0; i < count; ++i)
     {
@@ -186,6 +202,7 @@ inline SubResult subscriber_thread_copy(kickmsg::SharedRegion& region, int sub_i
                                         int num_pubs, uint32_t /*msgs_per_pub*/)
 {
     kickmsg::Subscriber sub{region};
+    g_subscribers_ready.fetch_add(1, std::memory_order_release);
 
     SubResult result{};
     result.sub_id = sub_id;
@@ -204,10 +221,17 @@ inline SubResult subscriber_thread_copy(kickmsg::SharedRegion& region, int sub_i
         {
             if (g_all_publishers_done)
             {
+                // Null can mean retry budget burned on evicted entries;
+                // only null with no lost() progress proves ring-empty.
+                uint64_t lost_before = sub.lost();
                 sample = sub.try_receive();
                 if (not sample)
                 {
-                    break;
+                    if (sub.lost() == lost_before)
+                    {
+                        break;
+                    }
+                    continue;
                 }
             }
             else
@@ -236,6 +260,7 @@ inline SubResult subscriber_thread_zerocopy(kickmsg::SharedRegion& region, int s
                                             int num_pubs, uint32_t /*msgs_per_pub*/)
 {
     kickmsg::Subscriber sub{region};
+    g_subscribers_ready.fetch_add(1, std::memory_order_release);
 
     SubResult result{};
     result.sub_id = sub_id;
@@ -254,10 +279,16 @@ inline SubResult subscriber_thread_zerocopy(kickmsg::SharedRegion& region, int s
         {
             if (g_all_publishers_done)
             {
+                // Same caveat as the copy path.
+                uint64_t lost_before = sub.lost();
                 view = sub.try_receive_view();
                 if (not view)
                 {
-                    break;
+                    if (sub.lost() == lost_before)
+                    {
+                        break;
+                    }
+                    continue;
                 }
             }
             else
@@ -280,6 +311,47 @@ inline SubResult subscriber_thread_zerocopy(kickmsg::SharedRegion& region, int s
 
     result.lost = sub.lost();
     return result;
+}
+
+// No-crash oracle: GC work not explained by observed publisher drops means
+// the normal path leaked and GC masked it -- fail.  Each stall-steal leaks
+// at most one slot ref and books at least one drop, so reclaimed <= drops
+// is the exact budget.
+inline bool verify_gc_zero(kickmsg::SharedRegion& region, kickmsg::channel::Config const& cfg)
+{
+    bool ok = true;
+
+    uint64_t dropped = 0;
+    for (uint32_t i = 0; i < cfg.max_subscribers; ++i)
+    {
+        auto* ring = kickmsg::sub_ring_at(region.base(), region.header(), i);
+        dropped += ring->dropped_count.load(std::memory_order_acquire);
+    }
+
+    std::size_t repaired = region.repair_locked_entries();
+    if (repaired != 0)
+    {
+        std::fprintf(stderr, "  [FAIL] repair_locked_entries fixed %zu entries on a no-crash run\n",
+                     repaired);
+        ok = false;
+    }
+
+    std::size_t reclaimed = region.reclaim_orphaned_slots();
+    if (reclaimed > dropped)
+    {
+        std::fprintf(stderr, "  [FAIL] reclaim_orphaned_slots recovered %zu slots on a no-crash run "
+                     "(only %" PRIu64 " publisher drops can account for steal residue)\n",
+                     reclaimed, dropped);
+        ok = false;
+    }
+    else if (reclaimed != 0)
+    {
+        std::printf("  [NOTE] %zu slot(s) reclaimed, within the %" PRIu64
+                    "-drop steal budget (stalled-publisher steal residue)\n",
+                    reclaimed, dropped);
+    }
+
+    return ok;
 }
 
 inline bool verify_pool_free(kickmsg::SharedRegion& region, kickmsg::channel::Config const& cfg)

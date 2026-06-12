@@ -1,5 +1,3 @@
-// Linux-specific SharedMemory::create().  Other methods live in
-// src/os/posix/SharedMemory.cc.
 #include "kickmsg/os/SharedMemory.h"
 
 #include <cerrno>
@@ -12,7 +10,12 @@ namespace kickmsg
 {
     void SharedMemory::create(std::string const& name, std::size_t size)
     {
-        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+        // Unlink + exclusive-create, never O_TRUNC: truncation zeroes an
+        // object live peers still have mapped; orphaning leaves them intact.
+        // The sequence is single-creator only (two concurrent callers could
+        // both unlink) -- concurrent creators go through try_create.
+        ::shm_unlink(name.c_str());
+        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, kickmsg_shm_mode());
         if (fd_ < 0)
         {
             throw std::system_error(errno, std::system_category(),

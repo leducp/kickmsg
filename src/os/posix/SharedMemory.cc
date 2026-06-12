@@ -3,6 +3,8 @@
 #include "kickmsg/os/SharedMemory.h"
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <string>
 #include <system_error>
@@ -12,6 +14,32 @@
 
 namespace kickmsg
 {
+    mode_t kickmsg_shm_mode()
+    {
+        static mode_t const mode = []() -> mode_t
+        {
+            constexpr mode_t DEFAULT_MODE = 0600;
+            char const* env = std::getenv("KICKMSG_SHM_MODE");
+            if (env == nullptr or *env == '\0')
+            {
+                return DEFAULT_MODE;
+            }
+            errno = 0;
+            char*         end = nullptr;
+            unsigned long v   = std::strtoul(env, &end, 8);
+            if (errno != 0 or end == env or *end != '\0' or v > 07777)
+            {
+                std::fprintf(stderr,
+                    "kickmsg: invalid KICKMSG_SHM_MODE '%s' "
+                    "(expected octal permission bits, e.g. \"0666\"); using 0600\n",
+                    env);
+                return DEFAULT_MODE;
+            }
+            return static_cast<mode_t>(v);
+        }();
+        return mode;
+    }
+
     namespace
     {
         [[noreturn]] void throw_system_error(char const* context,
@@ -83,9 +111,9 @@ namespace kickmsg
     {
         // Keep the fd and do the full setup (ftruncate + mmap) inline.
         // SharedRegion::create_or_open consumes the resulting mapping
-        // directly — there's no reason to close here and re-enter create(),
+        // directly -- there's no reason to close here and re-enter create(),
         // and the old round-trip pattern caused a subtle race on Darwin.
-        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
+        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, kickmsg_shm_mode());
         if (fd_ < 0)
         {
             if (errno == EEXIST)
@@ -95,7 +123,17 @@ namespace kickmsg
             }
             throw_system_error("SharedMemory: shm_open(try_create)", name);
         }
-        map(size);
+        try
+        {
+            map(size);
+        }
+        catch (...)
+        {
+            // O_EXCL made the name ours; leaving a zero-size object would
+            // wedge it (EEXIST on create, not-ready on open, forever).
+            ::shm_unlink(name.c_str());
+            throw;
+        }
         return true;
     }
 

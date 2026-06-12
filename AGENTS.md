@@ -110,6 +110,11 @@ style. Match the surrounding file.
   `SlotHeader`, `SchemaInfo`) is guarded by `MAGIC` + `VERSION`. Any layout
   change requires a `VERSION` bump and updating the `static_assert`s in
   `types.h`.
+- **ARCHITECTURE.md ships with the change.** Any commit touching the
+  `types.h` encoding, a `Region.h` contract, or the publish / receive /
+  repair paths must include its ARCHITECTURE.md delta in the same commit.
+  The doc is the only map of the lock-free invariants -- a stale claim
+  there is a footgun armed for the next reader.
 
 ### 5.4 Comments
 

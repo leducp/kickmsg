@@ -6,14 +6,14 @@
 # bash 4+ feature, and macOS ships 3.2 for GPL-licensing reasons.  Each
 # option occupies the same index across all OPT_* arrays.
 
-OPT_NAMES=(        unit_tests                    benchmarks                                      examples        tsan                      )
-OPT_DEFAULTS=(     OFF                           OFF                                             OFF             OFF                       )
-OPT_DESCRIPTIONS=( "Build unit tests"            "Build benchmarks (requires Google Benchmark)"  "Build examples" "Enable ThreadSanitizer" )
-OPT_CMAKE_FLAGS=(  BUILD_UNIT_TESTS              BUILD_BENCHMARKS                                BUILD_EXAMPLES  ENABLE_TSAN               )
+OPT_NAMES=(        unit_tests                    benchmarks                                      examples        tsan                      asan                      ubsan                                 )
+OPT_DEFAULTS=(     OFF                           OFF                                             OFF             OFF                       OFF                       OFF                                   )
+OPT_DESCRIPTIONS=( "Build unit tests"            "Build benchmarks (requires Google Benchmark)"  "Build examples" "Enable ThreadSanitizer" "Enable AddressSanitizer" "Enable UndefinedBehaviorSanitizer"  )
+OPT_CMAKE_FLAGS=(  BUILD_UNIT_TESTS              BUILD_BENCHMARKS                                BUILD_EXAMPLES  ENABLE_TSAN               ENABLE_ASAN               ENABLE_UBSAN                          )
 
 # Conan flags: only options that actually gate a Conan-provided dep.
 # Empty slot = option has no Conan side effect.
-OPT_CONAN_FLAGS=(  unit_tests                    benchmarks                                      ""              ""                        )
+OPT_CONAN_FLAGS=(  unit_tests                    benchmarks                                      ""              ""                        ""                        ""                                    )
 
 # CONFIG_VALUES is a parallel array keyed by the same index as OPT_NAMES.
 # Callers never index it directly — use config_get / config_set.

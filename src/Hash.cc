@@ -21,9 +21,9 @@ namespace kickmsg::hash
         return h;
     }
 
-    uint64_t fnv1a_64(std::string_view s) noexcept
+    uint64_t fnv1a_64(std::string_view s, uint64_t seed) noexcept
     {
-        return fnv1a_64(s.data(), s.size());
+        return fnv1a_64(s.data(), s.size(), seed);
     }
 
     std::array<uint8_t, 64> identity_from_fnv1a(std::string_view descriptor) noexcept
