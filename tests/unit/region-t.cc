@@ -1589,7 +1589,11 @@ TEST_F(RegionTest, RepairGraceSparesInFlightCommit)
     cfg.sub_ring_capacity = 4;
     cfg.pool_size         = 8;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{50000};
+    // The commit below must land inside the repairer's grace sleep.  A
+    // loaded CI runner can stall a thread for tens of milliseconds, so the
+    // margin is 100x: commit ~10 ms after the repairer is seen running,
+    // grace lasts 1 s.
+    cfg.commit_timeout    = std::chrono::microseconds{1000000};
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     kickmsg::Subscriber sub(region);
@@ -1612,11 +1616,22 @@ TEST_F(RegionTest, RepairGraceSparesInFlightCommit)
         expected, kickmsg::seq_lock(4),
         std::memory_order_acquire, std::memory_order_relaxed));
 
+    std::atomic<bool>        started{false};
     std::atomic<std::size_t> repaired{SIZE_MAX};
-    std::thread repairer([&] { repaired = region.repair_locked_entries(); });
+    std::thread repairer([&]
+    {
+        started.store(true, std::memory_order_release);
+        repaired = region.repair_locked_entries();
+    });
 
-    // Commit while the repairer sits in its 50 ms grace sleep: the re-check
-    // sees the value changed and must NOT steal.
+    // Commit while the repairer sits in its grace sleep: the re-check sees
+    // the value changed and must NOT steal.  (If the repairer is so delayed
+    // that its scan runs after the commit, it finds no candidate and the
+    // assertions below still hold.)
+    while (not started.load(std::memory_order_acquire))
+    {
+        kickmsg::yield();
+    }
     kickmsg::sleep(std::chrono::microseconds{10000});
     entries[0].slot_idx.store(kickmsg::INVALID_SLOT, std::memory_order_relaxed);
     entries[0].payload_len.store(0, std::memory_order_relaxed);
