@@ -15,6 +15,8 @@ bool run_stress_test(TestConfig const& tc)
     g_all_publishers_done = false;
     g_subscribers_ready   = 0;
     g_subscribers_expected = tc.num_subscribers;
+    g_published           = 0;
+    g_publisher_giveups   = 0;
 
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = tc.max_subs;
@@ -66,7 +68,12 @@ bool run_stress_test(TestConfig const& tc)
     nanoseconds t1 = kickmsg::monotonic_ns();
     int64_t elapsed_ms = std::chrono::duration_cast<milliseconds>(t1 - t0).count();
 
-    uint64_t total_sent = static_cast<uint64_t>(tc.num_publishers) * tc.msgs_per_pub;
+    // Actual commits, not the nominal target: under a tight pool a publisher
+    // may give up on sustained backpressure (see send_bounded).  Every
+    // committed message reaches every Live ring, so each subscriber accounts
+    // for exactly g_published of them.
+    uint64_t total_sent = g_published.load(std::memory_order_relaxed);
+    uint64_t giveups    = g_publisher_giveups.load(std::memory_order_relaxed);
 
     bool all_ok = true;
 
@@ -79,6 +86,11 @@ bool run_stress_test(TestConfig const& tc)
                 tc.num_publishers, tc.num_subscribers, mode_label);
     std::printf("  Elapsed: %" PRId64 " ms, total published: %" PRIu64 "\n",
                 elapsed_ms, total_sent);
+    if (giveups > 0)
+    {
+        std::printf("  [NOTE] %" PRIu64 " publisher giveup(s) under sustained pool exhaustion\n",
+                    giveups);
+    }
     std::printf("  %-6s %10s %10s %10s %10s %10s\n",
                 "sub", "received", "lost", "corrupt", "bad_pid", "reorder");
 

@@ -119,6 +119,51 @@ TEST_F(PublisherTest, PublishOversizedLenReturnsZeroAndRecyclesSlot)
     EXPECT_EQ(pub.publish(sizeof(uint32_t)), 1u);
 }
 
+// Pins the slot-recycling contract that caused a multi-hour soak hang: a slot
+// returns to the pool ONLY via eviction (a publisher overwriting an old ring
+// entry) or teardown -- NEVER via subscriber consumption. So with a pool
+// smaller than the ring capacity, once every slot is committed the pool stays
+// exhausted FOREVER: positions below `capacity` have no previous occupant to
+// evict, and consuming them frees nothing. A publisher that retries -EAGAIN
+// without bound (as the stress harness once did) then spins forever.
+TEST_F(PublisherTest, ConsumptionDoesNotRecycleSlotsPoolStaysExhausted)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 8;   // capacity > pool: no eviction can occur yet
+    cfg.pool_size         = 4;
+    cfg.max_payload_size  = 8;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    // Fill the pool: 4 sends commit 4 slots (positions 0..3, each refcount 1
+    // held by the single ring). The 5th targets position 4 -- below capacity,
+    // so no previous occupant to evict -- and the pool is empty.
+    uint32_t val = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        ASSERT_EQ(pub.send(&val, sizeof(val)), static_cast<int32_t>(sizeof(val)));
+    }
+    EXPECT_EQ(pub.send(&val, sizeof(val)), -EAGAIN);
+
+    // Consume everything. Consumption is pin/unpin (net-zero); it does NOT
+    // release the ring's reference, so no slot returns to the pool.
+    for (int i = 0; i < 4; ++i)
+    {
+        ASSERT_TRUE(sub.try_receive().has_value());
+    }
+
+    // Still exhausted, permanently: draining changed nothing. A bounded
+    // publisher must give up here; an unbounded one hangs.
+    for (int i = 0; i < 1000; ++i)
+    {
+        ASSERT_EQ(pub.send(&val, sizeof(val)), -EAGAIN)
+            << "consumption must not recycle slots (iter " << i << ")";
+    }
+}
+
 TEST_F(PublisherTest, SendReturnsEagainOnPoolExhaustion)
 {
     kickmsg::channel::Config cfg;

@@ -23,8 +23,9 @@ bool run_pool_exhaustion()
 
     g_subscribers_ready    = 0;
     g_subscribers_expected = NUM_SUBS;
+    g_published            = 0;
+    g_publisher_giveups    = 0;
 
-    std::atomic<uint64_t> eagain_count{0};
     std::atomic<uint64_t> corruption_count{0};
 
     struct SlowSubStats
@@ -35,7 +36,10 @@ bool run_pool_exhaustion()
     };
     std::vector<SlowSubStats> sub_stats(NUM_SUBS);
 
-    // Publishers that track EAGAIN
+    // Publishers face deliberate exhaustion (pool=8, 8 pubs).  send_bounded
+    // gives up after sustained EAGAIN rather than spinning forever: this pool
+    // CAN deadlock permanently -- slots recycle only on eviction, and once
+    // every publisher is blocked in allocate() nothing can evict.
     auto pub_worker = [&](int pub_id)
     {
         kickmsg::Publisher pub{region};
@@ -50,17 +54,9 @@ bool run_pool_exhaustion()
             msg.seq      = i;
             msg.checksum = compute_checksum(msg);
 
-            int32_t rc;
-            while ((rc = pub.send(&msg, sizeof(msg))) < 0)
+            if (not send_bounded(pub, msg, pub_id))
             {
-                if (rc != -EAGAIN)
-                {
-                    std::fprintf(stderr, "  [FATAL] publisher %d: send() returned %d\n",
-                                 pub_id, rc);
-                    std::abort();
-                }
-                eagain_count.fetch_add(1, std::memory_order_relaxed);
-                kickmsg::yield();
+                break;
             }
         }
     };
@@ -153,7 +149,9 @@ bool run_pool_exhaustion()
         t.join();
     }
 
-    std::printf("  EAGAIN count: %" PRIu64 "\n", eagain_count.load());
+    std::printf("  published: %" PRIu64 ", publisher giveups: %" PRIu64 "\n",
+                g_published.load(std::memory_order_relaxed),
+                g_publisher_giveups.load(std::memory_order_relaxed));
 
     bool ok = true;
 
@@ -164,7 +162,9 @@ bool run_pool_exhaustion()
         ok = false;
     }
 
-    uint64_t const total_sent = static_cast<uint64_t>(NUM_PUBS) * NUM_MSGS;
+    // Actual commits, not the nominal target: publishers may give up under
+    // sustained exhaustion, and every committed message reaches all 4 rings.
+    uint64_t const total_sent = g_published.load(std::memory_order_relaxed);
     for (int i = 0; i < NUM_SUBS; ++i)
     {
         auto const& s = sub_stats[static_cast<std::size_t>(i)];
