@@ -26,6 +26,8 @@ bool run_fairness_test()
 
     g_subscribers_ready    = 0;
     g_subscribers_expected = NUM_SUBS;
+    g_published            = 0;
+    g_publisher_giveups    = 0;
 
     std::vector<SubResult> results(NUM_SUBS);
     std::vector<std::thread> sub_threads;
@@ -52,6 +54,15 @@ bool run_fairness_test()
     uint64_t min_recv = UINT64_MAX;
     uint64_t max_recv = 0;
 
+    // One publisher into a 512-slot pool has ample headroom -- a giveup here
+    // would be a real backpressure regression, not legitimate exhaustion.
+    uint64_t published = g_published.load(std::memory_order_relaxed);
+    if (g_publisher_giveups.load(std::memory_order_relaxed) != 0)
+    {
+        std::fprintf(stderr, "  [FAIL] publisher gave up despite ample pool headroom\n");
+        ok = false;
+    }
+
     for (auto const& r : results)
     {
         min_recv = std::min(min_recv, r.received);
@@ -68,11 +79,11 @@ bool run_fairness_test()
         // Exact conservation: the readiness barrier means every ring is Live
         // before the first send, and subscribers drain to completion.
         uint64_t accounted = r.received + r.lost + r.corrupted + r.bad_pub_id + r.reordered;
-        if (accounted != NUM_MSGS)
+        if (accounted != published)
         {
             std::fprintf(stderr, "  [FAIL] sub%d: received+lost+corrupt+bad_pid+reorder (%" PRIu64
-                         ") != total_sent (%u)!\n",
-                         r.sub_id, accounted, NUM_MSGS);
+                         ") != published (%" PRIu64 ")!\n",
+                         r.sub_id, accounted, published);
             ok = false;
         }
     }
