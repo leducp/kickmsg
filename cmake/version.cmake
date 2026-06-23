@@ -9,7 +9,8 @@
 #     (build time): re-runs git and rewrites the header.
 #
 # With no git available (source tarball / conan-from-recipe) it falls back to
-# 0.0.0 and "unknown" git fields.
+# 0.0.0 and "unknown" git fields, unless -D KICKMSG_VERSION_OVERRIDE=X.Y.Z is
+# passed (e.g. by a package recipe that knows the release version).
 
 function(_kickmsg_compute_version src_dir)
     set(_describe "unknown")
@@ -45,6 +46,20 @@ function(_kickmsg_compute_version src_dir)
         string(REGEX REPLACE "^v" "" _nearest "${_nearest}")
         if(_nearest MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+")
             set(_ver "${_nearest}")
+        endif()
+    endif()
+
+    # Explicit override (release tarball / packaging, where no .git exists).
+    if(KICKMSG_VERSION_OVERRIDE)
+        string(REGEX REPLACE "^v" "" _override "${KICKMSG_VERSION_OVERRIDE}")
+        if(_override MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+")
+            set(_ver "${_override}")
+            if(_describe STREQUAL "unknown")
+                set(_describe "v${_ver}")
+            endif()
+            if(_tag STREQUAL "")
+                set(_tag "v${_ver}")
+            endif()
         endif()
     endif()
 
@@ -98,6 +113,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND}
         -D KICKMSG_VERSION_SRC=${CMAKE_CURRENT_SOURCE_DIR}
         -D KICKMSG_VERSION_OUT=${KICKMSG_VERSION_H}
+        -D KICKMSG_VERSION_OVERRIDE=${KICKMSG_VERSION_OVERRIDE}
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.cmake"
     DEPENDS ${_version_deps}
     COMMENT "Regenerating kickmsg/version.h from git"
