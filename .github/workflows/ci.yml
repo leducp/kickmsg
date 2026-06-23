@@ -80,8 +80,7 @@ jobs:
         run: ./kickmsg_microbench --benchmark_min_time=0.1s
         shell: bash
 
-  # Verify the Conan package recipe is well-formed and the package builds
-  # cleanly from the recipe (no local source leaking in).
+  # Verify the package builds from the recipe alone (no local source leaking in).
   conan-create:
     name: Conan Create
     runs-on: ubuntu-latest
@@ -117,9 +116,8 @@ jobs:
         run: file build_arm/kickmsg_unit build_arm/kickmsg_stress_test | grep "ARM aarch64"
         shell: bash
 
-  # Build Python wheels across the supported platforms.  Runs on every
-  # push so wheel-build regressions surface immediately; only the tagged
-  # release job below actually uploads to PyPI.
+  # Build wheels on every push to catch regressions; only the tagged
+  # release job uploads to PyPI.
   build-wheels:
     name: Build Python Wheels (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -128,10 +126,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
     env:
-      # `native`: the runner's own architecture.  Linux x86_64 runner →
-      # manylinux_x86_64 wheels; Linux ARM runner → manylinux_aarch64;
-      # macOS 14 runner (Apple Silicon) → universal2 via the macOS cibw
-      # config in pyproject.toml.
+      # Build for the runner's own architecture.
       CIBW_ARCHS: native
     steps:
       - uses: actions/checkout@v4
@@ -148,10 +143,9 @@ jobs:
           name: wheelhouse-kickmsg-${{ matrix.os }}
           path: wheelhouse/*.whl
 
-  # Publish to PyPI on tag push.  Uses OIDC trusted publishing (configured
-  # per-repo at https://pypi.org/manage/account/publishing/ — the `kickmsg`
-  # PyPI project must list this repository + environment `maintainer` as
-  # a trusted publisher).  No API tokens stored in GitHub secrets.
+  # Publish to PyPI on tag push via OIDC trusted publishing: the `kickmsg`
+  # PyPI project must list this repo + environment `maintainer` as a
+  # trusted publisher (no API tokens in GitHub secrets).
   release:
     needs: [build, conan-create, cross_arm64, build-wheels]
     if: startsWith(github.ref, 'refs/tags/')
