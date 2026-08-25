@@ -166,6 +166,14 @@ namespace kickmsg
         /// and size >= total_size.
         void validate_header_geometry(Header const* h)
         {
+            // channel::None carries no ring geometry and is never stamped by
+            // create(); rejecting it here is what makes that guarantee hold
+            // against a corrupt or hostile peer region as well.
+            if (h->channel_type != channel::PubSub
+                and h->channel_type != channel::Broadcast)
+            {
+                throw std::runtime_error("Header geometry: unsupported channel type");
+            }
             if (h->total_size < sizeof(Header))
             {
                 throw std::runtime_error(
@@ -282,27 +290,13 @@ namespace kickmsg
 
         // True if the ring's recorded owner is provably gone. owner_pid == 0
         // means unowned or a claim in progress -> not dead. Mirrors
-        // Registry::sweep_stale: a matching boot-relative starttime confirms
-        // the same process; if either starttime is 0 the platform can't
-        // disambiguate, so trust pid-alive.
         bool ring_owner_dead(SubRingHeader const* ring)
         {
+            // Acquire syncs with the subscriber's release-store of owner_pid,
+            // so a nonzero pid comes with a matching starttime.
             uint64_t pid = ring->owner_pid.load(std::memory_order_acquire);
-            if (pid == 0)
-            {
-                return false;
-            }
-            if (not process_exists(pid))
-            {
-                return true;
-            }
             uint64_t stored = ring->owner_starttime.load(std::memory_order_relaxed);
-            uint64_t live   = process_starttime(pid);
-            if (stored == 0 or live == 0)
-            {
-                return false;
-            }
-            return stored != live;
+            return owner_is_dead(pid, stored);
         }
     }
 

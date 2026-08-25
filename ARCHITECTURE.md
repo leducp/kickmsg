@@ -271,6 +271,10 @@ sequence-word encoding below) and added `steal_count` and
 meaning of shared bytes, so mixed-version binaries cannot share a
 region; mismatches are rejected at `open()` by the version check.
 
+The blackboard has no schema slot in v1: its values are per-key and
+heterogeneous, so one descriptor per region would describe nothing.
+Users who need it can carry a type tag in the value bytes.
+
 
 ## Treiber Free Stack
 
@@ -446,6 +450,13 @@ publishes during the visibility window right after attachment:
 publishers using a relaxed pre-check may still see the ring as
 non-Live (stale read). Steady-state delivery begins once all
 publishers observe the ring as Live.
+
+**A subscriber therefore never sees anything published before it
+attached** -- there is no replay and no last-value latch on a channel,
+by design. When what you need is state rather than a stream (a node's
+lifecycle, a mode, a calibration) use a [Blackboard](#blackboard)
+instead: a late reader there observes the current value of every key the
+instant it attaches.
 
 
 ## Publish Flow
@@ -1450,6 +1461,11 @@ PubSub (1-to-N)         Broadcast (N-to-N)         Mailbox (N-to-1)
                            (*) each node is both pub+sub
 ```
 
+A fourth pattern, the [Blackboard](#blackboard), is not built on this
+engine at all: it is a separate region type with no pool and no rings,
+carrying state rather than a stream so that a late reader sees current
+values instead of nothing.
+
 ### Topic Naming
 
 Topics are global within a prefix namespace. The publisher's node name
@@ -1630,6 +1646,489 @@ Load-bearing assumptions for anyone editing the registry:
   native binding's `__repr__` methods and the Python `_KIND_NAME` /
   ring-state maps in `diagnostics.py` must stay in sync when a new
   enum value is added.
+- **`Kind` is an open, forward-compatible enum.**  Adding a value (e.g.
+  `Blackboard = 4`) moves no offset and changes no size, so it does
+  *not* bump `registry::VERSION` -- which guards `ParticipantEntry`'s
+  layout and makes `try_open` throw on mismatch, so bumping it would
+  make every running process's registry unreadable machine-wide.
+  Readers must therefore tolerate an unknown kind and never switch
+  exhaustively without a default.  A blackboard row also carries
+  `channel_type = channel::None` (it has no ring geometry) and
+  `role = Both`, because producer/consumer is a per-key property there
+  and is not known at registration time; `kickmsg bb <name>` surfaces
+  the per-key ownership instead.
+
+
+## Blackboard
+
+### What it is
+
+Everything above is a *stream*: a `Subscriber` attaches at its ring's
+current `write_pos` and never sees anything published before it (see
+[Subscriber join and visibility window](#subscriber-join-and-visibility-window)).
+That is the right model for sensor data, and the wrong one for state.
+A node advertising its lifecycle has to heartbeat forever, and a
+listener that starts late still waits a full period before it learns
+anything.
+
+A **blackboard** is the state counterpart: a shared-memory key-value
+store where a writer node declares the keys it owns and a reader node
+declares the keys it needs. The writer publishes each key once and
+stops; a reader that attaches an hour later reads the current value
+immediately, along with how old it is and whether the process that
+wrote it is still alive.
+
+It is a separate shared-memory object with its own `MAGIC` and its own
+`blackboard::VERSION`, independent of the channel ABI in `types.h`.
+Like the registry, it persists beyond any single process.
+
+### Layout
+
+One region per board at `/{namespace}_bb_{name}`, composed through
+`sanitize_shm_component` + `compose_shm_name` like every other shm name,
+and stamped with a `Config::identity` fingerprint so the macOS
+name-hashing collision described under [Topic Naming](#topic-naming) is
+detected at open rather than silently sharing a region.
+
+```
+BlackboardHeader     192 B -- magic, version, capacity, max_value_size,
+                              total_size, config_hash, identity_hash,
+                              creator_pid, created_at_ns
+                              | change_seq, waiters   (own cache line)
+                              | lock_token            (own cache line)
+BlackboardEntry[capacity]  384 B each
+                              line 0: state, publish, tenancy, owner_pid,
+                                      owner_starttime, key_hash, declared_at_ns
+                              then:   key[128], owner_node[64], padding
+value cells          capacity * CELLS_PER_KEY cells of value_stride bytes
+                              each: BlackboardCell{updated_at_ns, value_len}
+                              followed by the payload
+```
+
+`entries_offset`, `values_offset` and the cell stride are **derived,
+never stored**: every field read from the region is a field a hostile
+peer can corrupt and that must then be bounds-checked, so the header
+carries only what cannot be computed. The stride is
+`align_up(sizeof(BlackboardCell) + max_value_size, CACHE_LINE)`, which
+makes every cell cache-line aligned and guarantees no two keys share a
+line.
+
+Storing the *configured* `max_value_size` rather than the padded stride
+matters twice over. It keeps the alignment slack from being handed out
+as extra payload capacity -- a board configured for 128 B must not
+accept 176 B, or one peer writes more than a correctly-sized reader can
+hold. And it keeps the accepted range identical on the create and open
+paths: bounding the derived stride against `MAX_VALUE_SIZE` would let a
+board be created at exactly the documented maximum and then fail every
+subsequent open.
+
+Defaults are 256 keys and a 1008 B value, about 608 KB per board --
+comfortably under the registry's 2 MB per namespace.
+
+### Key state machine
+
+Three states, with the board lock -- not a state value -- providing
+exclusion:
+
+```
+Free (0) ──► Claiming (1) ──► Active (2)
+   ▲                             │
+   └──────── sweep_stale ────────┘
+      (dead owner; value destroyed)
+
+every transition runs while holding the board lock
+```
+
+`Claiming` exists only because it must survive its claimant's death: it
+is what tells a recoverer the entry was mid-claim. A takeover or a
+release never leaves `Active`.
+
+A key is `Active` whether or not it currently has an owner. Releasing a
+key (explicitly, or when the `Writer` handle is destroyed) clears
+`owner_pid` and leaves the entry `Active` holding its value: late
+readers keep seeing the last state, and a later `declare()` takes it
+over. Only `sweep_stale()` returns an entry to `Free`, and doing so
+destroys its value -- which is why it is an operator tool and not the
+normal restart path.
+
+### Publish protocol: double-buffered value, packed publish word
+
+This is the part worth reading carefully; it is what makes a crashed
+writer harmless.
+
+```
+publish (atomic<uint64_t>) = (completed_writes << 1) | write_in_progress
+live cell                  = (publish >> 1) & (CELLS_PER_KEY - 1)
+```
+
+The cell index is a **mask of a counter, never an index stored in shared
+memory**, so a corrupt `publish` word cannot address outside the cells.
+
+Writer -- there is exactly one per key, so it caches its own write count
+in the handle and uses plain stores rather than RMWs:
+
+```
+k = writes_ + 1
+publish.store(2*k - 1, relaxed)      // announce write START
+atomic_thread_fence(release)         // keeps the odd store above the payload
+                                     // stores.  fetch_add(1, release) would NOT:
+                                     // a release RMW orders PRIOR ops only.
+memcpy(cell[k & 1].payload, data, len)
+cell[k & 1].value_len.store(len, relaxed)
+cell[k & 1].updated_at_ns.store(monotonic_ns(), relaxed)
+atomic_thread_fence(release)
+publish.store(2*k, relaxed)          // announce write DONE
+```
+
+Announcing at write **start** is load-bearing: cell `k` is clobbered when
+write `k + CELLS_PER_KEY` begins, and the odd store is what the reader's
+re-check observes. A naive double buffer that bumped its counter only
+after the copy would let a reader sit inside the cell being overwritten
+while the word looked unchanged.
+
+**A writer that dies mid-`memcpy` leaves `publish` odd at `2k-1`.**
+Readers compute `k = publish >> 1` and read the *other* cell, which is
+complete, so the last good value stays visible indefinitely. A new owner
+resumes the counter and the abandoned bytes are overwritten by its next
+write. There is no wedged state, so the blackboard needs **no repair
+primitive at all** -- unlike an odd/even seqlock, which would destroy the
+crashed node's last state at exactly the moment it is most wanted.
+
+`publish` is 64-bit and is never reset on a same-key takeover: it stays
+monotonic for the life of the entry, which preserves the dead owner's
+value with no blackout and closes the counter-rewind ABA window. It *is*
+reset when a `Free` entry is claimed for a new key -- a `Free` entry never
+holds a meaningful value, and without the reset a fresh reader would
+resolve the new key and read the previous tenant's bytes.
+
+### Read protocol
+
+```
+t1 = tenancy.load(acquire);  if (t1 != cached_tenancy) -> re-resolve
+v1 = publish.load(acquire);  k = v1 >> 1;  if (k == 0) -> Unset
+len = cell[k & 1].value_len.load(relaxed)
+if (len > value_capacity) { len = value_capacity }   // clamp BEFORE the memcpy
+memcpy(out, cell[k & 1].payload, len)
+atomic_thread_fence(acquire)         // load-bearing: an acquire LOAD orders
+                                     // only LATER accesses (cf. read_seqretry's
+                                     // smp_rmb).  Same shape as
+                                     // Registry::snapshot().
+v2 = publish.load(acquire)
+retry iff  v2 - (v1 & ~1ULL) >= 2 * CELLS_PER_KEY - 1
+```
+
+The unsigned retry predicate is exact for both parities of `v1` and
+cannot overflow on a corrupt word. Retries are **bounded**: after
+`READ_RETRY_BUDGET` attempts the read reports `Busy` rather than
+spinning. `Busy` is transient by construction -- it means a writer
+outran the reader, never that anything is broken.
+
+**Values are always copied.** There is deliberately no zero-copy view: a
+writer may overwrite the cell mid-read, so unlike `SampleView`'s
+refcount-pinned slot there is nothing safe to point at. Pinning would
+reintroduce the failure mode this design exists to remove -- a crashed
+reader blocking a writer.
+
+The overtake window is a genuine data race on the payload bytes in the
+C11 model: the reader's re-check *detects and discards* the copy, but the
+bytes really are touched concurrently. ThreadSanitizer is right to see
+it, and `tests/tsan.supp` carries a narrow, documented suppression scoped
+to `bb_copy_payload()` -- a `noinline` helper that exists so the
+suppression names one frame and leaves `write()` and `read()` themselves
+checked. The blackboard stress scenario asserts
+that no torn value ever escapes, over hundreds of thousands of reads.
+
+### Key claim and uniqueness
+
+`declare()` first scans for an `Active` entry holding the key (takeover),
+then claims the first `Free` entry. The second path needs care: two
+processes can both miss a not-yet-existing key and then claim two
+*different* free entries for it, which would break the one-owner-per-key
+invariant.
+
+The resolution is index-ordered. A claimant writes the key bytes, then
+release-stores `key_hash` last -- so `key_hash != 0` means "this claim's
+key is knowable", and a `Free` entry always reads `key_hash == 0`
+(`sweep_stale` clears it, the one field it does clear). The claimant then
+scans every *lower* index:
+
+- a lower index holding this key -> back out to `Free` and retry;
+- a lower index `Claiming` with `key_hash == 0` -> its key is not yet
+  knowable, so wait and re-scan;
+- otherwise -> finalize to `Active`.
+
+Only lower indices are ever waited on, which makes the wait graph a DAG:
+index 0 never waits, so someone always makes progress.
+
+A claimant killed mid-claim is handled, not merely tolerated. Owner
+identity (`owner_starttime`, then a release-store of `owner_pid`) is
+published **first**, immediately after the `Free -> Claiming` CAS and
+before the key bytes -- so an abandoned claim stays attributable and
+`sweep_stale()` reclaims it. Without that ordering, an abandoned claim
+that had already published `key_hash` would make its key undeclarable
+forever, since every later claimant would read it as a permanent
+conflict. `declare()` therefore sweeps and retries once before giving
+up, mirroring `Registry::register_participant`'s sweep-and-retry on a
+full registry.
+
+An exhausted wait is **not** permission to proceed. `CLAIM_SETTLE_SPINS`
+bounds how long a claimant waits on a lower-index key that has not been
+published, but on timeout it backs out and retries rather than going
+`Active`: a claimant that was merely slow will publish the same key
+afterwards, and treating the timeout as success would leave two entries
+owning one key. Refusing is the correct trade -- the claim is
+unavailable, not wrong.
+
+One residual window remains, and it is the registry's: a process killed
+between a state CAS and its identity store leaves an entry nothing can
+attribute. `sweep_stale()` deliberately skips those -- they are
+indistinguishable from a live transition still in progress -- so such an
+entry leaks until the region is unlinked, and blocks its key. The window
+is two stores wide.
+
+### Change notification
+
+One board-wide `change_seq` counter plus a `waiters` count, on their own
+cache line so the read-mostly header line is never dirtied by a commit.
+Every value update, key claim and key release bumps `change_seq`, then
+runs the same Dekker conditional-wake pair as the publish path
+(`seq_cst` fence, then wake only if someone is parked).
+
+`change_seq` is the futex word directly: `futex_wait` takes an
+`atomic<uint64_t>` and watches its low 32 bits, exactly as
+`SubRingHeader::write_pos` does. A lost wakeup therefore needs 2^32
+updates inside one park window -- the same property `write_pos` has, and
+the reason **every wait takes a finite caller-supplied timeout**. There
+is no infinite-wait API.
+
+`waiters` is a **counter, not a flag**. `SubRingHeader::has_waiter` can
+be a flag because each ring has exactly one owner; a board has N readers
+on one word, and with a flag reader A's `store(0)` would erase reader B's
+registration and B would sleep to its timeout. A reader killed while
+parked leaves the count high, which degrades toward *more* wakeups, never
+fewer.
+
+One counter, not a queue per key: a woken reader re-checks only the
+cached `(publish, tenancy)` of its own declared keys -- a handful of
+relaxed loads on lines it already owns -- so a spurious wake is cheap.
+At the pattern this is built for (a few keys at a few Hz, many readers)
+the wake traffic is negligible. It degrades above roughly 1 kHz aggregate
+updates with tens of parked readers; that is what pub/sub is for.
+
+### Ownership, liveness, and the recovery contract
+
+Ownership is exclusive: `declare()` on a key owned by a live process
+throws. It succeeds when the key is free, when it is unowned, or when its
+owner is **provably** dead -- `owner_is_dead()` in `os/Process.h`, the
+same pid + start-time check `Registry::sweep_stale` and the ring reclaim
+use, so a slow-but-alive writer is never evicted.
+
+"Provably dead" includes a process that has exited but has not been
+reaped. A zombie answers `kill(pid, 0)` and still reports the start time
+it was recorded with, so pid + start time alone calls it alive forever --
+and nothing would ever reclaim from a corpse whose parent never waits.
+`process_probe()` reports that state (`/proc/<pid>/stat` field 3 on
+Linux, `SZOMB` on Darwin, a zero-timeout wait on Windows) and
+`owner_is_dead()` treats it as dead. The board lock uses the same rule:
+an unreaped holder would otherwise wedge every board operation forever.
+
+Ownership is also **per process, not per handle**. A `Writer` inherited
+across `fork()` records the declaring pid, and in a child both `write()`
+and `release()` are no-ops: otherwise the child could publish under the
+parent's key, and the child's `~Writer` -- which runs on every exit path
+-- would hand the parent's claim away behind its back.
+
+Following the recovery contract used everywhere else in this document:
+
+- `snapshot()` and every read are **safe under live traffic**.
+  `snapshot()` probes owner liveness, which costs one OS call per active
+  key, so it belongs on a health timer or in the CLI -- never on a read
+  path.  Those probes run **after** the board lock is dropped: a /proc
+  read per key across a full board is long enough for a concurrent
+  `declare()` to burn its yield budget and report a busy board.
+- `sweep_stale()` is also **safe under live traffic**: it takes the board
+  lock and re-verifies death under it, so a slow-but-alive writer is
+  never touched. It is nonetheless destructive -- it frees keys whose
+  owner is gone, discarding their last values. The normal crash-restart
+  path is `declare()`'s takeover, which preserves them.
+- An unowned key -- released on purpose -- is never swept. `owner_pid ==
+  0` on an `Active` entry is a deliberate state, not crash residue.
+
+Releasing a key takes the board lock like every other transition.
+Clearing ownership without it is a real hazard rather than a theoretical
+one:
+`owner_pid = 0` makes the entry takeable, so a concurrent `declare()` can
+complete a takeover between that store and the ones after it -- and those
+would then wipe the new owner's start time and bump `tenancy` past the
+handle it was just given, leaving a writer that can never write again.
+
+Exclusion is a **board-level recoverable mutex**, `BlackboardHeader::
+lock_token`, and every metadata operation runs under it: `declare`,
+`release`, `sweep_stale` and `snapshot`. The value paths -- `write` and
+`read` -- never touch it and stay lock-free.
+
+The lock is board-wide rather than per-entry because the invariant it
+protects is board-wide. "No two entries hold the same key" spans the
+whole array, and no per-entry lock can enforce it: two claimants working
+on different entries exclude nothing between them. Both can scan, both
+can see nothing, and both can commit. Earlier designs tried to
+approximate a global lock with a downward scan and a back-off protocol;
+that scan is inherently asymmetric -- a claimant at a lower index never
+sees one already committed above it -- so duplicates survived. Scanning
+for the key and claiming a slot must be one indivisible step, which is
+what the board lock makes them.
+
+`declare` is a connect-time operation and `snapshot` a diagnostic one, so
+serializing them costs nothing that matters. What it buys is that pass 1
+finding no entry for a key is a *proof* rather than a snapshot.
+
+### The lock token
+
+The token packs the holder's pid with a fingerprint of its start time
+into one word: `(fingerprint : 32 | pid : 32)`, zero meaning unlocked.
+
+Packing is not tidiness, it is the correctness argument. Read as two
+separate fields, a transfer briefly exposes the new holder's pid beside
+the old holder's start time -- and a third party reading that pair
+concludes a live holder is dead and steals the lock. One word, one CAS,
+no window. pid fits in 32 bits on every supported platform (Linux
+`pid_max` is 2^22; Darwin and Windows ids are 32-bit). A fingerprint
+collision costs a missed reclaim, never a false one, because the pid must
+match too.
+
+An abandoned lock transfers **directly** from the dead holder's token to
+the recoverer's, never passing through zero, so no third party can slip
+in while the board is being repaired.
+
+One consequence worth stating because it is easy to get wrong: every
+thread in a process computes the *same* token, so the lock must not treat
+"held by my own token" as re-entry. Doing so makes it unusable between
+threads of one process -- a release gives up instantly and strands
+ownership on a live owner, which no sweep can reclaim. Nothing nests
+(`declare` and `sweep_stale` both call the already-locked sweep body), so
+a thread that finds its own process's token simply waits.
+
+### One way to hold it
+
+`BoardGuard` is the only way to take the lock, and it is `[[nodiscard]]`.
+That shape is not decoration: every lock defect found in review was the
+same mistake in a different place -- a fallible acquisition whose result
+was ignored, or a manual unlock skipped by an early exit. `snapshot()`
+managed both, reading unlocked when its budget expired and leaking the
+lock if building a row threw. The guard makes each a compile error or an
+unavoidable branch rather than something to re-check by eye.
+
+A leaked lock is worse than it sounds, because the lock outlives the
+process that dropped it. Leaking it and *dying* is harmless -- the token
+names a dead pid and the next actor transfers it. Leaking it while
+*surviving* is not: the token names a live pid, is never transferred, and
+every operation on that board in every process blocks forever. That
+asymmetry is why the guard exists rather than a convention.
+
+Teardown waits, but not forever. `Writer::release()` cannot report
+failure -- it runs from a destructor -- and giving up leaves ownership
+recorded for a process that is still alive, which no sweep can reclaim
+until that process exits. So it waits, and every critical section is a
+bounded, non-blocking scan with a dead holder's lock transferred, which
+is what makes the wait terminate. The bound is nevertheless wall clock
+(`RELEASE_LOCK_WAIT`, two seconds) and not a yield count: only wall clock
+bounds how long a destructor can stall, and a destructor that can hang
+the process on a wedged peer is not a shape worth keeping.
+`declare()`, `snapshot()` and `sweep_stale()` use a yield budget and
+report busy, so a caller that would rather fail than block can.
+
+One trap worth recording: every thread in a process computes the same
+token, so the lock must not treat "held by my own token" as re-entry.
+Doing so makes it unusable between threads of one process. Nothing nests,
+so a thread that meets its own process's token simply waits.
+
+### The lock excludes metadata, not writers
+
+`snapshot()` holds the board lock, but the value path is lock-free by
+design and keeps running underneath it. So a snapshot's value tuple needs
+the same `publish` re-check a read performs: without it, two writes can
+wrap back onto the cell the snapshot chose and pair `update_count` k with
+the length and timestamp of k+2.
+
+### Recovery is total
+
+Whoever inherits an abandoned lock repairs the board before doing
+anything else, and the repair is defined over *every* entry state rather
+than the ones a particular path happens to produce:
+
+- `Claiming` -> `Free`. A claim that never committed never handed out a
+  `Writer`, so it owns nothing. Promoting it to `Active` would invent an
+  owner that never existed and could duplicate a key another entry
+  legitimately holds.
+- `Active` with no `key_hash` -> `Free`. This is a death partway through
+  freeing an entry, which clears identity before publishing `Free`. Left
+  alone it is a phantom: it matches no reader, has no owner to sweep, and
+  holds a slot forever.
+- `Free` carrying identity -> identity cleared. The mirror case. A free
+  entry that kept a dead pid would be inherited by the next claimant, and
+  a sweeper would then reclaim that live claim using the corpse's pid.
+- `Active` with a key -> kept. Whatever ownership it carries is the
+  normal sweep's business.
+
+A board opened through `Node` carries the node's own name, so `declare()`
+labels every key with it and callers never repeat it. A standalone board
+takes the name at open time, mirroring `SharedRegion::create`'s
+`creator_name`.
+
+`Claiming` exists only to survive its claimant's death; it is what tells
+a recoverer the entry was mid-claim. A takeover or a release never leaves
+`Active` at all, which is why there is no `Reclaiming` state.
+
+### Verifying it
+
+Reasoning about this by inspection failed repeatedly, each fix seeding
+the next defect, so the invariants are tested rather than argued.
+
+`tests/unit/blackboard-t.cc` carries a **crash-point matrix**: every
+store in every transition, fabricated as a death at that point would
+leave it, with the board lock marked as held by that dead process, then
+swept and checked against one postcondition -- terminal state, lock free
+again, no phantom `Active`, no identity on a `Free` entry, board still
+declarable, neighbours untouched. It also covers forged states no live
+actor can produce, because a corrupt peer can write them and each would
+otherwise wedge a key or leak a slot.
+
+The matrix models one actor dying. The cross-entry invariant needs two
+live actors, so a separate test runs many threads declaring a few keys
+repeatedly and asserts no key is ever held by two entries or granted to
+two writers. Run against a build without the board lock it reports up to
+three simultaneous owners of one key -- which is the defect it exists to
+catch.
+
+### Mechanism, not policy
+
+The library never interprets a value's bytes, never defines a staleness
+threshold, and never re-declares a key on a writer's behalf. It exposes
+`updated_at_ns` (from `monotonic_ns()`, which is host-wide on all three
+platforms, so cross-process age arithmetic is valid and does not jump on
+an NTP step), the owner pid, and a change counter. What counts as "too
+old" is the caller's.
+
+One deliberate exception to the schema section's "the library does no
+waiting on behalf of the user": `wait()` blocks. A futex on a counter is
+a mechanism -- it replaces a polling loop the caller would otherwise
+write worse. A retry loop with a staleness threshold would be policy, and
+is left out.
+
+### Sizing
+
+```
+region = 192
+       + capacity * 384                              (entries)
+       + capacity * CELLS_PER_KEY * value_stride     (values)
+```
+
+At the defaults (`capacity = 256`, `max_value_size = 1008`,
+`CELLS_PER_KEY = 2`, so `value_stride = 1024`): 192 + 98304 + 524288 =
+622784 B, about 608 KB.
+`capacity` and `max_value_size` are create-time parameters that openers
+inherit and are checked against via `config_hash`, exactly like channel
+geometry.
 
 
 ## Design Tradeoffs

@@ -489,3 +489,159 @@ TEST_F(NodeTest, RelaxedMailboxForcesMaxSubscribersOne)
     auto r = inbox.try_receive();
     ASSERT_TRUE(r.has_value());
 }
+
+TEST_F(NodeTest, BlackboardIsIdempotentAndUsesBbShmName)
+{
+    track(kickmsg::Blackboard::shm_name("test", "state"));
+
+    kickmsg::Node node("bbnode", "test");
+    auto& a = node.blackboard("state");
+    auto& b = node.blackboard("state");
+    EXPECT_EQ(&a, &b);
+
+    // Not the literal path: macOS hashes shm names to fit PSHMNAMLEN.  What
+    // must hold everywhere is that Node and the public helper agree, so
+    // unlink_blackboard/try_open/diagnostics all address the same region.
+    // The naming scheme itself is covered in naming-t.cc.
+    EXPECT_EQ(a.name(), kickmsg::Blackboard::shm_name("test", "state"));
+}
+
+TEST_F(NodeTest, BlackboardRegistersAsBlackboardKind)
+{
+    track(kickmsg::Blackboard::shm_name("test", "state"));
+
+    kickmsg::Node node("bbnode", "test");
+    node.blackboard("state");
+
+    auto reg = kickmsg::Registry::try_open("test");
+    ASSERT_TRUE(reg.has_value());
+
+    auto expected_shm = kickmsg::Blackboard::shm_name("test", "state");
+    bool found = false;
+    for (auto const& p : reg->snapshot())
+    {
+        if (p.shm_name != expected_shm)
+        {
+            continue;
+        }
+        found = true;
+        EXPECT_EQ(p.kind, static_cast<uint32_t>(kickmsg::registry::Blackboard));
+        EXPECT_EQ(p.role, static_cast<uint32_t>(kickmsg::registry::Both));
+        EXPECT_EQ(p.channel_type, static_cast<uint32_t>(kickmsg::channel::None));
+        EXPECT_EQ(p.topic_name, "/state");
+        EXPECT_EQ(p.node_name, "bbnode");
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST_F(NodeTest, BlackboardCrossNodeLateReader)
+{
+    track(kickmsg::Blackboard::shm_name("test", "state"));
+
+    uint32_t value = 0xC0FFEE;
+    {
+        kickmsg::Node writer_node("writer", "test");
+        auto& bb = writer_node.blackboard("state");
+        auto  w  = bb.declare("lifecycle", "writer");
+        ASSERT_TRUE(w.write(value));
+
+        // The reader node is constructed only now, after the single write.
+        kickmsg::Node reader_node("reader", "test");
+        auto& rbb = reader_node.blackboard("state");
+        auto  r   = rbb.observe("lifecycle");
+
+        uint32_t got = 0;
+        auto     out = r.read(got);
+        EXPECT_EQ(out.status, kickmsg::blackboard::Ok);
+        EXPECT_EQ(got, value);
+    }
+}
+
+TEST_F(NodeTest, UnlinkBlackboardRemovesShm)
+{
+    // Same platform-portability structure as UnlinkTopicRemovesShm above:
+    // release every handle BEFORE unlinking, because Windows destroys a
+    // mapping only when its last handle closes and unlink() is a no-op there.
+    track(kickmsg::Blackboard::shm_name("test", "gone"));
+
+    {
+        kickmsg::Node node("bbnode", "test");
+        node.blackboard("gone");
+        EXPECT_TRUE(kickmsg::Blackboard::try_open("test", "gone").has_value());
+    }  // all handles released here
+
+    kickmsg::Node cleanup("cleanup", "test");
+    cleanup.unlink_blackboard("gone");
+
+    EXPECT_FALSE(kickmsg::Blackboard::try_open("test", "gone").has_value());
+}
+
+TEST_F(NodeTest, BlackboardShmNameCollisionDetectedByIdentityStamp)
+{
+    // "a:b" and "a b" both sanitize to "a_b", so both land on
+    // "/test_bb_a_b".  The identity stamp must reject the second open.
+    track(kickmsg::Blackboard::shm_name("test", "a:b"));
+
+    kickmsg::Node owner("owner", "test");
+    owner.blackboard("a:b");
+
+    kickmsg::Node other("other", "test");
+    EXPECT_THROW(other.blackboard("a b"), std::runtime_error);
+}
+
+TEST_F(NodeTest, BlackboardCacheDoesNotAliasSanitizedNames)
+{
+    // "a:b" and "a b" sanitize to one shm path.  A cache keyed by that path
+    // would return the first board for the second name, silently bypassing
+    // the identity check.
+    track(kickmsg::Blackboard::shm_name("test", "a:b"));
+
+    kickmsg::Node node("bbnode", "test");
+    node.blackboard("a:b");
+    EXPECT_THROW(node.blackboard("a b"), std::runtime_error);
+}
+
+TEST_F(NodeTest, BlackboardCacheValidatesConfigOnHit)
+{
+    // A cache hit skips open_or_create, so the geometry check has to happen
+    // on the hit path too.
+    track(kickmsg::Blackboard::shm_name("test", "state"));
+
+    kickmsg::Node node("bbnode", "test");
+    kickmsg::blackboard::Config first;
+    first.capacity       = 8;
+    first.max_value_size = 64;
+    node.blackboard("state", first);
+
+    kickmsg::blackboard::Config other;
+    other.capacity       = 16;
+    other.max_value_size = 64;
+    EXPECT_THROW(node.blackboard("state", other), std::runtime_error);
+}
+
+TEST_F(NodeTest, BlackboardKeysInheritTheNodeName)
+{
+    // The Node already knows its name; declaring a key must not make the
+    // caller repeat it.
+    track(kickmsg::Blackboard::shm_name("test", "state"));
+
+    kickmsg::Node node("arm_driver", "test");
+    auto&         bb = node.blackboard("state");
+
+    auto inherited = bb.declare("arm/state");
+    auto overridden = bb.declare("arm/mode", "other_name");
+
+    auto snap = bb.snapshot();
+    ASSERT_EQ(snap.size(), 2u);
+    for (auto const& ks : snap)
+    {
+        if (ks.key == "arm/state")
+        {
+            EXPECT_EQ(ks.owner_node, "arm_driver");
+        }
+        else
+        {
+            EXPECT_EQ(ks.owner_node, "other_name");
+        }
+    }
+}

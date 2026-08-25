@@ -152,12 +152,56 @@ class WatchSnapshot:
     rates_msg_per_sec: list[float]
 
 
+@dataclass(frozen=True)
+class BlackboardKey:
+    """One key on a blackboard.
+
+    `age_seconds` is derived from a monotonic clock shared with the writer's
+    process, so it is meaningful across processes and does not jump on an NTP
+    step.  It is None for a key that has been declared but never written.
+    """
+    key: str
+    value_len: int
+    updated_at_ns: int
+    update_count: int
+    owner_pid: int          # 0 when the key holds a value but is unowned
+    owner_node: str
+    owner_alive: bool
+    age_seconds: float | None
+
+
+@dataclass(frozen=True)
+class BlackboardSnapshot:
+    shm_name: str
+    kmsg_namespace: str
+    name: str
+    capacity: int
+    max_value_size: int
+    change_seq: int
+    keys: list[BlackboardKey] = field(default_factory=list)
+    dead_owner_keys: int = 0
+    status: str = "healthy"      # "healthy" | "stale owners"
+
+
+@dataclass(frozen=True)
+class BlackboardWatchSnapshot:
+    """One frame of `blackboard_watch()`.
+
+    Rates are keyed by key name, not index-aligned: blackboard keys appear and
+    disappear, so an index-aligned list would silently misattribute a rate to
+    whichever key landed in that slot.
+    """
+    snapshot: BlackboardSnapshot
+    rates_per_key: dict[str, float]
+
+
 # ----------------------------------------------------------------------
 # Internal helpers
 # ----------------------------------------------------------------------
 
 
 _CHANNEL_NAME = {
+    _native.ChannelType.NoChannel.value: "-",
     _native.ChannelType.PubSub.value: "pubsub",
     _native.ChannelType.Broadcast.value: "broadcast",
 }
@@ -169,9 +213,10 @@ _ROLE_NAME = {
 }
 
 _KIND_NAME = {
-    _native.Kind.Pubsub.value:    "pubsub",
-    _native.Kind.Broadcast.value: "broadcast",
-    _native.Kind.Mailbox.value:   "mailbox",
+    _native.Kind.Pubsub.value:     "pubsub",
+    _native.Kind.Broadcast.value:  "broadcast",
+    _native.Kind.Mailbox.value:    "mailbox",
+    _native.Kind.Blackboard.value: "blackboard",
 }
 
 _RING_STATE = {0: "free", 1: "live", 2: "draining"}
@@ -410,16 +455,20 @@ def list_topics(kmsg_namespace: str = "kickmsg") -> list[TopicSummary]:
     for native_t in registry.list_topics():
         schema_name = None
         schema_version = None
-        try:
-            region = _native.SharedRegion.open(native_t.shm_name)
-            s = _schema_snapshot(region)
-            if s.state == "set":
-                schema_name = s.name
-                schema_version = s.version
-        except RuntimeError:
-            # Region may have been unlinked between snapshot and open —
-            # skip schema enrichment, keep the row.
-            pass
+        # A blackboard is not a channel region: SharedRegion.open() would
+        # reject its magic.  Skipping is not just tidier — it avoids an
+        # shm_open + mmap + throw per blackboard on every listing.
+        if native_t.kind != _native.Kind.Blackboard.value:
+            try:
+                region = _native.SharedRegion.open(native_t.shm_name)
+                s = _schema_snapshot(region)
+                if s.state == "set":
+                    schema_name = s.name
+                    schema_version = s.version
+            except RuntimeError:
+                # Region may have been unlinked between snapshot and open —
+                # skip schema enrichment, keep the row.
+                pass
 
         # Topic age = now - earliest participant registration.
         all_parts = (list(native_t.producers) + list(native_t.consumers)
@@ -445,3 +494,105 @@ def list_topics(kmsg_namespace: str = "kickmsg") -> list[TopicSummary]:
             schema_version=schema_version,
         ))
     return out
+
+
+# ----------------------------------------------------------------------
+# Blackboard
+# ----------------------------------------------------------------------
+
+
+def _to_blackboard_key(ks, now_ns: int) -> BlackboardKey:
+    age = None
+    if ks.update_count > 0 and ks.updated_at_ns > 0:
+        age = max(0.0, (now_ns - ks.updated_at_ns) / 1e9)
+    return BlackboardKey(
+        key=ks.key,
+        value_len=ks.value_len,
+        updated_at_ns=ks.updated_at_ns,
+        update_count=ks.update_count,
+        owner_pid=ks.owner_pid,
+        owner_node=ks.owner_node,
+        owner_alive=ks.owner_alive,
+        age_seconds=age,
+    )
+
+
+def blackboard(name: str, kmsg_namespace: str = "kickmsg") -> BlackboardSnapshot | None:
+    """Snapshot every key on a blackboard, or None if it does not exist.
+
+    Read-only: never creates the region as a side effect of inspection.
+    """
+    board = _native.Blackboard.try_open(kmsg_namespace, name)
+    if board is None:
+        return None
+
+    now_ns = time.monotonic_ns()
+    keys = [_to_blackboard_key(ks, now_ns) for ks in board.snapshot()]
+    keys.sort(key=lambda k: k.key)
+
+    # An unowned key (owner_pid 0) was released deliberately and still holds
+    # its value; only a recorded owner that is gone counts as stale.
+    dead = sum(1 for k in keys if k.owner_pid != 0 and not k.owner_alive)
+    status = "healthy"
+    if dead > 0:
+        status = "stale owners"
+
+    return BlackboardSnapshot(
+        shm_name=board.name,
+        kmsg_namespace=kmsg_namespace,
+        name=name,
+        capacity=board.capacity,
+        max_value_size=board.max_value_size,
+        change_seq=board.change_seq,
+        keys=keys,
+        dead_owner_keys=dead,
+        status=status,
+    )
+
+
+def blackboard_watch(name: str, kmsg_namespace: str = "kickmsg",
+                     interval: float = 1.0) -> Iterator[BlackboardWatchSnapshot]:
+    """Generator yielding blackboard snapshots every `interval` seconds.
+
+    First frame has zero rates.  Caller drives the loop and breaks when done.
+    """
+    prev: dict[str, int] = {}
+    prev_t = 0.0
+    while True:
+        now = time.monotonic()
+        try:
+            snap = blackboard(name, kmsg_namespace)
+        except RuntimeError:
+            # A peer held the board lock for this frame.  Skip it rather than
+            # ending the stream; the next tick will very likely succeed.
+            time.sleep(interval)
+            continue
+        if snap is None:
+            return
+
+        rates: dict[str, float] = {}
+        for k in snap.keys:
+            before = prev.get(k.key)
+            if before is None or now <= prev_t:
+                rates[k.key] = 0.0
+            else:
+                rates[k.key] = max(0.0, (k.update_count - before) / (now - prev_t))
+        yield BlackboardWatchSnapshot(snapshot=snap, rates_per_key=rates)
+
+        prev = {k.key: k.update_count for k in snap.keys}
+        prev_t = now
+        time.sleep(interval)
+
+
+def blackboard_sweep_stale(name: str, kmsg_namespace: str = "kickmsg") -> int:
+    """Reclaim crash residue on a blackboard.
+
+    Frees keys whose owner process is provably dead -- destroying their values
+    -- and recovers entries left mid-operation by a process that died.  Safe
+    under live traffic.  Returns the number of entries reclaimed, or 0 if the
+    blackboard does not exist.
+    """
+    board = _native.Blackboard.try_open(kmsg_namespace, name)
+    if board is None:
+        return 0
+    return board.sweep_stale()

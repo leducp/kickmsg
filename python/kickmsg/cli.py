@@ -431,6 +431,102 @@ def cmd_watch(args) -> int:
 
 
 # ----------------------------------------------------------------------
+# Subcommand: blackboard / blackboard-watch
+# ----------------------------------------------------------------------
+
+
+def _bb_age(key) -> str:
+    if key.update_count == 0:
+        return "never"
+    return _humanize_age(key.age_seconds)
+
+
+def _bb_rows(keys, rates=None) -> tuple[list[str], list[list[str]]]:
+    headers = ["key", "bytes", "updates", "age", "owner", "pid", "alive"]
+    if rates is not None:
+        headers.append("upd/s")
+    rows = []
+    for k in keys:
+        owner_pid = str(k.owner_pid)
+        alive = "yes"
+        if k.owner_pid == 0:
+            owner_pid = "-"
+            alive = "-"          # released on purpose, not a dead owner
+        elif not k.owner_alive:
+            alive = "NO"
+        row = [k.key, str(k.value_len), str(k.update_count), _bb_age(k),
+               k.owner_node or "-", owner_pid, alive]
+        if rates is not None:
+            row.append(f"{rates.get(k.key, 0.0):.1f}")
+        rows.append(row)
+    return headers, rows
+
+
+def cmd_blackboard(args) -> int:
+    try:
+        if args.sweep:
+            reclaimed = diag.blackboard_sweep_stale(args.name, args.namespace)
+            print(f"--sweep: reclaimed {reclaimed} entries")
+
+        snap = diag.blackboard(args.name, args.namespace)
+    except RuntimeError as exc:
+        # e.g. a region that exists but was never initialized, or a version /
+        # geometry mismatch -- all operator-actionable, none a traceback.
+        print(str(exc), file=sys.stderr)
+        return 1
+    if snap is None:
+        print(f"no blackboard '{args.name}' in namespace '{args.namespace}'",
+              file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(_to_json(snap))
+        return 0 if snap.status == "healthy" else 1
+
+    print(f"{snap.shm_name}    keys: {len(snap.keys)}/{snap.capacity}    "
+          f"change_seq: {snap.change_seq}    status: {snap.status}")
+    print()
+    headers, rows = _bb_rows(snap.keys)
+    print(_render_table(headers, rows))
+    if snap.dead_owner_keys:
+        print(f"\n{snap.dead_owner_keys} key(s) owned by a process that is gone; "
+              f"their last values are still readable.  `--sweep` reclaims those "
+              f"entries and destroys those values.")
+    return 0 if snap.status == "healthy" else 1
+
+
+def cmd_blackboard_watch(args) -> int:
+    try:
+        present = diag.blackboard(args.name, args.namespace) is not None
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if not present:
+        print(f"no blackboard '{args.name}' in namespace '{args.namespace}'",
+              file=sys.stderr)
+        return 1
+
+    is_tty = sys.stdout.isatty()
+    try:
+        for frame in diag.blackboard_watch(args.name, args.namespace,
+                                           interval=args.interval):
+            if is_tty:
+                sys.stdout.write("\033[2J\033[H")  # clear screen + home
+            else:
+                sys.stdout.write("\n--- frame ---\n")
+            snap = frame.snapshot
+            print(f"{snap.shm_name}    keys: {len(snap.keys)}/{snap.capacity}    "
+                  f"change_seq: {snap.change_seq}    status: {snap.status}")
+            print()
+            headers, rows = _bb_rows(snap.keys, frame.rates_per_key)
+            print(_render_table(headers, rows))
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# ----------------------------------------------------------------------
 # Subcommand: schema / schema-diff
 # ----------------------------------------------------------------------
 
@@ -528,6 +624,24 @@ def build_parser() -> argparse.ArgumentParser:
     _add_region_target(sp)
     sp.add_argument("-i", "--interval", type=float, default=1.0)
     sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("blackboard", aliases=["bb"],
+                        help="Inspect a blackboard's keys")
+    sp.add_argument("name", help="Blackboard name, as passed to Node.blackboard()")
+    sp.add_argument("-n", "--namespace", default=_default_namespace())
+    sp.add_argument("--sweep", action="store_true",
+                    help="reclaim crash residue: free keys whose owner process "
+                         "is gone (destroying their values) and recover entries "
+                         "left mid-operation (safe under live traffic)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_blackboard)
+
+    sp = sub.add_parser("blackboard-watch", aliases=["bbwatch"],
+                        help="top-like live view of a blackboard")
+    sp.add_argument("name")
+    sp.add_argument("-n", "--namespace", default=_default_namespace())
+    sp.add_argument("-i", "--interval", type=float, default=1.0)
+    sp.set_defaults(func=cmd_blackboard_watch)
 
     sp = sub.add_parser("schema", help="Inspect the schema descriptor")
     _add_region_target(sp)

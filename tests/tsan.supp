@@ -1,5 +1,27 @@
-# No suppressions needed.
-# The seqlock data races were fixed by the refcount pin in try_receive()
-# and the two-phase commit (LOCKED_SEQUENCE) in publish().
-# This file is kept empty so the suppression infrastructure remains
-# available if needed in the future.
+# Blackboard value cells: a detected-and-discarded race on the payload bytes.
+#
+# A writer copies into the cell readers are NOT on, so the common case has no
+# concurrent access.  A reader overtaken by CELLS_PER_KEY writes does overlap
+# the writer's memcpy; its publish-word re-check detects exactly that and
+# discards the copy, so no torn value is ever returned (the blackboard stress
+# scenario asserts torn == 0 over hundreds of thousands of reads).  The
+# byte-level overlap is still a data race in the C11 model, and TSAN's slowdown
+# widens the overtake window enough that it fires at any write rate.
+#
+# Same class as the seqlock read in Subscriber::try_receive_view(), which is
+# race-free only because of its refcount pin.  A blackboard cannot pin: that
+# would let a crashed reader block a writer.
+race:bb_copy_payload
+
+# Blackboard key bytes: Reader::resolve() compares e->key unlocked, and a slot
+# being re-claimed has its key rewritten by declare() under the board lock.  A
+# reader reaches that compare only through a stale Active state -- the claim
+# publishes Active last, and that release store is what orders the key bytes
+# for every reader that sees it.  read() then re-checks the entry's tenancy and
+# retries when it moved, so a torn compare costs a retry and can never return
+# another key's value.
+race:bb_key_equals
+
+# Both helpers are noinline (KICKMSG_BB_NOINLINE in src/Blackboard.cc) so these
+# suppressions match one frame each: write(), read() and resolve() themselves
+# stay checked, as does the whole publish/receive/repair core.

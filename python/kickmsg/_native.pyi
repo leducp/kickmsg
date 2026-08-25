@@ -7,6 +7,8 @@ from . import hash as hash, schema as schema
 
 
 class ChannelType(enum.Enum):
+    NoChannel = 0
+
     PubSub = 1
 
     Broadcast = 2
@@ -248,6 +250,8 @@ class Kind(enum.Enum):
 
     Mailbox = 3
 
+    Blackboard = 4
+
 class Participant:
     @property
     def pid(self) -> int: ...
@@ -448,6 +452,175 @@ class Subscriber:
 
     def __next__(self) -> bytes: ...
 
+class BlackboardStatus(enum.Enum):
+    Ok = 0
+
+    Missing = 1
+
+    Unset = 2
+
+    Truncated = 3
+
+    Busy = 4
+
+    SizeMismatch = 5
+
+class BlackboardConfig:
+    def __init__(self) -> None: ...
+
+    @property
+    def capacity(self) -> int: ...
+
+    @capacity.setter
+    def capacity(self, arg: int, /) -> None: ...
+
+    @property
+    def max_value_size(self) -> int: ...
+
+    @max_value_size.setter
+    def max_value_size(self, arg: int, /) -> None: ...
+
+    @property
+    def identity(self) -> int: ...
+
+    @identity.setter
+    def identity(self, arg: int, /) -> None: ...
+
+    def __repr__(self) -> str: ...
+
+class KeyStatus:
+    @property
+    def key(self) -> str: ...
+
+    @property
+    def value_len(self) -> int: ...
+
+    @property
+    def updated_at_ns(self) -> int: ...
+
+    @property
+    def update_count(self) -> int: ...
+
+    @property
+    def owner_pid(self) -> int: ...
+
+    @property
+    def owner_node(self) -> str: ...
+
+    @property
+    def owner_alive(self) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+class ReadOutcome:
+    @property
+    def status(self) -> BlackboardStatus: ...
+
+    @property
+    def data(self) -> bytes: ...
+
+    @property
+    def updated_at_ns(self) -> int: ...
+
+    @property
+    def update_count(self) -> int: ...
+
+    def __len__(self) -> int: ...
+
+    def __bool__(self) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+class BlackboardWriter:
+    def write(self, data: bytes) -> bool:
+        """
+        Publish a new value.  Returns False if the value exceeds the board's max_value_size, or if this writer no longer owns the key; the previous value is left untouched either way.
+        """
+
+    def release(self) -> None:
+        """
+        Drop ownership now instead of at destruction.  The value, its timestamp and its update count all survive.
+        """
+
+    @property
+    def key(self) -> str: ...
+
+    @property
+    def valid(self) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+class BlackboardReader:
+    def read(self) -> ReadOutcome:
+        """
+        Copy the current value.  Returns a ReadOutcome.  Values are always copied -- there is no memoryview form, because a writer may overwrite the cell mid-read.
+        """
+
+    def owner_alive(self) -> bool:
+        """
+        Probe whether the key's owner process still exists.  Costs one OS call -- not a hot-path call.
+        """
+
+    @property
+    def key(self) -> str: ...
+
+    def __repr__(self) -> str: ...
+
+class Blackboard:
+    @staticmethod
+    def open_or_create(namespace: str, name: str, cfg: BlackboardConfig = ..., owner_name: str = '') -> Blackboard:
+        """Open the blackboard SHM for (namespace, name), creating it if absent."""
+
+    @staticmethod
+    def try_open(namespace: str, name: str) -> Blackboard | None:
+        """Open an existing blackboard; returns None if none exists."""
+
+    @staticmethod
+    def unlink(namespace: str, name: str) -> None:
+        """Remove the blackboard SHM from the filesystem."""
+
+    @staticmethod
+    def shm_name(namespace: str, name: str) -> str: ...
+
+    def declare(self, key: str, owner_node: str | None = None) -> BlackboardWriter:
+        """
+        Claim exclusive ownership of `key`.  Raises if a live process already owns it or the board is at capacity.
+        """
+
+    def observe(self, key: str) -> BlackboardReader:
+        """
+        Track `key` for O(1) reads.  Never creates it: a reader on a key that does not exist yet reads Missing, and starts returning Ok as soon as a writer declares and writes it.
+        """
+
+    @property
+    def change_seq(self) -> int: ...
+
+    def wait(self, last_seen: int, timeout: datetime.timedelta | float) -> bool:
+        """
+        Block until change_seq differs from `last_seen`, or `timeout` (a timedelta) elapses.  Releases the GIL while blocked.  Pass the change_seq you last acted on -- that is what closes the lost-wakeup window.
+        """
+
+    def snapshot(self) -> list[KeyStatus]:
+        """
+        Diagnostic copy of every active key.  Probes owner liveness (one OS call per key), so the GIL is released.
+        """
+
+    def sweep_stale(self) -> int:
+        """
+        Reclaim crash residue: free keys whose owner process is provably dead (destroying their values) and recover entries left mid-operation by a process that died.  Safe under live traffic.  Releases the GIL.
+        """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def capacity(self) -> int: ...
+
+    @property
+    def max_value_size(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
 class BroadcastHandle:
     @property
     def pub(self) -> Publisher: ...
@@ -473,6 +646,10 @@ class Node:
     def create_mailbox(self, tag: str, cfg: Config = ...) -> Subscriber: ...
 
     def open_mailbox(self, owner_node: str, tag: str) -> Publisher: ...
+
+    def blackboard(self, name: str, cfg: BlackboardConfig = ...) -> Blackboard: ...
+
+    def unlink_blackboard(self, name: str) -> None: ...
 
     def unlink_topic(self, topic: str) -> None: ...
 

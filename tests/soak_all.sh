@@ -8,7 +8,8 @@
 #   total_secs : wall-clock budget (default 604800 = 1 week)
 #   slice_secs : seconds per profile slice (default 1800 = 30 min)
 #   SOAK_FOREGROUND=1   run inline instead of detaching
-#   PLAIN_BIN / CRASH_BIN / TSAN_BIN   override binaries (TSAN optional)
+#   PLAIN_BIN / CRASH_BIN / TSAN_BIN / BBCRASH_BIN   override binaries
+#                                      (TSAN optional)
 #
 # NOT 'set -e': a failing slice records and continues.
 set -uo pipefail
@@ -64,6 +65,7 @@ PLAIN="${PLAIN_BIN:-$ROOT/build/kickmsg_stress_test}"
 CRASH="${CRASH_BIN:-$ROOT/build/kickmsg_crash_test}"
 STALL="${STALL_BIN:-$ROOT/build/kickmsg_stall_repair_test}"
 MP="${MP_BIN:-$ROOT/build/kickmsg_mp_stress_test}"
+BBCRASH="${BBCRASH_BIN:-$ROOT/build/kickmsg_blackboard_crash_test}"
 TSAN="${TSAN_BIN:-$ROOT/build_tsan/kickmsg_stress_test}"
 ASAN="${ASAN_BIN:-$ROOT/build_asan/kickmsg_stress_test}"
 TSAN_SUPP="$ROOT/tests/tsan.supp"
@@ -82,6 +84,7 @@ PROFILES=(
   "stress-150|$PLAIN|--oversub 150"
   "stall|$STALL|"
   "mp|$MP|"
+  "bbcrash|$BBCRASH|"
   "tsan-150|$TSAN|--oversub 150"
   "crash|$CRASH|"
   "tsan-150|$TSAN|--oversub 150"

@@ -71,6 +71,7 @@ success "Stress repeat x10 passed"
 
 step "Crash / recovery tests"
 "$BUILD_PATH/kickmsg_crash_test"
+"$BUILD_PATH/kickmsg_blackboard_crash_test"
 success "Crash tests passed"
 
 echo

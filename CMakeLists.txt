@@ -87,7 +87,9 @@ add_library(kickmsg STATIC
     src/Subscriber.cc
     src/Region.cc
     src/Registry.cc
+    src/Blackboard.cc
     src/Node.cc
+    src/os/Process.cc
     ${OS_SOURCES}
 )
 

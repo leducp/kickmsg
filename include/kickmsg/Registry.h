@@ -36,11 +36,16 @@ namespace kickmsg
         /// of view.  channel_type (in types.h) is the low-level ring
         /// geometry (PubSub vs Broadcast); Kind distinguishes Mailbox
         /// from PubSub even though both share channel::PubSub geometry.
+        /// Open enum: new kinds are added without a registry::VERSION bump
+        /// (the field is a uint32_t, so no offset moves).  Readers MUST
+        /// tolerate an unknown value -- never switch exhaustively without a
+        /// default.
         enum Kind : uint32_t
         {
-            Pubsub    = 1,
-            Broadcast = 2,
-            Mailbox   = 3,
+            Pubsub     = 1,
+            Broadcast  = 2,
+            Mailbox    = 3,
+            Blackboard = 4,
         };
 
         /// Only `Active` slots are visible to snapshot readers.

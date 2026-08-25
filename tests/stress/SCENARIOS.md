@@ -163,3 +163,27 @@ a subscriber disconnects.
 
 **Failure means**: Subscriber joins a non-Free ring, ring leak after disconnect,
 or data corruption during the join/leave cycle.
+
+## Blackboard (`blackboard.cc`)
+
+**What**: W writer threads (one declared key each) rewrite a large checksummed
+value flat out while R reader threads wake on the board-wide change counter and
+read every key. Writers and readers are both `contention_count()`.
+
+**Why**: The blackboard's correctness claim is that its parity double buffer
+never hands a reader a half-written value -- at any write rate, because the
+writer always targets the cell readers are not on and the reader's publish-word
+re-check discards anything it was overtaken on. Flat-out writers with a 1 KB
+payload make the overtake window wide enough to hit constantly.
+
+**Config**: capacity = W + 4, value = 1024 B, 20000 writes per writer.
+
+**Oracles**: `torn == 0` (no checksum ever fails -- the load-bearing one);
+`update_count` never regresses for a key; `change_seq` delta equals writes plus
+one declare and one release per writer; `snapshot()` holds exactly W keys;
+`sweep_stale()` frees none. `busy` (retry budget exhausted) is reported rather
+than asserted -- it is a transient miss under a hot writer, not corruption.
+
+**Failure means**: A torn value escaped the double buffer, the publish counter
+went backwards, a change event was lost or double-counted, or a live key was
+swept.

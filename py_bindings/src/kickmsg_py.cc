@@ -18,6 +18,13 @@
 ///     Participant            — registry snapshot entry
 ///     Registry               — per-namespace participant discovery
 ///     Node                   — high-level topic / broadcast / mailbox
+///     BlackboardStatus       — read outcome enum
+///     BlackboardConfig       — blackboard::Config
+///     KeyStatus              — Blackboard.snapshot() entry
+///     ReadOutcome            — Blackboard reader result (status + bytes)
+///     BlackboardWriter       — declared key owner: .write(bytes) / .release()
+///     BlackboardReader       — declared read interest: .read() / .owner_alive()
+///     Blackboard             — key/value state; late readers see current values
 ///     schema (submodule)
 ///       Diff                 — enum (bitmask)
 ///       diff(a, b)           — pure diff function
@@ -72,6 +79,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include "kickmsg/Blackboard.h"
 #include "kickmsg/Node.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Region.h"
@@ -99,6 +107,18 @@ namespace kickmsg
     // `.publish()` stays technically valid as a pointer — but any NEW
     // memoryview(slot) after publish is refused with BufferError so
     // accidental reuse is caught.
+    // A blackboard read result plus its bytes.  The C++ ReadOutcome carries
+    // only the length: values are always copied at the Python boundary
+    // because a writer may overwrite the cell mid-read, so unlike SampleView
+    // there is nothing safe to expose through the buffer protocol.
+    struct PyReadOutcome
+    {
+        blackboard::Status status;
+        nb::bytes          data;
+        uint64_t           updated_at_ns;
+        uint64_t           update_count;
+    };
+
     struct PyAllocatedSlot
     {
         Publisher*  publisher;
@@ -228,7 +248,10 @@ namespace kickmsg
         // Enums & simple types
         // -------------------------------------------------------------------
 
+        // channel::None is exposed as NoChannel: `ChannelType.None` would be
+        // a syntax error in Python.
         nb::enum_<channel::Type>(m, "ChannelType")
+            .value("NoChannel", channel::None)
             .value("PubSub",    channel::PubSub)
             .value("Broadcast", channel::Broadcast);
 
@@ -481,9 +504,10 @@ namespace kickmsg
             .value("Both",       registry::Both);
 
         nb::enum_<registry::Kind>(m, "Kind")
-            .value("Pubsub",    registry::Pubsub)
-            .value("Broadcast", registry::Broadcast)
-            .value("Mailbox",   registry::Mailbox);
+            .value("Pubsub",     registry::Pubsub)
+            .value("Broadcast",  registry::Broadcast)
+            .value("Mailbox",    registry::Mailbox)
+            .value("Blackboard", registry::Blackboard);
 
         nb::class_<Participant>(m, "Participant")
             .def_ro("pid",            &Participant::pid)
@@ -873,6 +897,192 @@ namespace kickmsg
         // Node-returned Publisher/Subscriber/BroadcastHandle all point
         // into SharedRegion objects stored inside the Node itself.
         // keep_alive<0, 1>: the return value (0) pins the Node (1 = self).
+        // -------------------------------------------------------------------
+        // Blackboard
+        // -------------------------------------------------------------------
+
+        nb::enum_<blackboard::Status>(m, "BlackboardStatus")
+            .value("Ok",        blackboard::Ok)
+            .value("Missing",   blackboard::Missing)
+            .value("Unset",     blackboard::Unset)
+            .value("Truncated", blackboard::Truncated)
+            .value("Busy",      blackboard::Busy)
+            // Only the C++ typed read can produce this; listed so a Python
+            // caller comparing against the enum sees the full set.
+            .value("SizeMismatch", blackboard::SizeMismatch);
+
+        nb::class_<blackboard::Config>(m, "BlackboardConfig")
+            .def(nb::init<>())
+            .def_rw("capacity",       &blackboard::Config::capacity)
+            .def_rw("max_value_size", &blackboard::Config::max_value_size)
+            .def_rw("identity",       &blackboard::Config::identity)
+            .def("__repr__", [](blackboard::Config const& c)
+            {
+                return std::string{"BlackboardConfig(capacity="}
+                     + std::to_string(c.capacity)
+                     + ", max_value_size=" + std::to_string(c.max_value_size) + ")";
+            });
+
+        nb::class_<blackboard::KeyStatus>(m, "KeyStatus")
+            .def_ro("key",           &blackboard::KeyStatus::key)
+            .def_ro("value_len",     &blackboard::KeyStatus::value_len)
+            .def_ro("updated_at_ns", &blackboard::KeyStatus::updated_at_ns)
+            .def_ro("update_count",  &blackboard::KeyStatus::update_count)
+            .def_ro("owner_pid",     &blackboard::KeyStatus::owner_pid)
+            .def_ro("owner_node",    &blackboard::KeyStatus::owner_node)
+            .def_ro("owner_alive",   &blackboard::KeyStatus::owner_alive)
+            .def("__repr__", [](blackboard::KeyStatus const& k)
+            {
+                return std::string{"KeyStatus(key='"} + k.key
+                     + "', updates=" + std::to_string(k.update_count)
+                     + ", owner_pid=" + std::to_string(k.owner_pid) + ")";
+            });
+
+        nb::class_<PyReadOutcome>(m, "ReadOutcome")
+            .def_ro("status",        &PyReadOutcome::status)
+            .def_ro("data",          &PyReadOutcome::data)
+            .def_ro("updated_at_ns", &PyReadOutcome::updated_at_ns)
+            .def_ro("update_count",  &PyReadOutcome::update_count)
+            .def("__len__", [](PyReadOutcome const& r) { return r.data.size(); })
+            .def("__bool__", [](PyReadOutcome const& r)
+            {
+                return r.status == blackboard::Ok;
+            })
+            .def("__repr__", [](PyReadOutcome const& r)
+            {
+                return std::string{"ReadOutcome(status="}
+                     + std::to_string(static_cast<unsigned>(r.status))
+                     + ", len=" + std::to_string(r.data.size()) + ")";
+            });
+
+        nb::class_<Blackboard::Writer>(m, "BlackboardWriter")
+            .def("write",
+                [](Blackboard::Writer& w, nb::bytes const& data)
+                { return w.write(data.c_str(), data.size()); },
+                "data"_a,
+                "Publish a new value.  Returns False if the value exceeds the "
+                "board's max_value_size, or if this writer no longer owns the "
+                "key; the previous value is left untouched either way.")
+            .def("release", &Blackboard::Writer::release,
+                 "Drop ownership now instead of at destruction.  The value, its "
+                 "timestamp and its update count all survive.")
+            .def_prop_ro("key",   &Blackboard::Writer::key)
+            .def_prop_ro("valid", &Blackboard::Writer::valid)
+            .def("__repr__", [](Blackboard::Writer const& w)
+            {
+                return std::string{"BlackboardWriter(key='"} + w.key() + "')";
+            });
+
+        nb::class_<Blackboard::Reader>(m, "BlackboardReader")
+            .def("read",
+                [](Blackboard::Reader const& r) -> PyReadOutcome
+                {
+                    std::vector<uint8_t> buf;
+                    auto out = r.read(buf);
+                    return PyReadOutcome{
+                        out.status,
+                        nb::bytes(reinterpret_cast<char const*>(buf.data()), buf.size()),
+                        out.updated_at_ns, out.update_count};
+                },
+                "Copy the current value.  Returns a ReadOutcome.  Values are "
+                "always copied -- there is no memoryview form, because a writer "
+                "may overwrite the cell mid-read.")
+            .def("owner_alive", &Blackboard::Reader::owner_alive,
+                 "Probe whether the key's owner process still exists.  Costs "
+                 "one OS call -- not a hot-path call.")
+            .def_prop_ro("key", &Blackboard::Reader::key)
+            .def("__repr__", [](Blackboard::Reader const& r)
+            {
+                return std::string{"BlackboardReader(key='"} + r.key() + "')";
+            });
+
+        nb::class_<Blackboard>(m, "Blackboard")
+            .def_static("open_or_create", &Blackboard::open_or_create,
+                        "namespace"_a, "name"_a, "cfg"_a = blackboard::Config{},
+                        "owner_name"_a = "",
+                        nb::rv_policy::move,
+                        "Open the blackboard SHM for (namespace, name), creating "
+                        "it if absent.  `owner_name` labels every key this board "
+                        "declares.")
+            .def_static("try_open", &Blackboard::try_open, "namespace"_a, "name"_a,
+                        nb::rv_policy::move,
+                        "Open an existing blackboard; returns None if none exists.")
+            .def_static("unlink", &Blackboard::unlink, "namespace"_a, "name"_a,
+                        "Remove the blackboard SHM from the filesystem.")
+            .def_static("shm_name", &Blackboard::shm_name, "namespace"_a, "name"_a)
+            .def("declare",
+                [](Blackboard& b, char const* key,
+                   std::optional<std::string> const& owner_node) -> Blackboard::Writer
+                {
+                    if (owner_node.has_value())
+                    {
+                        return b.declare(key, owner_node->c_str());
+                    }
+                    return b.declare(key);
+                },
+                "key"_a, "owner_node"_a = nb::none(),
+                nb::rv_policy::move, nb::keep_alive<0, 1>(),
+                "Claim exclusive ownership of `key`.  `owner_node` defaults to "
+                "the board's owner name.  Raises if a live process already owns "
+                "the key or the board is at capacity.")
+            .def("observe", &Blackboard::observe, "key"_a,
+                 nb::rv_policy::move, nb::keep_alive<0, 1>(),
+                 "Track `key` for O(1) reads.  Never creates it: a reader on a "
+                 "key that does not exist yet reads Missing, and starts "
+                 "returning Ok as soon as a writer declares and writes it.")
+            .def_prop_ro("change_seq", &Blackboard::change_seq)
+            .def("wait",
+                [](Blackboard& b, uint64_t last_seen, nanoseconds timeout)
+                {
+                    bool changed = false;
+                    {
+                        nb::gil_scoped_release release;
+                        changed = b.wait(last_seen, timeout);
+                    }
+                    return changed;
+                },
+                "last_seen"_a, "timeout"_a,
+                "Block until change_seq differs from `last_seen`, or `timeout` "
+                "(a timedelta) elapses.  Releases the GIL while blocked.  Pass "
+                "the change_seq you last acted on -- that is what closes the "
+                "lost-wakeup window.")
+            .def("snapshot",
+                [](Blackboard const& b)
+                {
+                    std::vector<blackboard::KeyStatus> out;
+                    {
+                        nb::gil_scoped_release release;
+                        out = b.snapshot();
+                    }
+                    return out;
+                },
+                "Diagnostic copy of every active key.  Probes owner liveness "
+                "(one OS call per key), so the GIL is released.")
+            .def("sweep_stale",
+                [](Blackboard& b)
+                {
+                    uint32_t freed = 0;
+                    {
+                        // One liveness probe per candidate key, so this can be
+                        // thousands of OS calls on a large board.
+                        nb::gil_scoped_release release;
+                        freed = b.sweep_stale();
+                    }
+                    return freed;
+                },
+                "Reclaim crash residue: free keys whose owner process is "
+                "provably dead (destroying their values) and recover entries "
+                "left mid-operation by a process that died.  Safe under live "
+                "traffic.  Releases the GIL.")
+            .def_prop_ro("name",           &Blackboard::name)
+            .def_prop_ro("capacity",       &Blackboard::capacity)
+            .def_prop_ro("max_value_size", &Blackboard::max_value_size)
+            .def("__repr__", [](Blackboard const& b)
+            {
+                return std::string{"Blackboard(name='"} + b.name()
+                     + "', capacity=" + std::to_string(b.capacity()) + ")";
+            });
+
         nb::class_<Node>(m, "Node")
             .def(nb::init<std::string const&, std::string const&>(),
                  "name"_a, "namespace"_a = std::string{"kickmsg"})
@@ -899,6 +1109,12 @@ namespace kickmsg
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
             .def("open_mailbox", &Node::open_mailbox, "owner_node"_a, "tag"_a,
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
+            .def("blackboard",
+                [](Node& n, char const* name, blackboard::Config const& cfg)
+                    -> Blackboard& { return n.blackboard(name, cfg); },
+                "name"_a, "cfg"_a = blackboard::Config{},
+                nb::rv_policy::reference_internal)
+            .def("unlink_blackboard", &Node::unlink_blackboard, "name"_a)
             .def("unlink_topic",     &Node::unlink_topic,     "topic"_a)
             .def("unlink_broadcast", &Node::unlink_broadcast, "channel"_a)
             .def("unlink_mailbox",
