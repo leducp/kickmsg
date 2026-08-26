@@ -9,6 +9,7 @@
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 #include "kickmsg/Registry.h"
+#include "kickmsg/Blackboard.h"
 
 namespace kickmsg
 {
@@ -22,10 +23,11 @@ namespace kickmsg
     /// Publisher/Subscriber handles for topic-centric communication.
     ///
     /// Lifetime: the Node owns the underlying shared-memory mappings. All
-    /// Publisher, Subscriber, and BroadcastHandle objects returned by this
-    /// Node hold raw pointers into the mapped memory. They MUST NOT outlive
-    /// the Node that created them -- destroying the Node unmaps the memory
-    /// and silently invalidates all outstanding handles.
+    /// Publisher, Subscriber, BroadcastHandle, and Blackboard::Writer /
+    /// Blackboard::Reader objects reachable through this Node hold raw
+    /// pointers into the mapped memory. They MUST NOT outlive the Node that
+    /// created them -- destroying the Node unmaps the memory and silently
+    /// invalidates all outstanding handles.
     class Node
     {
     public:
@@ -109,6 +111,14 @@ namespace kickmsg
         Publisher  open_or_create_mailbox(char const* owner_node, char const* tag,
                                           channel::Config const& cfg);
 
+        // --- Blackboard (key/value state; late readers see current values) ---
+        //
+        // Returns a reference into this Node's own map, so calling it twice
+        // with the same name yields the SAME object. `cfg` is validated
+        // against the creator's stamped geometry on every call; a mismatch
+        // throws.
+        Blackboard& blackboard(char const* name, blackboard::Config const& cfg = {});
+
         // --- Unlink helpers -----------------------------------------------
         //
         // Thin wrappers that call SharedMemory::unlink() with the same name
@@ -121,6 +131,7 @@ namespace kickmsg
         void unlink_broadcast(char const* channel) const;
         /// Unlink the mailbox owned by `owner_node` (defaults to this node).
         void unlink_mailbox(char const* tag, char const* owner_node = nullptr) const;
+        void unlink_blackboard(char const* name) const;
 
         // --- Optional payload schema descriptor ---
         //
@@ -191,6 +202,13 @@ namespace kickmsg
         // guarantees reference stability for elements (the mmap addresses
         // used by Publisher/Subscriber don't move on rehash).
         std::unordered_map<std::string, SharedRegion> regions_;
+
+        // A second map rather than a variant over regions_: a Blackboard is a
+        // different region type with its own MAGIC and layout, and
+        // unordered_map's reference stability is what makes returning
+        // Blackboard& safe.  Keyed by the logical name (regions_ is keyed by
+        // shm name) so two logical names that sanitize alike stay distinct.
+        std::unordered_map<std::string, Blackboard> blackboards_;
 
         struct RegistrySlot { uint32_t slot_index; registry::Role role; };
         std::unordered_map<std::string, RegistrySlot> registry_slots_;

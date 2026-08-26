@@ -11,6 +11,7 @@ Kickmsg provides MPMC publish/subscribe over shared memory with zero-copy receiv
 - **Per-subscriber isolation**: a slow subscriber only overflows its own ring — fast subscribers are unaffected
 - **Crash resilient**: publisher crashes never deadlock the channel; bounded slot leaks are recoverable via GC
 - **Topic-centric naming**: subscribers connect by topic name, not publisher identity
+- **Blackboard**: shared-memory key/value state -- a late reader immediately sees the current value of every key, with its age and its writer's liveness; no heartbeat, no replay
 - **C++17**, no external dependencies beyond POSIX / Win32
 
 ## Channel Patterns
@@ -20,6 +21,7 @@ Kickmsg provides MPMC publish/subscribe over shared memory with zero-copy receiv
 | PubSub (1-to-N) | `advertise` / `subscribe` | `/{prefix}_{topic}` |
 | Broadcast (N-to-N) | `join_broadcast` | `/{prefix}_broadcast_{channel}` |
 | Mailbox (N-to-1) | `create_mailbox` / `open_mailbox` | `/{prefix}_{owner}_mbx_{tag}` |
+| Blackboard (state) | `blackboard` / `declare` / `observe` | `/{prefix}_bb_{name}` |
 
 ## Installation
 
@@ -113,6 +115,39 @@ if (schema and schema->version != 2) { /* user-defined policy */ }
 The library stores the descriptor in the header but never interprets it — users
 choose how to compute identity/layout fingerprints and how to react to mismatches.
 
+### Blackboard (state, not stream)
+
+A `Subscriber` starts at the ring's current position and sees nothing
+published before it attached.  When what you have is *state* -- a lifecycle,
+a mode, a calibration -- use a blackboard: the writer publishes once and
+stops, and any reader that attaches later sees the current value at once.
+
+```cpp
+#include <kickmsg/Node.h>
+
+// Writer: declares the keys it owns, publishes once, stops.
+kickmsg::Node  arm("arm_driver", "demo");
+auto&          board = arm.blackboard("robot");
+auto           state = board.declare("arm/state");   // labelled "arm_driver"
+state.write(uint32_t{ACTIVE});
+
+// Reader: constructed AFTER the write, reads it immediately.
+kickmsg::Node  hmi("hmi", "demo");
+auto           view = hmi.blackboard("robot").observe("arm/state");
+
+uint32_t value = 0;
+auto     out   = view.read(value);          // out.status == blackboard::Ok
+// out.updated_at_ns -> how old it is;  view.owner_alive() -> is the writer up?
+
+// Block until any key on the board changes, instead of polling.
+uint64_t seq = board.change_seq();
+if (board.wait(seq, 100ms)) { view.read(value); }
+```
+
+One declared writer per key; a key whose owner died keeps its last value and
+can be taken over by a restarted writer.  See
+[ARCHITECTURE.md](ARCHITECTURE.md#blackboard) for the protocol.
+
 ### Health diagnostics and crash recovery
 
 ```cpp
@@ -149,6 +184,8 @@ kickmsg diagnose <shm>              # wraps SharedRegion::diagnose()
 kickmsg repair   <shm> [--locked]   # run repair primitives
 kickmsg schema <shm>                # focused schema descriptor view
 kickmsg schema-diff <a> <b>         # field-by-field schema comparison
+kickmsg blackboard <name>           # key table: size, freshness, owner, liveness
+kickmsg blackboard-watch <name>     # top-like live view, updates/s per key
 ```
 
 All subcommands accept `--json` for scripting.
@@ -172,6 +209,11 @@ for ring in stats.rings:
 # Live updates (generator — caller drives the loop)
 for frame in diag.watch("/kickmsg_telemetry", interval=1.0):
     gui.update(frame.stats, frame.rates_msg_per_sec)
+
+# Blackboards are addressed by (name, namespace), not by shm path
+board = diag.blackboard("robot", kmsg_namespace="demo")
+for key in board.keys:
+    print(key.key, key.value_len, key.age_seconds, key.owner_alive)
 ```
 
 ## Building
@@ -184,23 +226,39 @@ for frame in diag.watch("/kickmsg_telemetry", interval=1.0):
 
 ### Build
 
+The project's own scripts do the dependency install and the CMake configure
+together, which is the least error-prone route:
+
 ```bash
-# Install dependencies
-pip install conan
+scripts/configure.sh build --with=unit_tests   # record the option set
+scripts/setup_build.sh build                   # conan install + cmake configure
+cmake --build build
+```
+
+By hand:
+
+```bash
 conan install conan/conanfile.py -of=build --build=missing -o unit_tests=True
 
-# Configure and build
 cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH=build \
     -DBUILD_UNIT_TESTS=ON \
     -DBUILD_EXAMPLES=ON
 cmake --build build
+```
 
-# Run tests
-./build/kickmsg_unit
-./build/kickmsg_stress_test
-./build/kickmsg_crash_test
+**Re-run the `cmake -S . -B build` line every time you re-run `conan install`.**
+Skipping it reuses the existing CMake cache, which reports the dependency as
+found -- `Conan: Component target declared 'GTest::gtest'` -- while dropping
+its include paths, so the build fails with `gtest/gtest.h: No such file or
+directory` even though Conan just said `Already installed`. Deleting the build
+directory has the same effect.
+
+```bash
+# Run the whole suite: unit, stress, crash, stall-repair, mp-stress,
+# blackboard-crash, registry-stress
+ctest --test-dir build --output-on-failure
 
 # Run C++ examples
 ./build/examples/hello_pubsub
@@ -210,11 +268,13 @@ cmake --build build
 ./build/examples/hello_schema
 ./build/examples/hello_schema_late_publisher
 ./build/examples/hello_lowlevel
+./build/examples/hello_blackboard
 
 # Run Python examples (after `pip install kickmsg`)
 python examples/python/hello_pubsub.py
 python examples/python/hello_camera_zerocopy.py    # zero-copy with memoryview
 python examples/python/hello_schema.py
+python examples/python/hello_blackboard.py
 python examples/python/cli_playground.py           # long-running, drive the `kickmsg` CLI against it
 ```
 

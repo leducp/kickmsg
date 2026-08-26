@@ -20,6 +20,7 @@ these tests exercise.
 | `kickmsg_stall_repair_test` | False-positive death: SIGSTOP a live publisher so its entry lock looks stale, steal it with `repair_locked_entries()`, SIGCONT -- every steal must become a clean drop (POSIX only). |
 | `kickmsg_mp_stress_test` | Multi-process steady-state MPMC: 4 forked publisher processes x 2 forked subscriber processes over one region (POSIX only). |
 | `kickmsg_registry_stress_test` | Registry under concurrent register/deregister + dead-PID sweep (POSIX only). |
+| `kickmsg_blackboard_crash_test` | Blackboard crash recovery: SIGKILL a key's owner mid-update and prove its last value is still readable, sweepable, and takeover-able (POSIX only). |
 
 ## Prerequisites
 
@@ -47,9 +48,10 @@ thorough (and slower) than the last.
 ```bash
 ctest --test-dir build --output-on-failure
 ```
-Runs unit + crash + registry + a bounded stress pass. Expect:
+Runs unit + crash + stall-repair + mp-stress + registry + blackboard-crash +
+a bounded stress pass. Expect:
 ```
-100% tests passed, 0 tests failed out of 4
+100% tests passed, 0 tests failed out of 7
 ```
 
 ### 2. Full local pass -- minutes, before a PR / after touching lock-free or platform code

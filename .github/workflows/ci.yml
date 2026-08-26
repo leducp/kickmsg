@@ -71,6 +71,12 @@ jobs:
       - name: Unit tests
         if: contains(matrix.configure_args, 'unit_tests') || runner.os == 'Windows'
         working-directory: build
+        env:
+          # Ignored by non-sanitized builds.  halt_on_error is what gives the
+          # TSAN job teeth: without it TSAN prints a race report and still
+          # exits 0, so the job stays green (see tests/README.md rung 4).
+          # tests/tsan.supp documents each suppression and why it is benign.
+          TSAN_OPTIONS: "suppressions=${{ github.workspace }}/tests/tsan.supp:halt_on_error=1:exitcode=66"
         run: ctest . --output-on-failure
         shell: bash
 

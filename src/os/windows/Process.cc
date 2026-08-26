@@ -10,30 +10,44 @@ namespace kickmsg
         return static_cast<uint64_t>(::GetCurrentProcessId());
     }
 
-    uint64_t process_starttime(uint64_t pid) noexcept
+    ProcessProbe process_probe(uint64_t pid) noexcept
     {
+        ProcessProbe out;
         if (pid == 0)
         {
-            return 0;
+            return out;
         }
-        HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+        // SYNCHRONIZE is what makes the exit check exact: GetExitCodeProcess
+        // cannot tell a running process from one that exited with 259.
+        HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                                  FALSE,
                                  static_cast<DWORD>(pid));
         if (h == nullptr)
         {
-            return 0;
+            h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                              FALSE,
+                              static_cast<DWORD>(pid));
+            if (h == nullptr)
+            {
+                return out;
+            }
+        }
+        else
+        {
+            out.exited = ::WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
         }
         FILETIME creation{}, exit{}, kernel{}, user{};
         BOOL ok = ::GetProcessTimes(h, &creation, &exit, &kernel, &user);
         ::CloseHandle(h);
         if (not ok)
         {
-            return 0;
+            return out;
         }
         // FILETIME is 100-ns intervals since 1601-01-01; packing the two
         // halves is enough for the equality comparison sweep_stale uses.
-        return (static_cast<uint64_t>(creation.dwHighDateTime) << 32)
-             | static_cast<uint64_t>(creation.dwLowDateTime);
+        out.starttime = (static_cast<uint64_t>(creation.dwHighDateTime) << 32)
+                      | static_cast<uint64_t>(creation.dwLowDateTime);
+        return out;
     }
 
     bool process_exists(uint64_t pid) noexcept

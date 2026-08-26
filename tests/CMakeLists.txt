@@ -6,6 +6,7 @@ add_executable(kickmsg_unit
     unit/naming-t.cc
     unit/node-t.cc
     unit/registry-t.cc
+    unit/blackboard-t.cc
 )
 target_link_libraries(kickmsg_unit PRIVATE kickmsg GTest::gmock_main)
 set_target_properties(kickmsg_unit
@@ -25,6 +26,7 @@ add_executable(kickmsg_stress_test
     stress/live_repair.cc
     stress/edge_cases.cc
     stress/big_payload.cc
+    stress/blackboard.cc
 )
 target_link_libraries(kickmsg_stress_test PRIVATE kickmsg argparse::argparse)
 set_target_properties(kickmsg_stress_test
@@ -68,6 +70,17 @@ if(NOT WIN32)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
     add_test(NAME mp_stress COMMAND kickmsg_mp_stress_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
     set_tests_properties(mp_stress PROPERTIES TIMEOUT 300)
+
+    # Blackboard crash recovery: fork a key owner, SIGKILL it mid-update,
+    # verify the value survives, the entry is sweepable, and a restarted
+    # owner takes the key over -- POSIX only, like the other fork tests.
+    add_executable(kickmsg_blackboard_crash_test blackboard_crash_test.cc)
+    target_link_libraries(kickmsg_blackboard_crash_test PRIVATE kickmsg)
+    set_target_properties(kickmsg_blackboard_crash_test
+        PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    add_test(NAME blackboard_crash COMMAND kickmsg_blackboard_crash_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    set_tests_properties(blackboard_crash PROPERTIES TIMEOUT 300)
 
     add_executable(kickmsg_registry_stress_test registry_stress_test.cc)
     target_link_libraries(kickmsg_registry_stress_test PRIVATE kickmsg)

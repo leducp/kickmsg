@@ -1,6 +1,7 @@
 #include "kickmsg/Node.h"
 
 #include <cstdio>
+#include <stdexcept>
 #include <string_view>
 
 #include "kickmsg/Hash.h"
@@ -316,6 +317,48 @@ namespace kickmsg
             channel::PubSub, registry::Mailbox, registry::Publisher, mbx_cfg);
     }
 
+    Blackboard& Node::blackboard(char const* name, blackboard::Config const& cfg)
+    {
+        // Keyed by the LOGICAL name: "a:b" and "a b" sanitize to one shm
+        // path, so keying by that path would let the second call hit the
+        // cache and bypass the identity check.
+        std::string logical = name;
+        auto        path    = with_leading_slash(name);
+
+        auto it = blackboards_.find(logical);
+        if (it == blackboards_.end())
+        {
+            it = blackboards_.emplace(
+                logical,
+                Blackboard::open_or_create(namespace_, name, cfg, name_.c_str())).first;
+        }
+        else
+        {
+            // A cache hit skips open_or_create, so its checks happen here too.
+            auto const* h = it->second.header();
+            if (h->config_hash != bb_config_hash(cfg))
+            {
+                throw std::runtime_error(
+                    std::string("Blackboard config mismatch on ") + it->second.name());
+            }
+            // Same condition open_or_create applies: an unstamped region is
+            // not a mismatch.
+            if (cfg.identity != 0 and h->identity_hash != 0
+                and h->identity_hash != cfg.identity)
+            {
+                throw std::runtime_error(
+                    std::string("Blackboard identity mismatch on ") + it->second.name());
+            }
+        }
+
+        // Producer/consumer is a per-key property here and is not known at
+        // this point, so the row records Both; `kickmsg bb` surfaces the
+        // per-key ownership.
+        touch_registry(it->second.name(), path, channel::None,
+                       registry::Blackboard, registry::Both);
+        return it->second;
+    }
+
     void Node::unlink_topic(char const* topic) const
     {
         SharedMemory::unlink(make_topic_name(topic));
@@ -354,6 +397,11 @@ namespace kickmsg
             return false;
         }
         return region->try_claim_schema(info);
+    }
+
+    void Node::unlink_blackboard(char const* name) const
+    {
+        SharedMemory::unlink(Blackboard::shm_name(namespace_, name));
     }
 
     std::string Node::make_topic_name(char const* topic) const

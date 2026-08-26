@@ -142,8 +142,13 @@ namespace kickmsg
 
     namespace channel
     {
+        /// `None` carries no ring geometry and is never stamped into a
+        /// Header -- validate_header_geometry rejects it.  It exists so a
+        /// registry row can describe a participant that has no channel at
+        /// all (a Blackboard).
         enum Type : uint32_t
         {
+            None      = 0,
             PubSub    = 1,
             Broadcast = 2,
         };

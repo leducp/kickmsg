@@ -366,23 +366,6 @@ namespace kickmsg
         auto*    es  = entries();
         uint32_t cap = h->capacity;
 
-        // Live PID + matching boot-relative starttime = same process.
-        // If either starttime is 0 (platform doesn't expose it), degrade
-        // to trust-pid-alone.
-        auto is_dead = [](uint64_t pid, uint64_t stored_start) -> bool
-        {
-            if (not process_exists(pid))
-            {
-                return true;
-            }
-            uint64_t live_start = process_starttime(pid);
-            if (stored_start == 0 or live_start == 0)
-            {
-                return false;
-            }
-            return stored_start != live_start;
-        };
-
         uint32_t freed = 0;
         for (uint32_t i = 0; i < cap; ++i)
         {
@@ -402,7 +385,7 @@ namespace kickmsg
             }
             uint64_t stored_start = es[i].pid_starttime.load(
                                         std::memory_order_relaxed);
-            if (not is_dead(pid, stored_start))
+            if (not owner_is_dead(pid, stored_start))
             {
                 continue;
             }
@@ -425,7 +408,7 @@ namespace kickmsg
             uint64_t post_start = es[i].pid_starttime.load(
                                       std::memory_order_relaxed);
             if (post_pid != pid or post_start != stored_start or
-                not is_dead(post_pid, post_start))
+                not owner_is_dead(post_pid, post_start))
             {
                 // Restore via CAS, not blind store: a live tenant may
                 // have legitimately dereg'd (state==Free) and a blind
