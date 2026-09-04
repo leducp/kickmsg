@@ -178,7 +178,7 @@ bool run_big_payload()
 
         auto& stats = sub_stats[static_cast<std::size_t>(sub_id)];
         std::vector<uint32_t> last_seq(NUM_PUBS, UINT32_MAX);
-        auto const timeout = milliseconds{500};
+        auto const timeout = 500ms;
 
         while (true)
         {
@@ -229,7 +229,7 @@ bool run_big_payload()
 
         auto& stats = sub_stats[static_cast<std::size_t>(sub_id)];
         std::vector<uint32_t> last_seq(NUM_PUBS, UINT32_MAX);
-        auto const timeout = milliseconds{500};
+        auto const timeout = 500ms;
 
         while (true)
         {

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 project(kickmsg LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find conan-generated CMake package configs in the build directory
@@ -47,15 +47,17 @@ if(WIN32)
     set(OS_SOURCES
         src/os/windows/Time.cc
         src/os/windows/Futex.cc
+        src/os/windows/WakeBackends.cc
         src/os/windows/SharedMemory.cc
         src/os/windows/Process.cc
     )
-    set(OS_LIBRARIES synchronization)
+    set(OS_LIBRARIES synchronization ws2_32)
 else()
     # Linux and macOS share most of the POSIX OS layer; only sleep(),
     # create(), and the futex backend diverge.
     set(OS_SOURCES
         src/os/posix/Time.cc
+        src/os/posix/WakeBackends.cc
         src/os/posix/SharedMemory.cc
         src/os/posix/Process.cc
     )
@@ -85,6 +87,8 @@ add_library(kickmsg STATIC
     src/Naming.cc
     src/Publisher.cc
     src/Subscriber.cc
+    src/Waker.cc
+    src/WaitAny.cc
     src/Region.cc
     src/Registry.cc
     src/Blackboard.cc

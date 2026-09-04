@@ -12,7 +12,7 @@ Kickmsg provides MPMC publish/subscribe over shared memory with zero-copy receiv
 - **Crash resilient**: publisher crashes never deadlock the channel; bounded slot leaks are recoverable via GC
 - **Topic-centric naming**: subscribers connect by topic name, not publisher identity
 - **Blackboard**: shared-memory key/value state -- a late reader immediately sees the current value of every key, with its age and its writer's liveness; no heartbeat, no replay
-- **C++17**, no external dependencies beyond POSIX / Win32
+- **C++20**, no external dependencies beyond POSIX / Win32
 
 ## Channel Patterns
 
@@ -220,7 +220,7 @@ for key in board.keys:
 
 ### Prerequisites
 
-- C++17 compiler (GCC 10+, Clang 12+, MSVC 2019+)
+- C++20 compiler (GCC 10+, Clang 13+, MSVC 2019 16.10+)
 - CMake 3.15+
 - Conan 2.x (for test/benchmark dependencies)
 
@@ -269,6 +269,7 @@ ctest --test-dir build --output-on-failure
 ./build/examples/hello_schema_late_publisher
 ./build/examples/hello_lowlevel
 ./build/examples/hello_blackboard
+./build/examples/hello_wait
 
 # Run Python examples (after `pip install kickmsg`)
 python examples/python/hello_pubsub.py

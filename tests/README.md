@@ -24,7 +24,7 @@ these tests exercise.
 
 ## Prerequisites
 
-- A C++17 compiler (gcc, clang, or apple-clang), CMake >= 3.16.
+- A C++20 compiler (gcc, clang, or apple-clang), CMake >= 3.16.
 - Conan 2.x for the test dependencies (GoogleTest, argparse). Use a venv:
   ```bash
   python3 -m venv .venv && source .venv/bin/activate && pip install conan

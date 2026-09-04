@@ -1093,7 +1093,10 @@ namespace kickmsg
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
             .def("subscribe", &Node::subscribe, "topic"_a,
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
-            .def("advertise_or_join", &Node::advertise_or_join, "topic"_a, "cfg"_a,
+            .def("advertise_or_join",
+                [](Node& n, char const* topic, channel::Config const& cfg)
+                { return n.advertise_or_join(topic, cfg); },
+                "topic"_a, "cfg"_a,
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
             .def("subscribe_or_create", &Node::subscribe_or_create, "topic"_a, "cfg"_a,
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
@@ -1107,7 +1110,10 @@ namespace kickmsg
                 { return n.create_mailbox(tag, cfg); },
                 "tag"_a, "cfg"_a = channel::Config{},
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
-            .def("open_mailbox", &Node::open_mailbox, "owner_node"_a, "tag"_a,
+            .def("open_mailbox",
+                [](Node& n, char const* owner_node, char const* tag)
+                { return n.open_mailbox(owner_node, tag); },
+                "owner_node"_a, "tag"_a,
                 nb::rv_policy::move, nb::keep_alive<0, 1>())
             .def("blackboard",
                 [](Node& n, char const* name, blackboard::Config const& cfg)

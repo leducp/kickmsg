@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include "kickmsg/Hash.h"
 #include "kickmsg/Naming.h"
@@ -148,7 +149,8 @@ namespace kickmsg
         }
     }
 
-    Publisher Node::advertise(char const* topic, channel::Config const& cfg)
+    Publisher Node::advertise(char const* topic, channel::Config const& cfg,
+                              WakeBackend* backend)
     {
         auto shm_name   = make_topic_name(topic);
         auto topic_path = with_leading_slash(topic);
@@ -159,7 +161,7 @@ namespace kickmsg
         {
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Pubsub, registry::Publisher);
-            return Publisher(*r);
+            return Publisher(*r, backend);
         }
         channel::Config stamped_cfg = cfg;
         stamped_cfg.identity = make_topic_identity(topic);
@@ -168,7 +170,7 @@ namespace kickmsg
             SharedRegion::create(shm_name.c_str(), channel::PubSub, stamped_cfg, name_.c_str()));
         touch_registry(shm_name, topic_path, channel::PubSub,
                        registry::Pubsub, registry::Publisher);
-        return Publisher(it->second);
+        return Publisher(it->second, backend);
     }
 
     Subscriber Node::subscribe(char const* topic)
@@ -189,34 +191,36 @@ namespace kickmsg
         return Subscriber(it->second);
     }
 
-    template <typename Handle>
+    template <typename Handle, typename... Args>
     Handle Node::create_or_open_handle(std::string const& shm_name,
                                        std::string const& topic_path,
                                        channel::Type      channel_type,
                                        registry::Kind     kind,
                                        registry::Role     role,
-                                       channel::Config const& cfg)
+                                       channel::Config const& cfg,
+                                       Args&&...              args)
     {
         if (auto* r = find_region(shm_name))
         {
             touch_registry(shm_name, topic_path, channel_type, kind, role);
-            return Handle(*r);
+            return Handle(*r, std::forward<Args>(args)...);
         }
         auto [it, _] = regions_.emplace(
             shm_name,
             SharedRegion::create_or_open(
                 shm_name.c_str(), channel_type, cfg, name_.c_str()));
         touch_registry(shm_name, topic_path, channel_type, kind, role);
-        return Handle(it->second);
+        return Handle(it->second, std::forward<Args>(args)...);
     }
 
-    Publisher Node::advertise_or_join(char const* topic, channel::Config const& cfg)
+    Publisher Node::advertise_or_join(char const* topic, channel::Config const& cfg,
+                                      WakeBackend* backend)
     {
         channel::Config stamped_cfg = cfg;
         stamped_cfg.identity = make_topic_identity(topic);
         return create_or_open_handle<Publisher>(
             make_topic_name(topic), with_leading_slash(topic),
-            channel::PubSub, registry::Pubsub, registry::Publisher, stamped_cfg);
+            channel::PubSub, registry::Pubsub, registry::Publisher, stamped_cfg, backend);
     }
 
     Subscriber Node::subscribe_or_create(char const* topic, channel::Config const& cfg)
@@ -228,7 +232,8 @@ namespace kickmsg
             channel::PubSub, registry::Pubsub, registry::Subscriber, stamped_cfg);
     }
 
-    BroadcastHandle Node::join_broadcast(char const* channel, channel::Config const& cfg)
+    BroadcastHandle Node::join_broadcast(char const* channel, channel::Config const& cfg,
+                                         WakeBackend* backend)
     {
         auto shm_name   = make_broadcast_name(channel);
         auto topic_path = with_leading_slash(channel);
@@ -236,7 +241,7 @@ namespace kickmsg
         {
             touch_registry(shm_name, topic_path, channel::Broadcast,
                            registry::Broadcast, registry::Both);
-            return BroadcastHandle{Publisher{*r}, Subscriber{*r}};
+            return BroadcastHandle{Publisher{*r, backend}, Subscriber{*r}};
         }
         channel::Config stamped_cfg = cfg;
         stamped_cfg.identity = make_broadcast_identity(channel);
@@ -246,7 +251,7 @@ namespace kickmsg
                 shm_name.c_str(), channel::Broadcast, stamped_cfg, name_.c_str()));
         touch_registry(shm_name, topic_path, channel::Broadcast,
                        registry::Broadcast, registry::Both);
-        return BroadcastHandle{Publisher{it->second}, Subscriber{it->second}};
+        return BroadcastHandle{Publisher{it->second, backend}, Subscriber{it->second}};
     }
 
     Subscriber Node::create_mailbox(char const* tag, channel::Config const& cfg)
@@ -273,7 +278,8 @@ namespace kickmsg
         return Subscriber(it->second);
     }
 
-    Publisher Node::open_mailbox(char const* owner_node, char const* tag)
+    Publisher Node::open_mailbox(char const* owner_node, char const* tag,
+                                 WakeBackend* backend)
     {
         auto shm_name   = make_mailbox_name(owner_node, tag);
         auto topic_path = mailbox_topic(owner_node, tag);
@@ -281,7 +287,7 @@ namespace kickmsg
         {
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Mailbox, registry::Publisher);
-            return Publisher(*r);
+            return Publisher(*r, backend);
         }
         auto [it, _] = regions_.emplace(
             shm_name,
@@ -290,7 +296,7 @@ namespace kickmsg
         // Mailbox sender is the Publisher side.
         touch_registry(shm_name, topic_path, channel::PubSub,
                        registry::Mailbox, registry::Publisher);
-        return Publisher(it->second);
+        return Publisher(it->second, backend);
     }
 
     Subscriber Node::create_or_open_mailbox(char const* tag,
@@ -306,7 +312,8 @@ namespace kickmsg
     }
 
     Publisher Node::open_or_create_mailbox(char const* owner_node, char const* tag,
-                                            channel::Config const& cfg)
+                                            channel::Config const& cfg,
+                                            WakeBackend* backend)
     {
         channel::Config mbx_cfg = cfg;
         mbx_cfg.max_subscribers = 1;
@@ -314,7 +321,7 @@ namespace kickmsg
         return create_or_open_handle<Publisher>(
             make_mailbox_name(owner_node, tag),
             mailbox_topic(owner_node, tag),
-            channel::PubSub, registry::Mailbox, registry::Publisher, mbx_cfg);
+            channel::PubSub, registry::Mailbox, registry::Publisher, mbx_cfg, backend);
     }
 
     Blackboard& Node::blackboard(char const* name, blackboard::Config const& cfg)

@@ -17,6 +17,8 @@
     #include <malloc.h>   // _aligned_malloc / _aligned_free
 #endif
 
+using namespace std::chrono;
+
 namespace
 {
     // CACHE_LINE-aligned heap buffer for the injected-region tests.
@@ -1537,7 +1539,7 @@ TEST_F(RegionTest, RepairStealsProvenStaleLockAndResumedCommitFails)
     cfg.sub_ring_capacity = 4;
     cfg.pool_size         = 8;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000};
+    cfg.commit_timeout    = 1ms;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     kickmsg::Subscriber sub(region);
@@ -1589,11 +1591,9 @@ TEST_F(RegionTest, RepairGraceSparesInFlightCommit)
     cfg.sub_ring_capacity = 4;
     cfg.pool_size         = 8;
     cfg.max_payload_size  = 8;
-    // The commit below must land inside the repairer's grace sleep.  A
-    // loaded CI runner can stall a thread for tens of milliseconds, so the
-    // margin is 100x: commit ~10 ms after the repairer is seen running,
-    // grace lasts 1 s.
-    cfg.commit_timeout    = std::chrono::microseconds{1000000};
+    // The commit below must land inside the repairer's grace sleep.  A loaded CI runner
+    // can stall a thread for tens of milliseconds, hence the 100x margin.
+    cfg.commit_timeout    = 1s;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     kickmsg::Subscriber sub(region);
@@ -1632,7 +1632,7 @@ TEST_F(RegionTest, RepairGraceSparesInFlightCommit)
     {
         kickmsg::yield();
     }
-    kickmsg::sleep(std::chrono::microseconds{10000});
+    kickmsg::sleep(10ms);
     entries[0].slot_idx.store(kickmsg::INVALID_SLOT, std::memory_order_relaxed);
     entries[0].payload_len.store(0, std::memory_order_relaxed);
     uint64_t lock_val = kickmsg::seq_lock(4);
