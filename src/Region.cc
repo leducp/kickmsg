@@ -141,9 +141,10 @@ namespace kickmsg
             auto* ring = sub_ring_at(base(), h, i);
             ring->state_flight  = ring::make_packed(ring::Free);
             ring->write_pos     = 0;
-            ring->has_waiter    = 0;
             ring->dropped_count = 0;
             ring->lost_count    = 0;
+            // attach_create's buffer need not arrive zeroed the way a mapping does.
+            retract_tenant(ring);
         }
 
         // Write magic LAST with release: create_or_open() polls magic with
@@ -641,10 +642,11 @@ namespace kickmsg
             if (ring::get_state(packed) == ring::Free
                 and ring::get_in_flight(packed) > 0)
             {
+                // Already Free but unclaimable while in_flight > 0: the store below is
+                // the hand-off, so the retraction still goes first.
+                retract_tenant(ring);
                 ring->state_flight.store(ring::make_packed(ring::Free),
                                          std::memory_order_release);
-                ring->owner_pid.store(0, std::memory_order_relaxed);
-                ring->owner_starttime.store(0, std::memory_order_relaxed);
                 ++reset;
             }
         }
@@ -695,9 +697,11 @@ namespace kickmsg
 
             if (ring_owner_dead(ring))
             {
-                // Free but PRESERVE in_flight (zeroing would underflow into
-                // the state bits on a late fetch_sub); owner cleared only
-                // after Free, or a crash here leaves an unattributable ring.
+                // Still held Reclaiming, so still ours. The CAS below PRESERVES
+                // in_flight: zeroing it underflows into the state bits on a late
+                // fetch_sub.
+                retract_tenant(ring);
+
                 uint32_t old = claim;
                 while (ring::get_state(old) == ring::Reclaiming)
                 {
@@ -705,8 +709,6 @@ namespace kickmsg
                     if (ring->state_flight.compare_exchange_weak(old, desired,
                             std::memory_order_release, std::memory_order_acquire))
                     {
-                        ring->owner_pid.store(0, std::memory_order_relaxed);
-                        ring->owner_starttime.store(0, std::memory_order_relaxed);
                         ++reclaimed;
                         break;
                     }

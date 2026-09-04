@@ -9,6 +9,18 @@ namespace kickmsg
         release_pending();
     }
 
+    bool Publisher::wake_ring(SubRingHeader* ring)
+    {
+        // Relaxed: every call site fences seq_cst between the write_pos commit and this
+        // load, which is what orders it against the subscriber's has_waiter store.
+        uint32_t const waiter = ring->has_waiter.load(std::memory_order_relaxed);
+        if (waiter == ring::WaiterFutex)
+        {
+            futex_wake_all(ring->write_pos);
+        }
+        return waiter == ring::WaiterCarrier;
+    }
+
     void Publisher::release_pending()
     {
         if (pending_slot_ != INVALID_SLOT)
@@ -67,6 +79,7 @@ namespace kickmsg
 
         std::size_t delivered = 0;
         uint32_t    excess    = 0;
+        bool        carrier   = false;
 
         for (uint32_t i = 0; i < header_->max_subs; ++i)
         {
@@ -175,7 +188,7 @@ namespace kickmsg
                 // Heal a provably-stale entry so the next publisher here
                 // does not pay the timeout again.
                 self_repair(e, pos, capacity, wait);
-                abandon_delivery(ring);
+                carrier |= abandon_delivery(ring);
                 ++excess;
                 continue;
             }
@@ -198,7 +211,7 @@ namespace kickmsg
             // stall; storing data now would tear the repaired entry.
             if (e.sequence.load(std::memory_order_acquire) != lock_val)
             {
-                abandon_delivery(ring);
+                carrier |= abandon_delivery(ring);
                 ++excess;
                 continue;
             }
@@ -212,7 +225,7 @@ namespace kickmsg
             if (not e.sequence.compare_exchange_strong(expected_lock, pos + 1,
                     std::memory_order_release, std::memory_order_relaxed))
             {
-                abandon_delivery(ring);
+                carrier |= abandon_delivery(ring);
                 ++excess;
                 continue;
             }
@@ -228,10 +241,7 @@ namespace kickmsg
             // with the subscriber's fence. x86's locked RMW already fences,
             // which is why this never surfaced on x86.
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (ring->has_waiter.load(std::memory_order_relaxed))
-            {
-                futex_wake_all(ring->write_pos);
-            }
+            carrier |= wake_ring(ring);
             ++delivered;
         }
 
@@ -247,6 +257,12 @@ namespace kickmsg
             {
                 treiber_push(header_->free_top, slot, slot_idx);
             }
+        }
+
+        // Skip markers advance write_pos too, so they owe a wake like a delivery does.
+        if (carrier and wake_backend_ != nullptr)
+        {
+            wake_backend_->signal();
         }
 
         return delivered;
@@ -300,7 +316,7 @@ namespace kickmsg
         }
     }
 
-    void Publisher::abandon_delivery(SubRingHeader* ring)
+    bool Publisher::abandon_delivery(SubRingHeader* ring)
     {
         ++dropped_;
         ring->dropped_count.fetch_add(1, std::memory_order_relaxed);
@@ -309,10 +325,7 @@ namespace kickmsg
         // write_pos already advanced and the position may now carry a skip
         // marker: without the wake a parked subscriber sleeps its timeout.
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (ring->has_waiter.load(std::memory_order_relaxed))
-        {
-            futex_wake_all(ring->write_pos);
-        }
+        return wake_ring(ring);
     }
 
     void Publisher::self_repair(Entry& e, uint64_t pos, uint64_t capacity,

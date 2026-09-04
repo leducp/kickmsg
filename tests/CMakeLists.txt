@@ -3,6 +3,8 @@ add_executable(kickmsg_unit
     unit/region-t.cc
     unit/publisher-t.cc
     unit/subscriber-t.cc
+    unit/wait_fd-t.cc
+    unit/wait_any-t.cc
     unit/naming-t.cc
     unit/node-t.cc
     unit/registry-t.cc
@@ -27,6 +29,7 @@ add_executable(kickmsg_stress_test
     stress/edge_cases.cc
     stress/big_payload.cc
     stress/blackboard.cc
+    stress/wake_carrier.cc
 )
 target_link_libraries(kickmsg_stress_test PRIVATE kickmsg argparse::argparse)
 set_target_properties(kickmsg_stress_test

@@ -21,7 +21,7 @@ namespace kickmsg
         "Kickmsg requires lock-free 32-bit atomics.");
 
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
-    constexpr uint32_t    VERSION         = 7;
+    constexpr uint32_t    VERSION         = 8;
     constexpr uint32_t    INVALID_SLOT    = UINT32_MAX;
     constexpr std::size_t CACHE_LINE      = 64;
 
@@ -287,6 +287,13 @@ namespace kickmsg
         constexpr State    get_state(uint32_t packed)     { return static_cast<State>(packed & STATE_MASK); }
         constexpr uint32_t get_in_flight(uint32_t packed) { return packed >> 2; }
         constexpr uint32_t make_packed(State s, uint32_t in_flight = 0) { return (in_flight << 2) | s; }
+
+        enum Waiter : uint32_t
+        {
+            WaiterNone    = 0,  ///< Nobody waiting -- no wake syscall
+            WaiterFutex   = 1,  ///< Waiting in futex_wait on write_pos
+            WaiterCarrier = 2,  ///< Waiting on a WakeBackend descriptor
+        };
     }
 
     /// Per-subscriber ring header in shared memory.
@@ -303,7 +310,7 @@ namespace kickmsg
         std::atomic<uint64_t> owner_pid;                        ///< Claiming subscriber's pid; 0 when Free (liveness recovery)
         std::atomic<uint64_t> owner_starttime;                  ///< owner_pid's start time; pid-reuse guard for reclaim_dead_rings
         alignas(CACHE_LINE) std::atomic<uint64_t> write_pos;    ///< Monotonically increasing position counter
-        std::atomic<uint32_t> has_waiter;                       ///< Set by subscriber before futex_wait
+        std::atomic<uint32_t> has_waiter;                       ///< ring::Waiter, set by the subscriber before it waits
         std::atomic<uint64_t> dropped_count;                    ///< Cumulative publisher drops on this ring (all publishers)
         std::atomic<uint64_t> lost_count;                       ///< Cumulative subscriber losses on this ring (all subscribers)
     };
@@ -351,6 +358,12 @@ namespace kickmsg
     constexpr uint32_t tagged_gen(uint64_t tagged) { return static_cast<uint32_t>(tagged >> 32); }
 
     SubRingHeader* sub_ring_at(void* base, Header const* h, uint32_t idx);
+
+    /// Drop what the ring says about its tenant: identity and any wake it was waiting on.
+    /// Every path that hands a ring over calls this BEFORE publishing Free with
+    /// in_flight == 0 -- the value a claimant CASes from -- or the retraction races the
+    /// next claimant and erases what it just wrote. See ARCHITECTURE.md, "Ring hand-off".
+    void retract_tenant(SubRingHeader* ring);
     Entry*         ring_entries(SubRingHeader* ring);
     SlotHeader*    slot_at(void* base, Header const* h, uint32_t idx);
     SlotHeader*    slot_at(void* pool_base, std::size_t slot_stride, uint32_t idx);

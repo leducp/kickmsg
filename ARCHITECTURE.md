@@ -121,13 +121,22 @@ the user's responsibility.
 
 ## Shared-memory Header
 
-The region header is self-describing and forward-compatible:
+The region header is self-describing and forward-compatible.
+
+`version` is 8, and no struct changed to earn it: `Header` and
+`SubRingHeader` are byte-identical to version 7. What changed is the
+*meaning* of `has_waiter`, which gained `WaiterCarrier(2)` (see Waking on
+a descriptor). A version-7 publisher reads any non-zero `has_waiter` as
+"parked on a futex", so it would send `futex_wake_all` to a subscriber
+waiting on a descriptor and the wake would be lost until its deadline.
+The bump exists purely to keep the two interpretations apart, and the
+version check is what enforces it.
 
 ```
 Header (at offset 0)
 ┌───────────────────────────────────────────────────────────┐
 │  magic (atomic)     0x4B49434B4D534721 ("KICKMSG!")       │
-│  version            7                                     │
+│  version            8                                     │
 │  channel_type       PubSub | Broadcast                    │
 │  total_size         total mmap size in bytes              │
 │  sub_rings_offset   byte offset to first subscriber ring  │
@@ -345,9 +354,15 @@ Ring[0]
   in_flight, so acquire/release is sufficient (no seq_cst needed).
 - **write_pos** (atomic uint64): monotonically increasing position counter.
   Publishers claim positions via `fetch_add` (unconditional, O(1)).
-- **has_waiter** (atomic uint32): set by the subscriber before blocking
-  on `futex_wait`, cleared after. Publishers skip the `futex_wake_all`
-  syscall when no subscriber is sleeping.
+- **has_waiter** (atomic uint32): which wake this subscriber is parked
+  for, cleared after. `WaiterNone(0)` skips the syscall entirely,
+  `WaiterFutex(1)` takes `futex_wake_all`, `WaiterCarrier(2)` asks for the
+  channel's carrier instead. The publisher reads it in the ring loop it
+  already runs and ORs the carrier cases together, so a publish sends one
+  carrier signal however many rings asked. Keeping the mode per-ring is
+  also what makes it recoverable: a subscriber killed while parked has it
+  cleared by `retract_tenant()` when its ring is reclaimed, which a
+  channel-wide counter could not be.
 - **dropped_count** (atomic uint64): cumulative count of publisher
   delivery drops on this ring — incremented whenever the two-phase
   commit CAS lock fails and the publisher falls through to the self-
@@ -370,6 +385,104 @@ cache line: the hot path already owns this line when incrementing
 `write_pos`, so bumping the counters on a rare drop/loss adds no new
 coherency traffic.  Different rings target different lines (128 B
 stride), so publishers/subscribers on distinct rings never contend.
+
+### Ring hand-off
+
+`Free` **with `in_flight == 0`** is the single publication point for a
+ring's tenancy: it is the exact `state_flight` value a claimant CASes from,
+so producing it is what hands the ring over. What the ring says about its
+tenant -- `owner_pid`, `owner_starttime`, and the `has_waiter` mode it was
+parked for -- is retracted by `retract_tenant()` *before* that value is
+published. Nothing is written to the ring afterwards.
+
+Three paths produce it, and the ordering means something different in each:
+a subscriber releasing (`release_ring`) and a sweeper reclaiming a dead
+owner (`reclaim_dead_rings`) both publish the `Free` state itself, while an
+operator reset (`reset_retired_rings`) finds a ring **already** `Free` --
+retired at `in_flight > 0` by a crashed publisher, and unclaimable for
+exactly that reason. There the store that zeroes `in_flight` is the
+hand-off, and retracting before it is what keeps the rule uniform.
+
+Retracting after publishing `Free` races the next claimant: it can CAS to
+`Live` and write its own `owner_pid`, and the departing tenant's stores
+then erase it -- leaving a ring that is logically owned by one process and
+attributed to none.
+
+The cost is a crash *inside* the retract-then-publish window, which leaves
+a `Draining` ring with `owner_pid == 0`. `reclaim_dead_rings()` skips it,
+so it leaks until an operator resets it. That is the deliberate trade: one
+leaked ring, against a live ring whose owner is silently wrong. Closing it
+too would need the release itself to be a CAS with a recovery rule for
+`Draining` + `owner == 0`.
+
+A ring carries no wake address, so a hand-off can never strand one: the
+carrier belongs to the channel, not to whoever holds the ring.
+
+### Waking on a descriptor
+
+`futex_wait` blocks on one word and composes with nothing else, which is
+useless to a caller that must also watch a socket.  A **wake backend** is
+the alternative: `Subscriber::wait_fd()` hands back a descriptor for the
+caller's own `poll`/`epoll`/`kqueue` loop, and the publisher makes it
+readable.
+
+The backend is **injected into both ends by the caller** -- the
+subscriber's through `wait_fd()` or a `Waker`, the publisher's through the
+`Publisher` constructor -- and carries its own address.  Nothing about it
+is written to, read from, or negotiated through shared memory.  That is
+what keeps a peer from influencing where a wake is sent: a publisher's
+destination comes from an object built in its own process, so a corrupt or
+hostile region cannot redirect it, and there is no address for a ring
+hand-off to strand.  Wiring only one end is a caller error, and a quiet
+one -- the subscriber simply waits out its own deadline.
+
+The shipped backend is `UdpMulticastBackend`: loopback UDP multicast, one
+datagram waking every subscriber at once.  The carrier modes are ORed
+across the ring loop the publisher already runs and signalled once
+afterwards, so a send makes **one** `sendto` however many are parked.
+
+That is one *syscall*, not one unit of work: the kernel still replicates
+the datagram to every joined socket, so the cost grows with the number of
+parked subscribers much as the futex path's per-ring `futex_wake_all`
+does.  Measured on loopback, the carrier stays roughly 1--1.5 us per
+publish above the futex path at every fan-out.  The reason to reach for it
+is that a descriptor **composes** -- with a socket, a timer, another
+channel -- which a futex word cannot.  On a single channel with nothing
+else to watch, `receive()` is both simpler and faster.
+
+Give each channel its own instance.  The **port** is what separates them:
+a socket bound to `INADDR_ANY` receives every datagram arriving on its
+port, including groups it never joined, because the membership decides
+whether the *host* accepts the packet rather than which socket gets it.
+The **group** is what fans one channel's wake out to all its subscribers.
+Constructed from a channel name, both ends derive the same group and port
+without coordinating; a constructor taking an explicit group and port is
+there for a caller that would rather pin them.
+
+The park protocol is the same Dekker pair as the futex path, with one
+extra constraint.  `arm_wait()` samples `write_pos` **before** deciding the
+ring is empty, then stores `WaiterCarrier`, fences seq_cst, and re-reads.
+Sampling after the emptiness decision would fold a concurrent publish into
+the snapshot: the re-read would match, and the ring would park on a wake
+the publisher never sent, having read `has_waiter` while it was still
+`WaiterNone`.  `receive()` survives that ordering only because the kernel
+re-checks the word inside `futex_wait`; a descriptor has no such re-check,
+so the ordering is the whole guard.  `disarm_wait()` drains a Waker it
+privately owns and leaves a shared one to its owner, or one subscriber
+would swallow another's wake.
+
+`wait_any()` waits on a whole set by polling every distinct descriptor the
+set holds -- any number of them; only the buffer they are gathered into is
+bounded.  A Subscriber with no descriptor cannot be spoken for by that
+poll, so the wait caps at `poll_budget()` and the loop re-peeks on its
+behalf.  A ring whose head is claimed but uncommitted fires no wake of any
+kind, and caps the wait the same way.
+
+Both caps are decided by the **arming pass itself**, not by a scan before
+it.  A separate scan could observe `Parked` where `arm_wait()` goes on to
+see `Poll` -- a publisher claiming the head in between -- and that
+Subscriber then neither arms nor caps, so a commit that fires no wake
+would cost the caller's whole deadline.
 
 ### Entry sequence-word encoding
 
@@ -620,6 +733,9 @@ Publisher
                                     subscriber (lost wakeup until timeout).
                                     x86's locked RMW fences implicitly;
                                     ARM does not, hence the explicit fence.
+                                    has_waiter also names WaiterCarrier:
+                                    those are ORed across the ring loop and
+                                    woken once, after it.
 
 5. Batch excess: fetch_sub(excess) on slot refcount.
    One atomic RMW for all non-delivered rings, instead of N

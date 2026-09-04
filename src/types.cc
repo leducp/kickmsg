@@ -3,6 +3,16 @@
 
 namespace kickmsg
 {
+    void retract_tenant(SubRingHeader* ring)
+    {
+        // Relaxed: the release of Free that follows is what publishes these.
+        // has_waiter included, or a tenant killed mid-wait leaves its mode set and every
+        // later publish pays a wake for a waiter that no longer exists.
+        ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
+        ring->owner_pid.store(0, std::memory_order_relaxed);
+        ring->owner_starttime.store(0, std::memory_order_relaxed);
+    }
+
     SubRingHeader* sub_ring_at(void* base, Header const* h, uint32_t idx)
     {
         auto* p = static_cast<uint8_t*>(base) + h->sub_rings_offset;

@@ -189,34 +189,36 @@ namespace kickmsg
         return Subscriber(it->second);
     }
 
-    template <typename Handle>
+    template <typename Handle, typename... Args>
     Handle Node::create_or_open_handle(std::string const& shm_name,
                                        std::string const& topic_path,
                                        channel::Type      channel_type,
                                        registry::Kind     kind,
                                        registry::Role     role,
-                                       channel::Config const& cfg)
+                                       channel::Config const& cfg,
+                                       Args&&...              args)
     {
         if (auto* r = find_region(shm_name))
         {
             touch_registry(shm_name, topic_path, channel_type, kind, role);
-            return Handle(*r);
+            return Handle(*r, std::forward<Args>(args)...);
         }
         auto [it, _] = regions_.emplace(
             shm_name,
             SharedRegion::create_or_open(
                 shm_name.c_str(), channel_type, cfg, name_.c_str()));
         touch_registry(shm_name, topic_path, channel_type, kind, role);
-        return Handle(it->second);
+        return Handle(it->second, std::forward<Args>(args)...);
     }
 
-    Publisher Node::advertise_or_join(char const* topic, channel::Config const& cfg)
+    Publisher Node::advertise_or_join(char const* topic, channel::Config const& cfg,
+                                      WakeBackend* backend)
     {
         channel::Config stamped_cfg = cfg;
         stamped_cfg.identity = make_topic_identity(topic);
         return create_or_open_handle<Publisher>(
             make_topic_name(topic), with_leading_slash(topic),
-            channel::PubSub, registry::Pubsub, registry::Publisher, stamped_cfg);
+            channel::PubSub, registry::Pubsub, registry::Publisher, stamped_cfg, backend);
     }
 
     Subscriber Node::subscribe_or_create(char const* topic, channel::Config const& cfg)
