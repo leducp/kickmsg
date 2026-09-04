@@ -91,7 +91,10 @@ namespace kickmsg
         Publisher  advertise(char const* topic, channel::Config const& cfg = {});
         Subscriber subscribe(char const* topic);
 
-        Publisher  advertise_or_join(char const* topic, channel::Config const& cfg);
+        /// `backend` is forwarded to the Publisher: pass one to wake subscribers that
+        /// wait on a descriptor, the same object their side was given.
+        Publisher  advertise_or_join(char const* topic, channel::Config const& cfg,
+                                     WakeBackend* backend = nullptr);
         Subscriber subscribe_or_create(char const* topic, channel::Config const& cfg);
 
         // --- Broadcast (N-to-N shared channel) ---
@@ -172,13 +175,14 @@ namespace kickmsg
         // Shared body of every *_or_* method: idempotent find, else
         // create_or_open, then touch_registry on both branches.
         // Instantiated for Publisher and Subscriber inside Node.cc.
-        template <typename Handle>
+        template <typename Handle, typename... Args>
         Handle create_or_open_handle(std::string const& shm_name,
                                      std::string const& topic_path,
                                      channel::Type      channel_type,
                                      registry::Kind     kind,
                                      registry::Role     role,
-                                     channel::Config const& cfg);
+                                     channel::Config const& cfg,
+                                     Args&&...              args);
 
         Registry& lazy_registry();
 

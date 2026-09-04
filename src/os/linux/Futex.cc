@@ -15,7 +15,7 @@ namespace kickmsg
     static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
         "futex word aliasing assumes the low half of write_pos at offset 0");
 
-    bool futex_wait(std::atomic<uint64_t>& word, uint64_t expected, nanoseconds timeout)
+    int futex_wait(std::atomic<uint64_t>& word, uint64_t expected, nanoseconds timeout)
     {
         auto* addr = reinterpret_cast<uint32_t*>(&word);
         auto  val  = static_cast<uint32_t>(expected);
@@ -23,7 +23,16 @@ namespace kickmsg
         struct timespec ts = to_timespec(timeout);
 
         long rc = syscall(SYS_futex, addr, FUTEX_WAIT, val, &ts, nullptr, 0);
-        return not (rc == -1 and errno == ETIMEDOUT);
+        if (rc != -1)
+        {
+            return 0;
+        }
+        if (errno == EINTR or errno == EAGAIN)
+        {
+            // EAGAIN is a word that already moved: the caller re-checks either way.
+            return 0;
+        }
+        return -errno;
     }
 
     void futex_wake_all(std::atomic<uint64_t>& word)

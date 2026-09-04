@@ -36,7 +36,7 @@ class KickmsgRecipe(ConanFile):
 
     def validate(self):
         if self.settings.compiler.get_safe("cppstd"):
-            check_min_cppstd(self, 17)
+            check_min_cppstd(self, 20)
 
     def generate(self):
         tc = CMakeToolchain(self)

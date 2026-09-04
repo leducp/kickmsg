@@ -16,6 +16,9 @@ bool run_single_slot_ring();
 bool run_subscriber_saturation();
 bool run_big_payload();
 bool run_blackboard_stress();
+bool run_wake_parking();
+bool run_wake_arm_loop();
+bool run_wake_wait_any();
 
 int main(int argc, char** argv)
 {
@@ -85,6 +88,9 @@ int main(int argc, char** argv)
     runner.run("subscriber_saturation", run_subscriber_saturation);
     runner.run("big_payload",          run_big_payload);
     runner.run("blackboard",           run_blackboard_stress);
+    runner.run("wake_parking",         run_wake_parking);
+    runner.run("wake_arm_loop",        run_wake_arm_loop);
+    runner.run("wake_wait_any",        run_wake_wait_any);
 
     return runner.summary();
 }

@@ -3,6 +3,7 @@
 
 #include "kickmsg/types.h"
 #include "kickmsg/Region.h"
+#include "kickmsg/Waker.h"
 
 namespace kickmsg
 {
@@ -18,11 +19,15 @@ namespace kickmsg
     class Publisher
     {
     public:
-        Publisher(SharedRegion& region)
+        /// `backend` wakes subscribers waiting on a descriptor. It must outlive this
+        /// Publisher and be the one their side was given. Null, the default, sends no
+        /// such wake; the futex path is unaffected either way.
+        Publisher(SharedRegion& region, WakeBackend* backend = nullptr)
             : base_{region.base()}
             , header_{region.header()}
             , commit_timeout_{microseconds{header_->commit_timeout_us}}
             , pending_slot_{INVALID_SLOT}
+            , wake_backend_{backend}
         {
         }
 
@@ -37,6 +42,7 @@ namespace kickmsg
             , commit_timeout_{other.commit_timeout_}
             , pending_slot_{other.pending_slot_}
             , dropped_{other.dropped_}
+            , wake_backend_{other.wake_backend_}
         {
             other.pending_slot_ = INVALID_SLOT;
         }
@@ -51,6 +57,7 @@ namespace kickmsg
                 commit_timeout_ = other.commit_timeout_;
                 pending_slot_   = other.pending_slot_;
                 dropped_        = other.dropped_;
+                wake_backend_   = other.wake_backend_;
                 other.pending_slot_ = INVALID_SLOT;
             }
             return *this;
@@ -91,15 +98,21 @@ namespace kickmsg
                                           microseconds timeout);
         void self_repair(Entry& e, uint64_t pos, uint64_t capacity,
                          CommitWait const& wait);
-        void abandon_delivery(SubRingHeader* ring);
+        /// True when the ring wants a backend wake for the skip marker.
+        bool abandon_delivery(SubRingHeader* ring);
         void release_slot(uint32_t idx);
         void release_pending();
+
+        /// futex-wakes `ring`; true when it wants the backend instead, ORed across the
+        /// ring loop so a publish signals it once.
+        bool wake_ring(SubRingHeader* ring);
 
         void*        base_;
         Header*      header_;
         microseconds commit_timeout_;
         uint32_t     pending_slot_;
         uint64_t     dropped_{0};
+        WakeBackend* wake_backend_{nullptr};
     };
 }
 

@@ -97,7 +97,8 @@ jobs:
       - name: conan create
         run: |
           conan profile detect
-          conan create conan/all --version=0.0.0 --build=missing
+          # detect picks the compiler's default, which is below what this library needs.
+          conan create conan/all --version=0.0.0 --build=missing -s compiler.cppstd=20
         shell: bash
 
   # Cross-compile for ARM64 (no run — just verify it compiles)

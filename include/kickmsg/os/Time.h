@@ -1,7 +1,10 @@
 #ifndef KICKMSG_OS_TIME_H
 #define KICKMSG_OS_TIME_H
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 
 namespace kickmsg
 {
@@ -24,6 +27,19 @@ namespace kickmsg
     nanoseconds since_epoch();
 
     nanoseconds elapsed_time(nanoseconds start);
+
+    /// Milliseconds for a poll()-style timeout. Rounds UP -- a sub-millisecond budget
+    /// must still block, or a caller pacing itself on it spins -- and clamps, so a very
+    /// long one cannot overflow int and read as poll()'s "wait forever".
+    constexpr int to_poll_ms(nanoseconds timeout)
+    {
+        if (timeout <= nanoseconds{0})
+        {
+            return 0;
+        }
+        auto const ms = ceil<milliseconds>(timeout).count();
+        return static_cast<int>(std::min<int64_t>(ms, std::numeric_limits<int>::max()));
+    }
 
     constexpr timespec to_timespec(nanoseconds time)
     {
