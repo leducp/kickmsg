@@ -7,6 +7,13 @@
 
 namespace kickmsg
 {
+    namespace
+    {
+        /// How long receive() sleeps before re-checking a head that is claimed but not
+        /// yet committed: no futex edge fires for the commit itself.
+        constexpr nanoseconds RECHECK_NAP = 100us;
+    }
+
     Subscriber::Subscriber(SharedRegion& region)
         : base_{region.base()}
         , header_{region.header()}
@@ -107,6 +114,10 @@ namespace kickmsg
             kickmsg::yield();
         }
 
+        // Still Draining, so still ours to retract. A crash inside this window leaves
+        // Draining + owner == 0, which reclaim_dead_rings skips: one leaked ring.
+        clear_owner(ring);
+
         if (quiesced)
         {
             drain_unconsumed(ring);
@@ -131,13 +142,6 @@ namespace kickmsg
             }
         }
 
-        // Clear owner AFTER reaching Free. Order matters: clearing earlier
-        // would leave a crash window where a Draining ring shows owner == 0
-        // and reclaim_dead_rings skips it. The worst case here is a brief
-        // Free + stale-owner, which the next claimer simply overwrites.
-        ring->owner_pid.store(0, std::memory_order_relaxed);
-        ring->owner_starttime.store(0, std::memory_order_relaxed);
-
         ring_idx_ = UINT32_MAX;
     }
 
@@ -155,8 +159,10 @@ namespace kickmsg
         , lost_{other.lost_}
         , drain_timeouts_{other.drain_timeouts_}
         , recv_buf_{std::move(other.recv_buf_)}
+        , waker_{other.waker_}
     {
         other.ring_idx_ = UINT32_MAX;
+        other.waker_    = nullptr;
     }
 
     Subscriber& Subscriber::operator=(Subscriber&& other) noexcept
@@ -173,10 +179,107 @@ namespace kickmsg
             lost_            = other.lost_;
             drain_timeouts_  = other.drain_timeouts_;
             recv_buf_        = std::move(other.recv_buf_);
+            waker_           = other.waker_;
 
             other.ring_idx_ = UINT32_MAX;
+            other.waker_    = nullptr;
         }
         return *this;
+    }
+
+    bool Subscriber::attach(Waker& waker)
+    {
+        if (ring_idx_ == UINT32_MAX or not waker.valid())
+        {
+            return false;
+        }
+        waker_ = &waker;
+        return true;
+    }
+
+    Subscriber::Wait Subscriber::head_state(SubRingHeader* ring) const
+    {
+        uint64_t wp = ring->write_pos.load(std::memory_order_acquire);
+        if (wp <= read_pos_)
+        {
+            return Wait::Armed;
+        }
+        if (wp - read_pos_ > header_->sub_ring_capacity)
+        {
+            // Overrun: try_receive resynchronises and returns a sample.
+            return Wait::Ready;
+        }
+        auto&    e   = ring_entries(ring)[read_pos_ & header_->sub_ring_mask];
+        uint64_t seq = e.sequence.load(std::memory_order_acquire);
+        // Same test try_receive gives up on: a lock at this position, or an
+        // entry still holding an older generation. Everything else (commit,
+        // skip marker, overwrite) it resolves without blocking.
+        if (seq_is_locked(seq) or seq_pos(seq) < read_pos_ + 1)
+        {
+            return Wait::Poll;
+        }
+        return Wait::Ready;
+    }
+
+    Subscriber::Wait Subscriber::wait_state() const
+    {
+        if (ring_idx_ == UINT32_MAX)
+        {
+            return Wait::Armed;
+        }
+        return head_state(sub_ring_at(base_, header_, ring_idx_));
+    }
+
+    Subscriber::Wait Subscriber::arm_wait()
+    {
+        if (ring_idx_ == UINT32_MAX)
+        {
+            return Wait::Armed;
+        }
+        auto* ring = sub_ring_at(base_, header_, ring_idx_);
+
+        // Sampled BEFORE head_state decides the ring is empty. A publish landing between
+        // that decision and this load would otherwise already be in cur, the re-read below
+        // would match, and the ring would wait on a wake the publisher never sent: it read
+        // has_waiter before the store below and saw WaiterNone. receive() survives the same
+        // ordering only because futex_wait re-checks the word inside the kernel; poll on a
+        // descriptor has no such re-check, so this is the only guard.
+        uint64_t cur = ring->write_pos.load(std::memory_order_relaxed);
+
+        Wait state = head_state(ring);
+        if (state != Wait::Armed)
+        {
+            return state;
+        }
+        if (waker_ == nullptr)
+        {
+            // No carrier: the caller's own deadline is the only wake left.
+            return Wait::Armed;
+        }
+
+        ring->has_waiter.store(ring::WaiterCarrier, std::memory_order_relaxed);
+        // Pairs with the publisher's seq_cst fence: orders the store above before the
+        // write_pos re-read below, so a concurrent publish either sees the mode and
+        // signals, or lands in the re-read.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (ring->write_pos.load(std::memory_order_relaxed) != cur)
+        {
+            disarm_wait();
+            return head_state(ring);
+        }
+        return Wait::Armed;
+    }
+
+    void Subscriber::disarm_wait()
+    {
+        if (ring_idx_ == UINT32_MAX)
+        {
+            return;
+        }
+        // Relaxed: a publisher reading the mode just before this can still signal,
+        // leaving one stale wake for the Waker's owner to drain.
+        auto* ring = sub_ring_at(base_, header_, ring_idx_);
+        ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
     }
 
     std::optional<Subscriber::SampleRef> Subscriber::try_receive()
@@ -339,13 +442,13 @@ namespace kickmsg
             if (cur <= read_pos_)
             {
                 idle_spins = 0;
-                ring->has_waiter.store(1, std::memory_order_relaxed);
+                ring->has_waiter.store(ring::WaiterFutex, std::memory_order_relaxed);
                 // Pairs with the publisher's seq_cst fence: orders this store
                 // before futex_wait's kernel read of write_pos so a concurrent
                 // publish can't be missed on a weakly-ordered CPU.
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 futex_wait(ring->write_pos, cur, remaining);
-                ring->has_waiter.store(0, std::memory_order_relaxed);
+                ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
             }
             else
             {
@@ -359,7 +462,7 @@ namespace kickmsg
                 }
                 else
                 {
-                    nanoseconds nap = 100us;
+                    nanoseconds nap = RECHECK_NAP;
                     if (remaining < nap)
                     {
                         nap = remaining;
@@ -508,13 +611,13 @@ namespace kickmsg
             if (cur <= read_pos_)
             {
                 idle_spins = 0;
-                ring->has_waiter.store(1, std::memory_order_relaxed);
+                ring->has_waiter.store(ring::WaiterFutex, std::memory_order_relaxed);
                 // Pairs with the publisher's seq_cst fence: orders this store
                 // before futex_wait's kernel read of write_pos so a concurrent
                 // publish can't be missed on a weakly-ordered CPU.
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 futex_wait(ring->write_pos, cur, remaining);
-                ring->has_waiter.store(0, std::memory_order_relaxed);
+                ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
             }
             else
             {
@@ -528,7 +631,7 @@ namespace kickmsg
                 }
                 else
                 {
-                    nanoseconds nap = 100us;
+                    nanoseconds nap = RECHECK_NAP;
                     if (remaining < nap)
                     {
                         nap = remaining;

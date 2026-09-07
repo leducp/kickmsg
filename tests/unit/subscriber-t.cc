@@ -55,8 +55,8 @@ TEST_F(SubscriberTest, MovedFromReceiveReturnsNulloptNotCrash)
     // must return nullopt instead of dereferencing a wild ring pointer.
     EXPECT_FALSE(src.try_receive().has_value());
     EXPECT_FALSE(src.try_receive_view().has_value());
-    EXPECT_FALSE(src.receive(std::chrono::milliseconds{0}).has_value());
-    EXPECT_FALSE(src.receive_view(std::chrono::milliseconds{0}).has_value());
+    EXPECT_FALSE(src.receive(0ms).has_value());
+    EXPECT_FALSE(src.receive_view(0ms).has_value());
 }
 
 TEST_F(SubscriberTest, ZeroCopyReceive)
@@ -183,11 +183,11 @@ TEST_F(SubscriberTest, BlockingReceiveTimesOut)
     kickmsg::Subscriber sub(region);
 
     nanoseconds start  = kickmsg::monotonic_ns();
-    auto        sample = sub.receive(milliseconds{50});
+    auto        sample = sub.receive(50ms);
     nanoseconds elapsed = kickmsg::monotonic_ns() - start;
 
     EXPECT_FALSE(sample.has_value());
-    EXPECT_GE(elapsed, milliseconds{40});
+    EXPECT_GE(elapsed, 40ms);
 }
 
 TEST_F(SubscriberTest, BlockingReceiveWakesOnPublish)
@@ -205,7 +205,7 @@ TEST_F(SubscriberTest, BlockingReceiveWakesOnPublish)
         pub.send(&val, sizeof(val));
     });
 
-    auto sample = sub.receive(std::chrono::seconds{2});
+    auto sample = sub.receive(2s);
     ASSERT_TRUE(sample.has_value());
 
     uint32_t got = 0;
@@ -287,7 +287,7 @@ TEST_F(SubscriberTest, StuckPublisherCausesDrainTimeout)
     cfg.sub_ring_capacity = 4;
     cfg.pool_size         = 8;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000}; // 1ms — fast timeout
+    cfg.commit_timeout    = 1ms;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 
@@ -345,7 +345,7 @@ TEST_F(SubscriberTest, DrainTimeoutsCounterIncrementsOnTimeout)
     cfg.sub_ring_capacity = 4;
     cfg.pool_size         = 8;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000};
+    cfg.commit_timeout    = 1ms;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 
@@ -392,7 +392,7 @@ TEST_F(SubscriberTest, RejoinAfterDrainTimeout)
     cfg.sub_ring_capacity = 4;
     cfg.pool_size         = 8;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000};
+    cfg.commit_timeout    = 1ms;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 
@@ -441,7 +441,7 @@ TEST_F(SubscriberTest, SlowPublisherNoCorruption)
     cfg.sub_ring_capacity = 8;
     cfg.pool_size         = 16;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000}; // 1ms
+    cfg.commit_timeout    = 1ms;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 

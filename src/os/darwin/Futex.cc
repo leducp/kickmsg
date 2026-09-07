@@ -23,19 +23,37 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 
 namespace kickmsg
 {
-    bool futex_wait(std::atomic<uint64_t>& word, uint64_t expected, nanoseconds timeout)
+    int futex_wait(std::atomic<uint64_t>& word, uint64_t expected, nanoseconds timeout)
     {
         auto* addr = reinterpret_cast<uint32_t*>(&word);
         auto  val  = static_cast<uint64_t>(static_cast<uint32_t>(expected));
 
+        // 0 means "wait forever" to __ulock_wait, so a budget that rounds to zero has to
+        // become the shortest real wait instead.
         auto us = duration_cast<microseconds>(timeout).count();
-        auto timeout_us = static_cast<uint32_t>(us > 0 ? us : 1);
+        if (us <= 0)
+        {
+            us = 1;
+        }
+        // Clamped, not truncated: a longer budget would wrap to a short one and return
+        // early. ~71 minutes, and the caller's loop re-arms past that.
+        if (us > UINT32_MAX)
+        {
+            us = UINT32_MAX;
+        }
+        auto timeout_us = static_cast<uint32_t>(us);
 
+        // ULF_NO_ERRNO makes __ulock_wait return the negative errno directly, which is
+        // already this function's convention.
         int rc = __ulock_wait(
             UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO,
             addr, val, timeout_us);
 
-        return rc != -ETIMEDOUT;
+        if (rc >= 0 or rc == -EINTR)
+        {
+            return 0;
+        }
+        return rc;
     }
 
     void futex_wake_all(std::atomic<uint64_t>& word)

@@ -3,6 +3,7 @@
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
 
+using namespace std::chrono;
 
 class PublisherTest : public ::testing::Test
 {
@@ -274,7 +275,7 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
     cfg.sub_ring_capacity = 4;    // capacity = 4
     cfg.pool_size         = 16;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000};  // 1 ms -- fast test
+    cfg.commit_timeout    = 1ms;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 
@@ -363,7 +364,7 @@ TEST_F(PublisherTest, SelfRepairCaseB_StaleEntry)
     cfg.sub_ring_capacity = 4;
     cfg.pool_size         = 16;
     cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = std::chrono::microseconds{1000};
+    cfg.commit_timeout    = 1ms;
 
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 

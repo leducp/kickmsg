@@ -69,7 +69,7 @@ bool run_pool_exhaustion()
         g_subscribers_ready.fetch_add(1, std::memory_order_release);
 
         auto& stats = sub_stats[static_cast<std::size_t>(sub_id)];
-        auto const timeout = milliseconds{500};
+        auto const timeout = 500ms;
 
         while (true)
         {

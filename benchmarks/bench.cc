@@ -286,7 +286,7 @@ static void run_throughput(BenchConfig const& bc, bool zerocopy,
 
     // Run for 2 seconds
     nanoseconds start = kickmsg::since_epoch();
-    kickmsg::sleep(seconds{2});
+    kickmsg::sleep(2s);
     done.store(true, std::memory_order_relaxed);
 
     for (auto& t : pub_threads)

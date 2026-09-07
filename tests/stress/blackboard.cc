@@ -122,7 +122,7 @@ namespace
             {
                 return;
             }
-            bb.wait(seen, milliseconds{20});
+            bb.wait(seen, 20ms);
             seen = bb.change_seq();
         }
     }

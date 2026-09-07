@@ -36,7 +36,7 @@ class KickmsgRecipe(ConanFile):
 
     def validate(self):
         if self.settings.compiler.get_safe("cppstd"):
-            check_min_cppstd(self, 17)
+            check_min_cppstd(self, 20)
 
     def generate(self):
         tc = CMakeToolchain(self)
@@ -69,5 +69,10 @@ class KickmsgRecipe(ConanFile):
 
     def package_info(self):
         self.cpp_info.libs = ["kickmsg"]
+        # Must match OS_LIBRARIES in CMakeLists.txt, or a consumer fails at link.
         if self.settings.os == "Linux":
             self.cpp_info.system_libs = ["rt", "pthread"]
+        elif self.settings.os == "Macos":
+            self.cpp_info.system_libs = ["pthread"]
+        elif self.settings.os == "Windows":
+            self.cpp_info.system_libs = ["synchronization", "ws2_32"]

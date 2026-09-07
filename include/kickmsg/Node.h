@@ -88,18 +88,22 @@ namespace kickmsg
         // never part of the create_or_open config-mismatch check.  Use
         // try_claim_topic_schema() afterwards to publish a descriptor
         // regardless of which side ended up creating the region.
-        Publisher  advertise(char const* topic, channel::Config const& cfg = {});
+        Publisher  advertise(char const* topic, channel::Config const& cfg = {},
+                             WakeBackend* backend = nullptr);
         Subscriber subscribe(char const* topic);
 
-        Publisher  advertise_or_join(char const* topic, channel::Config const& cfg);
+        Publisher  advertise_or_join(char const* topic, channel::Config const& cfg,
+                                     WakeBackend* backend = nullptr);
         Subscriber subscribe_or_create(char const* topic, channel::Config const& cfg);
 
         // --- Broadcast (N-to-N shared channel) ---
-        BroadcastHandle join_broadcast(char const* channel, channel::Config const& cfg = {});
+        BroadcastHandle join_broadcast(char const* channel, channel::Config const& cfg = {},
+                                       WakeBackend* backend = nullptr);
 
         // --- Mailbox (N-to-1, max_subscribers=1) ---
         Subscriber create_mailbox(char const* tag, channel::Config const& cfg = {});
-        Publisher  open_mailbox(char const* owner_node, char const* tag);
+        Publisher  open_mailbox(char const* owner_node, char const* tag,
+                                WakeBackend* backend = nullptr);
 
         // Relaxed-order mailbox: either side may arrive first. Mirrors
         // advertise_or_join / subscribe_or_create for strict pub/sub.
@@ -109,7 +113,8 @@ namespace kickmsg
         Subscriber create_or_open_mailbox(char const* tag,
                                           channel::Config const& cfg);
         Publisher  open_or_create_mailbox(char const* owner_node, char const* tag,
-                                          channel::Config const& cfg);
+                                          channel::Config const& cfg,
+                                          WakeBackend* backend = nullptr);
 
         // --- Blackboard (key/value state; late readers see current values) ---
         //
@@ -172,13 +177,14 @@ namespace kickmsg
         // Shared body of every *_or_* method: idempotent find, else
         // create_or_open, then touch_registry on both branches.
         // Instantiated for Publisher and Subscriber inside Node.cc.
-        template <typename Handle>
+        template <typename Handle, typename... Args>
         Handle create_or_open_handle(std::string const& shm_name,
                                      std::string const& topic_path,
                                      channel::Type      channel_type,
                                      registry::Kind     kind,
                                      registry::Role     role,
-                                     channel::Config const& cfg);
+                                     channel::Config const& cfg,
+                                     Args&&...              args);
 
         Registry& lazy_registry();
 

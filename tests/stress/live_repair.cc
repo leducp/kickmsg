@@ -23,7 +23,11 @@ bool run_live_repair()
     constexpr int NUM_PUBS = 4;
     constexpr int NUM_SUBS = 4;
 
-    auto const test_duration = (TSAN_SCALE > 1) ? milliseconds{200} : seconds{2};
+    milliseconds test_duration = 2s;
+    if (TSAN_SCALE > 1)
+    {
+        test_duration = 200ms;
+    }
 
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> inject_count{0};
@@ -70,7 +74,7 @@ bool run_live_repair()
         MsgTrace trace[TRACE_SIZE]{};
         std::size_t trace_pos = 0;
 
-        auto const timeout = milliseconds{100};
+        auto const timeout = 100ms;
 
         while (true)
         {

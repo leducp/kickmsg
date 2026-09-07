@@ -188,7 +188,7 @@ SubResult subscriber_thread_copy(kickmsg::SharedRegion& region, int sub_id,
     MsgTrace trace[TRACE_SIZE]{};
     std::size_t trace_pos = 0;
 
-    auto const timeout = milliseconds{500};
+    auto const timeout = 500ms;
 
     while (true)
     {
@@ -246,7 +246,7 @@ SubResult subscriber_thread_zerocopy(kickmsg::SharedRegion& region, int sub_id,
     MsgTrace trace[TRACE_SIZE]{};
     std::size_t trace_pos = 0;
 
-    auto const timeout = milliseconds{500};
+    auto const timeout = 500ms;
 
     while (true)
     {

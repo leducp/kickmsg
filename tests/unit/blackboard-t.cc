@@ -266,7 +266,7 @@ TEST_F(BlackboardTest, UpdateCountIncrementsAndTimestampAdvances)
     auto   first = r.read(got);
     ASSERT_EQ(first.status, blackboard::Ok);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    std::this_thread::sleep_for(2ms);
     ASSERT_TRUE(w.write(Sample{2, 2}));
     auto second = r.read(got);
     ASSERT_EQ(second.status, blackboard::Ok);
@@ -313,12 +313,12 @@ TEST_F(BlackboardTest, WaitWakesOnAnyChange)
     uint64_t seq = bb.change_seq();
     std::thread writer([&]
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(20ms);
         b.write(Sample{1, 1});
     });
 
     // Waiting on the board, not on key "a": any value change wakes us.
-    EXPECT_TRUE(bb.wait(seq, std::chrono::seconds(5)));
+    EXPECT_TRUE(bb.wait(seq, 5s));
     writer.join();
     EXPECT_NE(bb.change_seq(), seq);
 }
@@ -330,8 +330,8 @@ TEST_F(BlackboardTest, WaitReturnsFalseOnTimeout)
 
     uint64_t seq   = bb.change_seq();
     auto     start = std::chrono::steady_clock::now();
-    EXPECT_FALSE(bb.wait(seq, std::chrono::milliseconds(50)));
-    EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(45));
+    EXPECT_FALSE(bb.wait(seq, 50ms));
+    EXPECT_GE(std::chrono::steady_clock::now() - start, 45ms);
 }
 
 TEST_F(BlackboardTest, WaitReturnsImmediatelyWhenSeqAlreadyAdvanced)
@@ -342,8 +342,8 @@ TEST_F(BlackboardTest, WaitReturnsImmediatelyWhenSeqAlreadyAdvanced)
     ASSERT_TRUE(w.write(Sample{1, 1}));
 
     auto start = std::chrono::steady_clock::now();
-    EXPECT_TRUE(bb.wait(stale, std::chrono::seconds(5)));
-    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+    EXPECT_TRUE(bb.wait(stale, 5s));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
 }
 
 // ---- bounds and hostile bytes -------------------------------------------
@@ -591,7 +591,7 @@ TEST_F(BlackboardTest, ClosedBoardThrowsRatherThanDereferencingNull)
     EXPECT_THROW(closed.change_seq(), std::runtime_error);
     EXPECT_THROW(closed.declare("k"), std::runtime_error);
     EXPECT_THROW(closed.observe("k"), std::runtime_error);
-    EXPECT_THROW(closed.wait(0, std::chrono::milliseconds(1)), std::runtime_error);
+    EXPECT_THROW(closed.wait(0, 1ms), std::runtime_error);
     EXPECT_THROW(closed.snapshot(), std::runtime_error);
     EXPECT_THROW(closed.sweep_stale(), std::runtime_error);
 
@@ -639,7 +639,7 @@ TEST_F(BlackboardTest, ConcurrentDeclareOfOneKeyYieldsOneOwner)
             {
                 auto w = bb.declare("contested");
                 winners.fetch_add(1, std::memory_order_relaxed);
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                std::this_thread::sleep_for(50ms);
                 w.release();
             }
             catch (std::runtime_error const&)
@@ -1071,7 +1071,7 @@ TEST_F(BlackboardTest, ReleaseWaitsRatherThanStrandingTheKey)
     h->lock_token.store(live_lock_token(), std::memory_order_release);
     std::thread unlocker([&]
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        std::this_thread::sleep_for(80ms);
         h->lock_token.store(0, std::memory_order_release);
     });
 
@@ -1080,7 +1080,7 @@ TEST_F(BlackboardTest, ReleaseWaitsRatherThanStrandingTheKey)
     auto waited = std::chrono::steady_clock::now() - start;
     unlocker.join();
 
-    EXPECT_GE(waited, std::chrono::milliseconds(50))
+    EXPECT_GE(waited, 50ms)
         << "release returned without waiting for the board lock";
 
     // Ownership really was cleared, so the key is redeclarable.
@@ -1203,7 +1203,7 @@ TEST_F(BlackboardTest, ConcurrentDeclareAcrossEntriesYieldsOneOwnerPerKey)
                                    seen, now, std::memory_order_relaxed))
                     {
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    std::this_thread::sleep_for(5ms);
                     live[slot].fetch_sub(1, std::memory_order_acq_rel);
 
                     w.release();

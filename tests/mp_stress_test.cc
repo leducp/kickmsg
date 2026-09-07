@@ -219,7 +219,7 @@ static int child_subscriber_main(int sub_id, int ready_wfd, int report_wfd)
     // accounted total reaches TOTAL_SENT iff nothing vanished.  The deadline
     // turns a conservation bug into a parent-side oracle failure instead of
     // a hang.
-    auto const deadline = monotonic_ns() + seconds{60};
+    auto const deadline = monotonic_ns() + 60s;
 
     while (true)
     {
