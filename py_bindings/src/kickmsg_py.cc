@@ -18,10 +18,9 @@
 ///     Participant            — registry snapshot entry
 ///     Registry               — per-namespace participant discovery
 ///     Node                   — high-level topic / broadcast / mailbox
-///     BlackboardStatus       — read outcome enum
 ///     BlackboardConfig       — blackboard::Config
 ///     KeyStatus              — Blackboard.snapshot() entry
-///     ReadOutcome            — Blackboard reader result (status + bytes)
+///     ReadOutcome            — Blackboard reader result (errno + bytes)
 ///     BlackboardWriter       — declared key owner: .write(bytes) / .release()
 ///     BlackboardReader       — declared read interest: .read() / .owner_alive()
 ///     Blackboard             — key/value state; late readers see current values
@@ -77,6 +76,7 @@
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 
 #include "kickmsg/Blackboard.h"
@@ -113,11 +113,27 @@ namespace kickmsg
     // there is nothing safe to expose through the buffer protocol.
     struct PyReadOutcome
     {
-        blackboard::Status status;
-        nb::bytes          data;
-        uint64_t           updated_at_ns;
-        uint64_t           update_count;
+        std::error_code ec;
+        nb::bytes       data;
+        uint64_t        updated_at_ns;
+        uint64_t        update_count;
     };
+
+    /// The blackboard reports std::error_code; Python's standard for the same
+    /// thing is OSError carrying an errno, so failures are raised, not returned.
+    /// Built by hand because nanobind's builtin_exception set has no OSError,
+    /// and the (errno, strerror) pair is what populates e.errno for the caller.
+    void raise_if(std::error_code ec, char const* what)
+    {
+        if (ec)
+        {
+            std::string const msg = std::string{what} + ": " + ec.message();
+            PyObject*         args = Py_BuildValue("(is)", ec.value(), msg.c_str());
+            PyErr_SetObject(PyExc_OSError, args);
+            Py_XDECREF(args);
+            throw nb::python_error();
+        }
+    }
 
     struct PyAllocatedSlot
     {
@@ -901,16 +917,6 @@ namespace kickmsg
         // Blackboard
         // -------------------------------------------------------------------
 
-        nb::enum_<blackboard::Status>(m, "BlackboardStatus")
-            .value("Ok",        blackboard::Ok)
-            .value("Missing",   blackboard::Missing)
-            .value("Unset",     blackboard::Unset)
-            .value("Truncated", blackboard::Truncated)
-            .value("Busy",      blackboard::Busy)
-            // Only the C++ typed read can produce this; listed so a Python
-            // caller comparing against the enum sees the full set.
-            .value("SizeMismatch", blackboard::SizeMismatch);
-
         nb::class_<blackboard::Config>(m, "BlackboardConfig")
             .def(nb::init<>())
             .def_rw("capacity",       &blackboard::Config::capacity)
@@ -939,31 +945,35 @@ namespace kickmsg
             });
 
         nb::class_<PyReadOutcome>(m, "ReadOutcome")
-            .def_ro("status",        &PyReadOutcome::status)
+            .def_prop_ro("errno", [](PyReadOutcome const& r)
+                { return r.ec.value(); },
+                "0 on success, otherwise the standard errno -- compare against "
+                "the stdlib errno module (ENOENT: no such key, ENOMSG: declared "
+                "but never written, EAGAIN: transient, retry).")
+            .def_prop_ro("error", [](PyReadOutcome const& r) { return r.ec.message(); })
             .def_ro("data",          &PyReadOutcome::data)
             .def_ro("updated_at_ns", &PyReadOutcome::updated_at_ns)
             .def_ro("update_count",  &PyReadOutcome::update_count)
             .def("__len__", [](PyReadOutcome const& r) { return r.data.size(); })
-            .def("__bool__", [](PyReadOutcome const& r)
-            {
-                return r.status == blackboard::Ok;
-            })
+            .def("__bool__", [](PyReadOutcome const& r) { return not r.ec; })
             .def("__repr__", [](PyReadOutcome const& r)
             {
-                return std::string{"ReadOutcome(status="}
-                     + std::to_string(static_cast<unsigned>(r.status))
+                return std::string{"ReadOutcome(errno="}
+                     + std::to_string(r.ec.value())
                      + ", len=" + std::to_string(r.data.size()) + ")";
             });
 
         nb::class_<Blackboard::Writer>(m, "BlackboardWriter")
             .def("write",
                 [](Blackboard::Writer& w, nb::bytes const& data)
-                { return w.write(data.c_str(), data.size()); },
+                { raise_if(w.write(data.c_str(), data.size()), "write"); },
                 "data"_a,
-                "Publish a new value.  Returns False if the value exceeds the "
-                "board's max_value_size, or if this writer no longer owns the "
-                "key; the previous value is left untouched either way.")
-            .def("release", &Blackboard::Writer::release,
+                "Publish a new value.  Raises OSError -- EMSGSIZE if the value "
+                "exceeds the board's max_value_size, ENOTRECOVERABLE if this "
+                "writer no longer owns the key; the previous value is left "
+                "untouched either way.")
+            .def("release",
+                [](Blackboard::Writer& w) { raise_if(w.release(), "release"); },
                  "Drop ownership now instead of at destruction.  The value, its "
                  "timestamp and its update count all survive.")
             .def_prop_ro("key",   &Blackboard::Writer::key)
@@ -980,7 +990,7 @@ namespace kickmsg
                     std::vector<uint8_t> buf;
                     auto out = r.read(buf);
                     return PyReadOutcome{
-                        out.status,
+                        out.ec,
                         nb::bytes(reinterpret_cast<char const*>(buf.data()), buf.size()),
                         out.updated_at_ns, out.update_count};
                 },
@@ -1028,24 +1038,59 @@ namespace kickmsg
             .def("observe", &Blackboard::observe, "key"_a,
                  nb::rv_policy::move, nb::keep_alive<0, 1>(),
                  "Track `key` for O(1) reads.  Never creates it: a reader on a "
-                 "key that does not exist yet reads Missing, and starts "
-                 "returning Ok as soon as a writer declares and writes it.")
+                 "key that does not exist yet reads ENOENT, and starts "
+                 "succeeding as soon as a writer declares and writes it.")
             .def_prop_ro("change_seq", &Blackboard::change_seq)
             .def("wait",
                 [](Blackboard& b, uint64_t last_seen, nanoseconds timeout)
                 {
-                    bool changed = false;
+                    std::error_code ec;
                     {
                         nb::gil_scoped_release release;
-                        changed = b.wait(last_seen, timeout);
+                        ec = b.wait(last_seen, timeout);
                     }
-                    return changed;
+                    // A timeout is an ordinary answer here, not a failure.
+                    return not ec;
                 },
                 "last_seen"_a, "timeout"_a,
                 "Block until change_seq differs from `last_seen`, or `timeout` "
                 "(a timedelta) elapses.  Releases the GIL while blocked.  Pass "
                 "the change_seq you last acted on -- that is what closes the "
                 "lost-wakeup window.")
+            .def("keys",
+                [](Blackboard const& b, std::string const& prefix)
+                {
+                    std::vector<std::string> out;
+                    {
+                        nb::gil_scoped_release release;
+                        out = b.keys(prefix);
+                    }
+                    return out;
+                },
+                "prefix"_a = std::string{},
+                "Names of every active key, prefix-filtered.  Takes no board "
+                "lock and probes no owner, unlike snapshot().")
+            .def("read_all",
+                [](Blackboard const& b, std::string const& prefix)
+                {
+                    std::unordered_map<std::string, std::vector<uint8_t>> raw;
+                    {
+                        nb::gil_scoped_release release;
+                        raw = b.read_all(prefix);
+                    }
+                    std::unordered_map<std::string, nb::bytes> out;
+                    out.reserve(raw.size());
+                    for (auto const& [key, value] : raw)
+                    {
+                        out.emplace(key,
+                            nb::bytes(reinterpret_cast<char const*>(value.data()), value.size()));
+                    }
+                    return out;
+                },
+                "prefix"_a = std::string{},
+                "Every prefix-matching key that holds a value, as a dict of "
+                "key -> bytes.  A key overtaken by its writer mid-read is "
+                "dropped rather than returned torn.")
             .def("snapshot",
                 [](Blackboard const& b)
                 {

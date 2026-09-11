@@ -22,6 +22,12 @@ race:bb_copy_payload
 # another key's value.
 race:bb_key_equals
 
-# Both helpers are noinline (KICKMSG_BB_NOINLINE in src/Blackboard.cc) so these
+# Blackboard key bytes, copy side: snapshot() reads them under the board lock,
+# but keys()/read_all() walk the entry array unlocked and hit the same
+# claim_free_slot() write that bb_key_equals races.  A torn copy is discarded by
+# the tenancy re-check that follows it, so it can never be returned.
+race:bb_read_key
+
+# All three helpers are noinline (KICKMSG_BB_NOINLINE in src/Blackboard.cc) so these
 # suppressions match one frame each: write(), read() and resolve() themselves
 # stay checked, as does the whole publish/receive/repair core.

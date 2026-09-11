@@ -1,4 +1,6 @@
 
+#include <algorithm>
+#include <cstring>
 #include <map>
 #include <thread>
 
@@ -24,7 +26,7 @@ namespace
     BlackboardEntry* entry(Blackboard& bb, uint32_t index)
     {
         auto* h = bb.header();
-        return bb_entry_at(static_cast<void*>(h), h, index);
+        return bb_entry_at(static_cast<void*>(h), index);
     }
 }
 
@@ -113,7 +115,7 @@ TEST_F(BlackboardTest, LateReaderSeesCurrentValue)
 {
     auto bb = open();
     auto w  = bb.declare("arm/state");
-    ASSERT_TRUE(w.write(Sample{7, 3}));
+    ASSERT_FALSE(w.write(Sample{7, 3}));
 
     // The reader attaches only now and never waits for a second write.
     auto other  = open();
@@ -121,7 +123,7 @@ TEST_F(BlackboardTest, LateReaderSeesCurrentValue)
 
     Sample got{};
     auto   out = reader.read(got);
-    EXPECT_EQ(out.status, blackboard::Ok);
+    EXPECT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(out.len, sizeof(Sample));
     EXPECT_EQ(out.update_count, 1u);
     EXPECT_EQ(got.id, 7u);
@@ -134,14 +136,14 @@ TEST_F(BlackboardTest, ObserveBeforeDeclareResolvesLazily)
     auto reader = bb.observe("late/key");
 
     Sample got{};
-    EXPECT_EQ(reader.read(got).status, blackboard::Missing);
+    EXPECT_EQ(reader.read(got).ec, std::make_error_code(std::errc::no_such_file_or_directory));
 
     auto w = bb.declare("late/key");
-    ASSERT_TRUE(w.write(Sample{1, 2}));
+    ASSERT_FALSE(w.write(Sample{1, 2}));
 
     // Same Reader object, no re-observe.
     auto out = reader.read(got);
-    EXPECT_EQ(out.status, blackboard::Ok);
+    EXPECT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(got.id, 1u);
 }
 
@@ -153,7 +155,7 @@ TEST_F(BlackboardTest, DeclaredButUnwrittenKeyReadsUnset)
 
     Sample got{};
     auto   out = r.read(got);
-    EXPECT_EQ(out.status, blackboard::Unset);
+    EXPECT_EQ(out.ec, std::make_error_code(std::errc::no_message));
     EXPECT_EQ(out.len, 0u);
     EXPECT_EQ(out.update_count, 0u);
 }
@@ -172,7 +174,7 @@ TEST_F(BlackboardTest, RedeclareAfterWriterDestructionSucceeds)
     auto bb = open();
     {
         auto w = bb.declare("cycle");
-        ASSERT_TRUE(w.write(Sample{5, 5}));
+        ASSERT_FALSE(w.write(Sample{5, 5}));
     }
     auto w2 = bb.declare("cycle");
     EXPECT_TRUE(w2.valid());
@@ -184,12 +186,12 @@ TEST_F(BlackboardTest, ReleasedKeyKeepsItsValue)
     auto r  = bb.observe("released");
     {
         auto w = bb.declare("released");
-        ASSERT_TRUE(w.write(Sample{9, 1}));
+        ASSERT_FALSE(w.write(Sample{9, 1}));
     }
 
     Sample got{};
     auto   out = r.read(got);
-    EXPECT_EQ(out.status, blackboard::Ok);
+    EXPECT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(got.id, 9u);
     EXPECT_FALSE(r.owner_alive());
 
@@ -204,7 +206,7 @@ TEST_F(BlackboardTest, TakeoverPreservesPriorValueUntilFirstWrite)
     auto bb = open();
     {
         auto w = bb.declare("arm/state");
-        ASSERT_TRUE(w.write(Sample{11, 4}));
+        ASSERT_FALSE(w.write(Sample{11, 4}));
         orphan(bb, "arm/state");
     }
 
@@ -213,14 +215,14 @@ TEST_F(BlackboardTest, TakeoverPreservesPriorValueUntilFirstWrite)
 
     Sample got{};
     auto   out = r.read(got);
-    EXPECT_EQ(out.status, blackboard::Ok);
+    EXPECT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(got.id, 11u);
     EXPECT_EQ(out.update_count, 1u);
 
     // The counter continues rather than rewinding.
-    ASSERT_TRUE(w2.write(Sample{12, 5}));
+    ASSERT_FALSE(w2.write(Sample{12, 5}));
     out = r.read(got);
-    EXPECT_EQ(out.status, blackboard::Ok);
+    EXPECT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(got.id, 12u);
     EXPECT_EQ(out.update_count, 2u);
 }
@@ -229,9 +231,128 @@ TEST_F(BlackboardTest, SweepStaleLeavesLiveOwnersAlone)
 {
     auto bb = open();
     auto w  = bb.declare("live");
-    ASSERT_TRUE(w.write(Sample{1, 1}));
+    ASSERT_FALSE(w.write(Sample{1, 1}));
     EXPECT_EQ(bb.sweep_stale(), 0u);
     EXPECT_EQ(bb.snapshot().size(), 1u);
+}
+
+TEST_F(BlackboardTest, KeysListsEveryActiveKeyIncludingUnwritten)
+{
+    auto bb = open();
+    auto a  = bb.declare("arm/state");
+    auto b  = bb.declare("hand/0");
+    ASSERT_FALSE(a.write(Sample{1, 1}));
+    // b is declared and never written: it exists, so it is listed.
+
+    auto got = bb.keys();
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<std::string>{"arm/state", "hand/0"}));
+}
+
+TEST_F(BlackboardTest, KeysAndReadAllFilterOnPrefix)
+{
+    auto bb  = open();
+    auto h0  = bb.declare("hand/0");
+    auto h1  = bb.declare("hand/1");
+    auto arm = bb.declare("arm/state");
+    ASSERT_FALSE(h0.write(Sample{1, 1}));
+    ASSERT_FALSE(h1.write(Sample{2, 2}));
+    ASSERT_FALSE(arm.write(Sample{3, 3}));
+
+    auto named = bb.keys("hand/");
+    std::sort(named.begin(), named.end());
+    EXPECT_EQ(named, (std::vector<std::string>{"hand/0", "hand/1"}));
+
+    auto values = bb.read_all("hand/");
+    ASSERT_EQ(values.size(), 2u);
+    EXPECT_TRUE(values.contains("hand/0"));
+    EXPECT_TRUE(values.contains("hand/1"));
+    EXPECT_FALSE(values.contains("arm/state"));
+}
+
+TEST_F(BlackboardTest, ReadAllReturnsTheValuesReaderWouldRead)
+{
+    auto bb = open();
+    auto w  = bb.declare("hand/0");
+    ASSERT_FALSE(w.write(Sample{7, 3}));
+
+    auto values = bb.read_all();
+    ASSERT_EQ(values.size(), 1u);
+
+    auto const& bytes = values.at("hand/0");
+    ASSERT_EQ(bytes.size(), sizeof(Sample));
+    Sample got{};
+    std::memcpy(&got, bytes.data(), sizeof(got));
+    EXPECT_EQ(got.id, 7u);
+    EXPECT_EQ(got.state, 3u);
+}
+
+// A declared-but-unwritten key has no value, so it is a keys() row and not a
+// read_all() one: the two answer different questions about the same entry.
+TEST_F(BlackboardTest, ReadAllSkipsAKeyThatHoldsNoValue)
+{
+    auto bb = open();
+    auto w  = bb.declare("hand/0");
+
+    EXPECT_EQ(bb.keys().size(), 1u);
+    EXPECT_TRUE(bb.read_all().empty());
+
+    ASSERT_FALSE(w.write(Sample{1, 1}));
+    EXPECT_EQ(bb.read_all().size(), 1u);
+}
+
+// Releasing a key keeps its value, so both listings still report it: that is
+// what lets a reader see what a writer said before it went away.
+TEST_F(BlackboardTest, KeysAndReadAllOutliveTheWriter)
+{
+    auto bb = open();
+    {
+        auto w = bb.declare("hand/0");
+        ASSERT_FALSE(w.write(Sample{5, 2}));
+    }
+
+    EXPECT_EQ(bb.keys(), (std::vector<std::string>{"hand/0"}));
+    EXPECT_EQ(bb.read_all().size(), 1u);
+}
+
+// The typed form skips a key whose value is not sizeof(T), the listing
+// counterpart of the EBADMSG a typed read reports for one.
+TEST_F(BlackboardTest, TypedReadAllSkipsAValueOfTheWrongSize)
+{
+    auto bb    = open();
+    auto right = bb.declare("hand/0");
+    auto wrong = bb.declare("hand/1");
+    ASSERT_FALSE(right.write(Sample{7, 3}));
+    ASSERT_FALSE(wrong.write(uint32_t{9}));
+
+    auto typed = bb.read_all<Sample>("hand/");
+    ASSERT_EQ(typed.size(), 1u);
+    EXPECT_EQ(typed.at("hand/0").id, 7u);
+    EXPECT_EQ(typed.at("hand/0").state, 3u);
+
+    EXPECT_EQ(bb.read_all("hand/").size(), 2u);
+}
+
+// Each cause gets its own errno rather than one collapsed "false".
+TEST_F(BlackboardTest, WriteNamesWhyItFailed)
+{
+    auto bb = open();
+    auto w  = bb.declare("hand/0");
+
+    std::vector<uint8_t> const over(bb.max_value_size() + 1, 0xAB);
+    EXPECT_EQ(w.write(over.data(), over.size()),
+              std::make_error_code(std::errc::message_size));
+
+    Blackboard::Writer const moved_from;
+    Blackboard::Writer       taken = std::move(w);
+    EXPECT_EQ(w.write(Sample{1, 1}),
+              std::make_error_code(std::errc::bad_file_descriptor));
+
+    // Sweeping the entry out from under a live claim is the false-death-verdict
+    // path: the handle survives, the claim does not.
+    orphan(bb, "hand/0");
+    EXPECT_EQ(taken.write(Sample{1, 1}),
+              std::make_error_code(std::errc::state_not_recoverable));
 }
 
 TEST_F(BlackboardTest, SweepStaleFreesDeadOwnerAndLeavesUnownedAlone)
@@ -239,12 +360,12 @@ TEST_F(BlackboardTest, SweepStaleFreesDeadOwnerAndLeavesUnownedAlone)
     auto bb = open();
     {
         auto dead = bb.declare("dead");
-        ASSERT_TRUE(dead.write(Sample{1, 1}));
+        ASSERT_FALSE(dead.write(Sample{1, 1}));
         orphan(bb, "dead");
     }
     {
         auto released = bb.declare("released");
-        ASSERT_TRUE(released.write(Sample{2, 2}));
+        ASSERT_FALSE(released.write(Sample{2, 2}));
     }
 
     EXPECT_EQ(bb.sweep_stale(), 1u);
@@ -261,15 +382,15 @@ TEST_F(BlackboardTest, UpdateCountIncrementsAndTimestampAdvances)
     auto w  = bb.declare("tick");
     auto r  = bb.observe("tick");
 
-    ASSERT_TRUE(w.write(Sample{1, 1}));
+    ASSERT_FALSE(w.write(Sample{1, 1}));
     Sample got{};
     auto   first = r.read(got);
-    ASSERT_EQ(first.status, blackboard::Ok);
+    ASSERT_EQ(first.ec, std::error_code{});
 
     std::this_thread::sleep_for(2ms);
-    ASSERT_TRUE(w.write(Sample{2, 2}));
+    ASSERT_FALSE(w.write(Sample{2, 2}));
     auto second = r.read(got);
-    ASSERT_EQ(second.status, blackboard::Ok);
+    ASSERT_EQ(second.ec, std::error_code{});
 
     EXPECT_EQ(first.update_count, 1u);
     EXPECT_EQ(second.update_count, 2u);
@@ -281,7 +402,7 @@ TEST_F(BlackboardTest, SnapshotReportsOwnerAndSkipsFreeSlots)
     auto bb = open();
     auto a  = bb.declare("a", "node_a");
     auto b  = bb.declare("b", "node_b");
-    ASSERT_TRUE(a.write(Sample{1, 1}));
+    ASSERT_FALSE(a.write(Sample{1, 1}));
 
     auto snap = bb.snapshot();
     ASSERT_EQ(snap.size(), 2u);
@@ -318,7 +439,7 @@ TEST_F(BlackboardTest, WaitWakesOnAnyChange)
     });
 
     // Waiting on the board, not on key "a": any value change wakes us.
-    EXPECT_TRUE(bb.wait(seq, 5s));
+    EXPECT_FALSE(bb.wait(seq, 5s));
     writer.join();
     EXPECT_NE(bb.change_seq(), seq);
 }
@@ -330,7 +451,7 @@ TEST_F(BlackboardTest, WaitReturnsFalseOnTimeout)
 
     uint64_t seq   = bb.change_seq();
     auto     start = std::chrono::steady_clock::now();
-    EXPECT_FALSE(bb.wait(seq, 50ms));
+    EXPECT_TRUE(bb.wait(seq, 50ms));
     EXPECT_GE(std::chrono::steady_clock::now() - start, 45ms);
 }
 
@@ -339,10 +460,10 @@ TEST_F(BlackboardTest, WaitReturnsImmediatelyWhenSeqAlreadyAdvanced)
     auto     bb    = open();
     auto     w     = bb.declare("k");
     uint64_t stale = bb.change_seq();
-    ASSERT_TRUE(w.write(Sample{1, 1}));
+    ASSERT_FALSE(w.write(Sample{1, 1}));
 
     auto start = std::chrono::steady_clock::now();
-    EXPECT_TRUE(bb.wait(stale, 5s));
+    EXPECT_FALSE(bb.wait(stale, 5s));
     EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
 }
 
@@ -353,14 +474,14 @@ TEST_F(BlackboardTest, ValueTooLargeIsRejectedAndPreservesPrevious)
     auto bb = open();
     auto w  = bb.declare("k");
     auto r  = bb.observe("k");
-    ASSERT_TRUE(w.write(Sample{3, 3}));
+    ASSERT_FALSE(w.write(Sample{3, 3}));
 
     std::vector<uint8_t> huge(4096, 0xAB);
-    EXPECT_FALSE(w.write(huge.data(), huge.size()));
+    EXPECT_TRUE(w.write(huge.data(), huge.size()));
 
     Sample got{};
     auto   out = r.read(got);
-    EXPECT_EQ(out.status, blackboard::Ok);
+    EXPECT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(out.update_count, 1u);
     EXPECT_EQ(got.id, 3u);
 }
@@ -372,11 +493,11 @@ TEST_F(BlackboardTest, ReadIntoSmallBufferReportsTruncated)
     auto r  = bb.observe("k");
 
     std::vector<uint8_t> payload(32, 0x5A);
-    ASSERT_TRUE(w.write(payload.data(), payload.size()));
+    ASSERT_FALSE(w.write(payload.data(), payload.size()));
 
     uint8_t guarded[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     auto    out = r.read(guarded, 4);
-    EXPECT_EQ(out.status, blackboard::Truncated);
+    EXPECT_EQ(out.ec, std::make_error_code(std::errc::message_size));
     EXPECT_EQ(out.len, 32u);
     for (auto byte : guarded)
     {
@@ -412,15 +533,15 @@ TEST_F(BlackboardTest, CorruptValueLenIsClamped)
     auto bb = open();
     auto w  = bb.declare("k");
     auto r  = bb.observe("k");
-    ASSERT_TRUE(w.write(Sample{1, 1}));
+    ASSERT_FALSE(w.write(Sample{1, 1}));
 
     auto* h    = bb.header();
-    auto* cell = bb_cell_at(static_cast<void*>(h), h, 0, 1);
+    auto* cell = bb_cell_at(static_cast<void*>(h), 0, 1);
     cell->value_len.store(0xFFFFFFFFu, std::memory_order_relaxed);
 
     std::vector<uint8_t> out;
     auto result = r.read(out);
-    EXPECT_EQ(result.status, blackboard::Ok);
+    EXPECT_EQ(result.ec, std::error_code{});
     EXPECT_LE(result.len, bb.max_value_size());
 }
 
@@ -496,19 +617,19 @@ TEST_F(BlackboardTest, EntryRetenancyInvalidatesCachedReaderIndex)
     auto reader = bb.observe("a");
     {
         auto w = bb.declare("a");
-        ASSERT_TRUE(w.write(Sample{1, 1}));
+        ASSERT_FALSE(w.write(Sample{1, 1}));
         Sample got{};
-        ASSERT_EQ(reader.read(got).status, blackboard::Ok);   // caches the index
+        ASSERT_EQ(reader.read(got).ec, std::error_code{});   // caches the index
         orphan(bb, "a");
     }
     ASSERT_EQ(bb.sweep_stale(), 1u);
 
     auto w2 = bb.declare("b");
-    ASSERT_TRUE(w2.write(Sample{99, 99}));
+    ASSERT_FALSE(w2.write(Sample{99, 99}));
 
     Sample got{};
     auto   out = reader.read(got);
-    EXPECT_EQ(out.status, blackboard::Missing);
+    EXPECT_EQ(out.ec, std::make_error_code(std::errc::no_such_file_or_directory));
     EXPECT_NE(got.id, 99u);
 }
 
@@ -521,7 +642,7 @@ TEST_F(BlackboardTest, FreshClaimDoesNotResurrectPreviousTenantValue)
 
     {
         auto w = bb.declare("a");
-        ASSERT_TRUE(w.write(Sample{42, 42}));
+        ASSERT_FALSE(w.write(Sample{42, 42}));
         orphan(bb, "a");
     }
     ASSERT_EQ(bb.sweep_stale(), 1u);
@@ -529,7 +650,7 @@ TEST_F(BlackboardTest, FreshClaimDoesNotResurrectPreviousTenantValue)
     auto   w2 = bb.declare("b");
     auto   r  = bb.observe("b");
     Sample got{};
-    EXPECT_EQ(r.read(got).status, blackboard::Unset);
+    EXPECT_EQ(r.read(got).ec, std::make_error_code(std::errc::no_message));
 }
 
 // ---- convenience overloads ----------------------------------------------
@@ -541,17 +662,17 @@ TEST_F(BlackboardTest, VectorReadResizesAndReusesCapacity)
     auto r  = bb.observe("k");
 
     std::vector<uint8_t> payload(48, 0x7E);
-    ASSERT_TRUE(w.write(payload.data(), payload.size()));
+    ASSERT_FALSE(w.write(payload.data(), payload.size()));
 
     std::vector<uint8_t> out;
     auto result = r.read(out);
-    ASSERT_EQ(result.status, blackboard::Ok);
+    ASSERT_EQ(result.ec, std::error_code{});
     ASSERT_EQ(out.size(), 48u);
     EXPECT_EQ(out, payload);
 
     std::size_t cap_before = out.capacity();
     result = r.read(out);
-    EXPECT_EQ(result.status, blackboard::Ok);
+    EXPECT_EQ(result.ec, std::error_code{});
     EXPECT_EQ(out.capacity(), cap_before);
 }
 
@@ -563,22 +684,22 @@ TEST_F(BlackboardTest, TypedReadRejectsAValueOfADifferentSize)
     auto w  = bb.declare("k");
     auto r  = bb.observe("k");
 
-    ASSERT_TRUE(w.write(uint32_t{0xABCD1234}));
+    ASSERT_FALSE(w.write(uint32_t{0xABCD1234}));
 
     uint64_t wide = 0xFFFFFFFFFFFFFFFFull;
     auto     out  = r.read(wide);
-    EXPECT_EQ(out.status, blackboard::SizeMismatch);
+    EXPECT_EQ(out.ec, std::make_error_code(std::errc::bad_message));
     EXPECT_EQ(out.len, 4u);
     EXPECT_EQ(wide, 0xFFFFFFFFFFFFFFFFull) << "out must not be touched";
 
     // The matching type still reads.
     uint32_t narrow = 0;
-    EXPECT_EQ(r.read(narrow).status, blackboard::Ok);
+    EXPECT_EQ(r.read(narrow).ec, std::error_code{});
     EXPECT_EQ(narrow, 0xABCD1234u);
 
     // And a value larger than T is still Truncated, not a partial fill.
-    ASSERT_TRUE(w.write(std::vector<uint8_t>(32, 0x11).data(), 32));
-    EXPECT_EQ(r.read(narrow).status, blackboard::Truncated);
+    ASSERT_FALSE(w.write(std::vector<uint8_t>(32, 0x11).data(), 32));
+    EXPECT_EQ(r.read(narrow).ec, std::make_error_code(std::errc::message_size));
     EXPECT_EQ(narrow, 0xABCD1234u);
 }
 
@@ -610,11 +731,11 @@ TEST_F(BlackboardTest, RawByteRoundTrip)
     auto r  = bb.observe("k");
 
     char const* text = "lifecycle=ACTIVE";
-    ASSERT_TRUE(w.write(text, std::strlen(text)));
+    ASSERT_FALSE(w.write(text, std::strlen(text)));
 
     char buf[64] = {};
     auto out = r.read(buf, sizeof(buf));
-    ASSERT_EQ(out.status, blackboard::Ok);
+    ASSERT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(std::string(buf, out.len), text);
 }
 
@@ -683,10 +804,10 @@ TEST_F(BlackboardTest, MaxValueSizeIsExactlyAsConfigured)
 
     auto w = bb.declare("k");
     std::vector<uint8_t> exact(128, 0xEE);
-    EXPECT_TRUE(w.write(exact.data(), exact.size()));
+    EXPECT_FALSE(w.write(exact.data(), exact.size()));
 
     std::vector<uint8_t> over(129, 0xEE);
-    EXPECT_FALSE(w.write(over.data(), over.size()));
+    EXPECT_TRUE(w.write(over.data(), over.size()));
 }
 
 TEST_F(BlackboardTest, BoardAtMaxValueSizeCanBeReopened)
@@ -728,7 +849,7 @@ TEST_F(BlackboardTest, ConcurrentReleaseAndTakeoverYieldAWorkingWriter)
                 {
                     auto w = bb.declare("contended");
                     taken.store(true, std::memory_order_release);
-                    wrote.store(w.write(uint32_t{7}), std::memory_order_release);
+                    wrote.store(not w.write(uint32_t{7}), std::memory_order_release);
                     w.release();
                     return;
                 }
@@ -778,7 +899,7 @@ TEST_F(BlackboardTest, FreedEntryDoesNotLeaveADeadPidForTheNextClaimant)
     auto bb = open();
     {
         auto w = bb.declare("gone");
-        ASSERT_TRUE(w.write(Sample{1, 1}));
+        ASSERT_FALSE(w.write(Sample{1, 1}));
         orphan(bb, "gone");
     }
     ASSERT_EQ(bb.sweep_stale(), 1u);
@@ -792,7 +913,7 @@ TEST_F(BlackboardTest, FreedEntryDoesNotLeaveADeadPidForTheNextClaimant)
     // A fresh claim must survive a sweep running against it.
     auto w2 = bb.declare("fresh");
     EXPECT_EQ(bb.sweep_stale(), 0u);
-    EXPECT_TRUE(w2.write(Sample{2, 2}));
+    EXPECT_FALSE(w2.write(Sample{2, 2}));
 }
 
 // ---- crash-point matrix --------------------------------------------------
@@ -926,9 +1047,9 @@ TEST_F(BlackboardTest, CrashPointMatrix)
 
         // Index 0 is the victim; index 1 is an untouched neighbour.
         auto victim = bb.declare("victim", "owner");
-        ASSERT_TRUE(victim.write(Sample{1, 1})) << point.name;
+        ASSERT_FALSE(victim.write(Sample{1, 1})) << point.name;
         auto neighbour = bb.declare("neighbour", "owner");
-        ASSERT_TRUE(neighbour.write(Sample{2, 2})) << point.name;
+        ASSERT_FALSE(neighbour.write(Sample{2, 2})) << point.name;
 
         auto* h = bb.header();
         auto* e = entry(bb, 0);
@@ -963,7 +1084,7 @@ TEST_F(BlackboardTest, CrashPointMatrix)
         try
         {
             auto probe = bb.declare("probe");
-            declarable = probe.write(Sample{3, 3});
+            declarable = not probe.write(Sample{3, 3});
         }
         catch (std::runtime_error const&)
         {
@@ -973,7 +1094,7 @@ TEST_F(BlackboardTest, CrashPointMatrix)
 
         Sample got{};
         auto   out = bb.observe("neighbour").read(got);
-        ok = ok and out.status == blackboard::Ok and got.id == 2u;
+        ok = ok and not out.ec and got.id == 2u;
 
         EXPECT_TRUE(ok) << ctx
                         << " | state=" << st
@@ -1013,7 +1134,7 @@ TEST_F(BlackboardTest, SnapshotReportsBusyRatherThanReadingUnlocked)
     // lock exists to prevent, so it must report busy instead of returning rows.
     auto bb = open();
     auto w  = bb.declare("k", "owner");
-    ASSERT_TRUE(w.write(Sample{1, 1}));
+    ASSERT_FALSE(w.write(Sample{1, 1}));
 
     auto* h = bb.header();
     h->lock_token.store(live_lock_token(), std::memory_order_release);
@@ -1034,7 +1155,7 @@ TEST_F(BlackboardTest, LockIsNeverLeftHeldOnAThrowingPath)
     auto* h = bb.header();
 
     auto w = bb.declare("owned", "owner");
-    ASSERT_TRUE(w.write(Sample{1, 1}));
+    ASSERT_FALSE(w.write(Sample{1, 1}));
 
     EXPECT_THROW(bb.declare("owned"), std::runtime_error);
     EXPECT_EQ(h->lock_token.load(std::memory_order_acquire), 0u);
@@ -1053,7 +1174,7 @@ TEST_F(BlackboardTest, LockIsNeverLeftHeldOnAThrowingPath)
 
     // And the board still works.
     auto w2 = bb.declare("after");
-    EXPECT_TRUE(w2.write(Sample{2, 2}));
+    EXPECT_FALSE(w2.write(Sample{2, 2}));
 }
 
 TEST_F(BlackboardTest, ReleaseWaitsRatherThanStrandingTheKey)
@@ -1065,7 +1186,7 @@ TEST_F(BlackboardTest, ReleaseWaitsRatherThanStrandingTheKey)
     auto* h  = bb.header();
 
     auto w = bb.declare("stuck", "owner");
-    ASSERT_TRUE(w.write(Sample{1, 1}));
+    ASSERT_FALSE(w.write(Sample{1, 1}));
 
     // A peer takes the board and holds it across the release.
     h->lock_token.store(live_lock_token(), std::memory_order_release);
@@ -1085,7 +1206,7 @@ TEST_F(BlackboardTest, ReleaseWaitsRatherThanStrandingTheKey)
 
     // Ownership really was cleared, so the key is redeclarable.
     auto w2 = bb.declare("stuck");
-    EXPECT_TRUE(w2.write(Sample{2, 2}));
+    EXPECT_FALSE(w2.write(Sample{2, 2}));
 }
 
 // A hammer, not a proof: it still passes with the publish re-check removed,

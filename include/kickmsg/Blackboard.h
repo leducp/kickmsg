@@ -7,7 +7,10 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "kickmsg/types.h"
@@ -46,17 +49,8 @@ namespace kickmsg
             Active   = 2,
         };
 
-        /// A read has several distinguishable outcomes, so it reports a status
-        /// rather than collapsing them into a std::optional.
-        enum Status : uint32_t
-        {
-            Ok           = 0,  ///< `len` bytes were copied into the caller's buffer
-            Missing      = 1,  ///< No entry for this key
-            Unset        = 2,  ///< Key is declared but no value has ever been written
-            Truncated    = 3,  ///< Buffer too small; `len` is the true size, nothing copied
-            Busy         = 4,  ///< Retry budget exhausted under a very hot writer; transient
-            SizeMismatch = 5,  ///< Typed read only: the value is not sizeof(T) bytes
-        };
+        /// ENOENT: no entry for this key.  ENOMSG: declared, never written.
+        /// EMSGSIZE: `len` is the true size and nothing was copied.
 
         /// Geometry of a blackboard region.  Only the creator's values are
         /// stamped; an opener's are checked against the stamped config_hash.
@@ -74,10 +68,10 @@ namespace kickmsg
 
         struct ReadOutcome
         {
-            Status      status       {Missing};
-            std::size_t len          {0};
-            uint64_t    updated_at_ns{0};  ///< monotonic_ns of the last write, 0 if never
-            uint64_t    update_count {0};
+            std::error_code ec;
+            std::size_t     len          {0};
+            uint64_t        updated_at_ns{0};  ///< monotonic_ns of the last write, 0 if never
+            uint64_t        update_count {0};
         };
 
         /// Diagnostic view of one key.  owner_alive costs one OS probe, so
@@ -200,29 +194,23 @@ namespace kickmsg
     static_assert(std::is_standard_layout<BlackboardHeader>::value,
         "BlackboardHeader is placed in shared memory via reinterpret_cast");
 
-    BlackboardEntry* bb_entry_at(void* base, BlackboardHeader const* h, uint32_t idx);
-    BlackboardCell*  bb_cell_at(void* base, BlackboardHeader const* h,
-                                uint32_t idx, uint64_t parity);
+    BlackboardEntry* bb_entry_at(void* base, uint32_t idx);
+    BlackboardCell*  bb_cell_at(void* base, uint32_t idx, uint64_t parity);
     uint8_t*         bb_cell_payload(BlackboardCell* cell);
 
     uint64_t bb_config_hash(blackboard::Config const& cfg);
 
-    /// Shared-memory key/value state store.
-    ///
-    /// A Subscriber attaches at its ring's current write_pos and never sees
-    /// anything published before it, so a node broadcasting lifecycle state
-    /// must heartbeat forever and a late listener still waits a full period.
-    /// A blackboard reader instead observes the current value of every key the
-    /// instant it attaches.  State, not stream: writers publish once and stop.
+    /// Shared-memory key/value state store.  State, not stream: a reader
+    /// observes the current value of every key the instant it attaches, so
+    /// writers publish once and stop.
     ///
     /// One region per board at `/{namespace}_bb_{name}`, with its own MAGIC
     /// and blackboard::VERSION -- independent of the channel ABI in types.h.
     /// Persists beyond any single process; remove with unlink().
     ///
-    /// Mechanism, not policy.  The library never interprets a value's bytes,
-    /// never defines a staleness threshold, and never re-declares a key on a
-    /// writer's behalf.  It exposes updated_at_ns, the owner pid, and a change
-    /// counter; what counts as "too old" is the caller's.
+    /// Mechanism, not policy: the library never interprets a value's bytes.  It
+    /// exposes updated_at_ns, the owner pid and a change counter; what counts
+    /// as "too old" is the caller's.
     ///
     /// Lifetime: Writer and Reader hold raw pointers into the mapping.  They
     /// MUST NOT outlive the Blackboard, and the Blackboard MUST NOT be moved
@@ -236,23 +224,20 @@ namespace kickmsg
         Blackboard(Blackboard const&) = delete;
         Blackboard& operator=(Blackboard const&) = delete;
 
-        // Hand-written like SharedRegion's: a defaulted move would leave the
-        // source aliasing the destination's live mapping.
+        // A defaulted move would leave the source aliasing the destination's
+        // live mapping.
         Blackboard(Blackboard&& other) noexcept;
         Blackboard& operator=(Blackboard&& other) noexcept;
 
         /// `owner_name` labels every key this board declares, for diagnostics.
-        /// Node passes its own node name, so a Node-owned board never makes
-        /// the caller repeat it.
         static Blackboard open_or_create(std::string const& kmsg_namespace,
                                          std::string const& name,
                                          blackboard::Config const& cfg = {},
                                          char const* owner_name = "");
 
-        /// Returns nullopt when the region does not exist -- for read-only
-        /// tools that must not create one as a side effect of inspection.
-        /// Throws on magic / version / geometry / identity mismatch.
-        /// The mapping is still read/write: "try" means "does not create".
+        /// Returns nullopt when the region does not exist.  Throws on magic /
+        /// version / geometry / identity mismatch.  The mapping is still
+        /// read/write: "try" means "does not create".
         static std::optional<Blackboard> try_open(std::string const& kmsg_namespace,
                                                   std::string const& name);
 
@@ -278,35 +263,31 @@ namespace kickmsg
             Writer(Writer&& other) noexcept;
             Writer& operator=(Writer&& other) noexcept;
 
-            /// Publish a new value.  Returns false when `len` exceeds the
-            /// board's max_value_size, when this writer no longer owns the
-            /// key (its entry was swept and re-tenanted after a false death
-            /// verdict), or when the caller is a fork() child of the declaring
-            /// process.  In every case the previous value is untouched.
-            bool write(void const* data, std::size_t len);
+            /// Publish a new value.  The previous value is untouched on every
+            /// failure.  ENOTRECOVERABLE: the entry was swept and re-tenanted
+            /// after a false death verdict, so this claim is gone.
+            std::error_code write(void const* data, std::size_t len);
 
             /// Typed convenience, gated exactly like hash::fnv1a_64<T>.
             template <typename T>
             auto write(T const& value)
                 -> std::enable_if_t<std::is_trivially_copyable_v<T>
                                     and not std::is_pointer_v<T>
-                                    and not std::is_null_pointer_v<T>, bool>
+                                    and not std::is_null_pointer_v<T>,
+                                    std::error_code>
             {
                 return write(&value, sizeof(T));
             }
 
             /// Drop ownership now rather than at destruction.  Same
-            /// value-preserving semantics as the destructor.  A no-op in a
-            /// fork() child, and a no-op if the board lock stays held by a
-            /// wedged peer for the whole (bounded) wait -- the key is then
-            /// reclaimed when this process exits.
-            void release();
+            /// value-preserving semantics as the destructor, and idempotent.
+            /// EBUSY: the key is reclaimed when this process exits instead.
+            std::error_code release();
 
             std::string const& key() const { return key_; }
 
-            /// False only for a default-constructed or moved-from Writer.  A
-            /// live claim that later loses its entry surfaces through write()
-            /// returning false, not through this.
+            /// False only for a default-constructed or moved-from Writer; a
+            /// claim that later loses its entry surfaces as a write() error.
             bool valid() const { return base_ != nullptr; }
 
         private:
@@ -336,17 +317,14 @@ namespace kickmsg
             Reader& operator=(Reader&&) noexcept = default;
 
             /// Copy the current value into the caller's buffer.  No
-            /// allocation, no syscall.
-            ///
-            /// Always a copy: a writer may overwrite the cell mid-read, so
-            /// unlike SampleView's pinned slot there is nothing safe to point
-            /// at.  Do not add a zero-copy view.
+            /// allocation, no syscall.  Always a copy: a writer may overwrite
+            /// the cell mid-read, so there is nothing safe to point at.
             blackboard::ReadOutcome read(void* out, std::size_t cap) const;
 
-            /// Typed form.  Reports SizeMismatch when the stored value is not
-            /// exactly sizeof(T) bytes -- a uint32_t read as a uint64_t would
-            /// otherwise return Ok over a half-filled object.  `out` is
-            /// written only on Ok.
+            /// Typed form.  EBADMSG when the stored value is not exactly
+            /// sizeof(T) bytes -- a uint32_t read as a uint64_t would otherwise
+            /// succeed over a half-filled object.  `out` is written only on
+            /// success.
             template <typename T>
             auto read(T& out) const
                 -> std::enable_if_t<std::is_trivially_copyable_v<T>
@@ -356,13 +334,13 @@ namespace kickmsg
             {
                 alignas(T) unsigned char staging[sizeof(T)];
                 blackboard::ReadOutcome result = read(staging, sizeof(T));
-                if (result.status != blackboard::Ok)
+                if (result.ec)
                 {
                     return result;
                 }
                 if (result.len != sizeof(T))
                 {
-                    result.status = blackboard::SizeMismatch;
+                    result.ec = std::make_error_code(std::errc::bad_message);
                     return result;
                 }
                 std::memcpy(&out, staging, sizeof(T));
@@ -370,7 +348,7 @@ namespace kickmsg
             }
 
             /// Owning form: resizes `out` to the value length, reusing its
-            /// capacity.  Never returns Truncated.
+            /// capacity.  Never reports errc::message_size.
             blackboard::ReadOutcome read(std::vector<uint8_t>& out) const;
 
             /// Probe whether the key's current owner process still exists.
@@ -411,8 +389,9 @@ namespace kickmsg
         Writer declare(char const* key, char const* owner_node = nullptr);
 
         /// Track `key` for O(1) reads.  Never creates it: a Reader on a key
-        /// that does not exist yet reads Missing, and starts returning Ok as
-        /// soon as some writer declares and writes it -- no second call.
+        /// that does not exist yet reads errc::no_such_file_or_directory, and
+        /// starts succeeding as soon as some writer declares and writes it --
+        /// no second call.
         Reader observe(char const* key);
 
         /// Monotonic count of value updates and key claims across this board.
@@ -429,7 +408,9 @@ namespace kickmsg
         /// The timeout is mandatory and finite: futex_wait compares only the
         /// low 32 bits of change_seq, so an infinite wait could in principle
         /// miss a wakeup forever.
-        bool wait(uint64_t last_seen, nanoseconds timeout);
+        ///
+        /// {} once change_seq moved, errc::timed_out when it did not.
+        std::error_code wait(uint64_t last_seen, nanoseconds timeout);
 
         /// Diagnostic copy of every active key.  Probes owner liveness, so it
         /// costs one OS call per active key.  Safe under live traffic.
@@ -438,6 +419,44 @@ namespace kickmsg
         /// owner_node in place with no seqlock over those bytes.  Throws
         /// std::runtime_error if the board lock cannot be taken.
         std::vector<blackboard::KeyStatus> snapshot() const;
+
+        /// Names of every active key, `prefix`-filtered, in entry order.  Takes
+        /// no board lock and probes no owner, unlike snapshot().  Includes a key
+        /// declared but never written.
+        std::vector<std::string> keys(std::string_view prefix = {}) const;
+
+        /// Every `prefix`-matching key that holds a value, with a copy of it.
+        /// One unlocked pass; a key overtaken by its writer mid-read is dropped
+        /// rather than returned torn.
+        ///
+        /// Not atomic across the board: a key claimed or written during the pass
+        /// may or may not appear.  change_seq() tells you whether it moved.
+        std::unordered_map<std::string, std::vector<uint8_t>>
+        read_all(std::string_view prefix = {}) const;
+
+        /// Typed form, gated exactly like Writer::write<T>.  A key whose value is
+        /// not sizeof(T) bytes is skipped, the listing counterpart of the
+        /// EBADMSG Reader::read(T&) reports for one.
+        template <typename T>
+        auto read_all(std::string_view prefix = {}) const
+            -> std::enable_if_t<std::is_trivially_copyable_v<T>
+                                and not std::is_pointer_v<T>
+                                and not std::is_null_pointer_v<T>,
+                                std::unordered_map<std::string, T>>
+        {
+            std::unordered_map<std::string, T> out;
+            for (auto const& [key, bytes] : read_all(prefix))
+            {
+                if (bytes.size() != sizeof(T))
+                {
+                    continue;
+                }
+                T value;
+                std::memcpy(&value, bytes.data(), sizeof(T));
+                out.emplace(key, value);
+            }
+            return out;
+        }
 
         /// Reclaim crash residue.  Frees keys whose owner process is provably
         /// dead -- destroying their values -- and recovers entries left in a
@@ -474,6 +493,20 @@ namespace kickmsg
 
         /// Sweep body, run by a caller that already holds the board lock.
         uint32_t sweep_locked(BlackboardHeader* h);
+
+        struct EntryRead
+        {
+            std::string key;
+            std::size_t value_len    {0};
+            uint64_t    updated_at_ns{0};
+            uint64_t    update_count {0};
+        };
+
+        /// Coherent read of entry `i`, the seqlock Reader::read() runs over a
+        /// resolved entry.  Copies the value into `value` when it is non-null.
+        /// ENOMSG: active but never written.  ENOENT: not active.
+        std::error_code read_entry(uint32_t i, EntryRead& out,
+                                   std::vector<uint8_t>* value) const;
 
         SharedMemory shm_;
         std::string  name_;

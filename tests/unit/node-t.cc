@@ -543,7 +543,7 @@ TEST_F(NodeTest, BlackboardCrossNodeLateReader)
         kickmsg::Node writer_node("writer", "test");
         auto& bb = writer_node.blackboard("state");
         auto  w  = bb.declare("lifecycle", "writer");
-        ASSERT_TRUE(w.write(value));
+        ASSERT_FALSE(w.write(value));
 
         // The reader node is constructed only now, after the single write.
         kickmsg::Node reader_node("reader", "test");
@@ -552,7 +552,7 @@ TEST_F(NodeTest, BlackboardCrossNodeLateReader)
 
         uint32_t got = 0;
         auto     out = r.read(got);
-        EXPECT_EQ(out.status, kickmsg::blackboard::Ok);
+        EXPECT_FALSE(out.ec);
         EXPECT_EQ(got, value);
     }
 }

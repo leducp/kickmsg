@@ -52,15 +52,15 @@ def main() -> int:
     out = state_view.read()
     lifecycle, fault, temperature = struct.unpack("<IIf", out.data)
     age = (time.monotonic_ns() - out.updated_at_ns) / 1e9
-    print(f"[reader] arm/state -> {out.status.name} "
+    print(f"[reader] arm/state -> {out.error} "
           f"({_LIFECYCLE[lifecycle]}, fault {fault}, {temperature:.1f} C) "
           f"age {age:.3f}s owner_alive={state_view.owner_alive()}")
     print("[reader] a Subscriber here would have received nothing at all.\n")
 
     # --- Two states a topic cannot express ------------------------------
-    print(f"[reader] arm/gripper     -> {hmi_board.observe('arm/gripper').read().status.name}"
+    print(f"[reader] arm/gripper     -> {hmi_board.observe('arm/gripper').read().error}"
           "   (no writer ever declared it)")
-    print(f"[reader] arm/calibration -> {hmi_board.observe('arm/calibration').read().status.name}"
+    print(f"[reader] arm/calibration -> {hmi_board.observe('arm/calibration').read().error}"
           "     (declared, never written)\n")
 
     # --- Change notification, without polling ---------------------------
