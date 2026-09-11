@@ -66,7 +66,7 @@ namespace
         for (uint32_t seq = 1; seq <= count; ++seq)
         {
             fill(value, static_cast<uint32_t>(writer_id), seq);
-            if (w.write(value))
+            if (not w.write(value))
             {
                 g_writes.fetch_add(1, std::memory_order_relaxed);
             }
@@ -94,13 +94,13 @@ namespace
             for (int i = 0; i < num_writers; ++i)
             {
                 auto out = readers[static_cast<std::size_t>(i)].read(got);
-                if (out.status == blackboard::Busy)
+                if (out.ec == std::errc::resource_unavailable_try_again)
                 {
                     g_busy.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
-                if (out.status == blackboard::Unset
-                    or out.status == blackboard::Missing)
+                if (out.ec == std::errc::no_message
+                    or out.ec == std::errc::no_such_file_or_directory)
                 {
                     continue;
                 }

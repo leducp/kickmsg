@@ -174,7 +174,7 @@ namespace
         BbPayload got{};
         for (int i = 0; i < 5000; ++i)
         {
-            if (r.read(got).status == blackboard::Ok)
+            if (r.read(got).ec == std::error_code{})
             {
                 return true;
             }
@@ -220,11 +220,11 @@ static bool test_value_survives_owner_death()
         {
             BbPayload got{};
             auto out = r.read(got);
-            if (out.status != blackboard::Ok)
+            if (out.ec)
             {
                 std::fprintf(stderr,
-                    "  [FAIL] round %d: read status %u after owner death\n",
-                    round, static_cast<unsigned>(out.status));
+                    "  [FAIL] round %d: read %s after owner death\n",
+                    round, out.ec.message().c_str());
                 ok = false;
                 break;
             }
@@ -269,7 +269,7 @@ static bool test_value_survives_owner_death()
             ok = false;
         }
         BbPayload got{};
-        if (r.read(got).status != blackboard::Missing)
+        if (r.read(got).ec != std::make_error_code(std::errc::no_such_file_or_directory))
         {
             std::fprintf(stderr, "  [FAIL] round %d: key readable after sweep\n", round);
             ok = false;
@@ -301,7 +301,7 @@ static bool test_takeover_after_owner_death()
 
     BbPayload before{};
     auto out = r.read(before);
-    if (out.status != blackboard::Ok or not payload_valid(before))
+    if (out.ec != std::error_code{} or not payload_valid(before))
     {
         std::fprintf(stderr, "  [FAIL] no valid value after owner death\n");
         ok = false;
@@ -322,7 +322,7 @@ static bool test_takeover_after_owner_death()
 
     BbPayload after{};
     out = r.read(after);
-    if (out.status != blackboard::Ok or after.seq != before.seq
+    if (out.ec != std::error_code{} or after.seq != before.seq
         or out.update_count != count_before)
     {
         std::fprintf(stderr, "  [FAIL] takeover did not preserve the prior value\n");
@@ -332,13 +332,13 @@ static bool test_takeover_after_owner_death()
     // The publish counter continues rather than rewinding.
     BbPayload fresh{};
     fill_payload(fresh, 0xABCD);
-    if (not w2.write(fresh))
+    if (w2.write(fresh))
     {
         std::fprintf(stderr, "  [FAIL] write after takeover failed\n");
         ok = false;
     }
     out = r.read(after);
-    if (out.status != blackboard::Ok or after.seq != 0xABCD
+    if (out.ec != std::error_code{} or after.seq != 0xABCD
         or out.update_count != count_before + 1)
     {
         std::fprintf(stderr, "  [FAIL] counter did not continue after takeover "
@@ -508,7 +508,7 @@ static bool test_unreaped_owner_is_reclaimable()
         auto w = bb.declare(KEY, "restarted");
         BbPayload fresh{};
         fill_payload(fresh, 7);
-        if (not w.write(fresh))
+        if (w.write(fresh))
         {
             std::fprintf(stderr, "  [FAIL] write after zombie takeover failed\n");
             ok = false;
@@ -546,7 +546,7 @@ static bool test_forked_writer_does_not_touch_the_parents_key()
 
     BbPayload mine{};
     fill_payload(mine, 1);
-    if (not w.write(mine))
+    if (w.write(mine))
     {
         std::fprintf(stderr, "  [FAIL] parent could not write\n");
         return false;
@@ -560,7 +560,7 @@ static bool test_forked_writer_does_not_touch_the_parents_key()
         BbPayload theirs{};
         fill_payload(theirs, 2);
         int code = 0;
-        if (w.write(theirs))
+        if (not w.write(theirs))
         {
             code = 1;
         }
@@ -584,14 +584,14 @@ static bool test_forked_writer_does_not_touch_the_parents_key()
     }
 
     BbPayload got{};
-    if (r.read(got).status != blackboard::Ok or got.seq != 1)
+    if (r.read(got).ec != std::error_code{} or got.seq != 1)
     {
         std::fprintf(stderr, "  [FAIL] the child's write reached the value\n");
         ok = false;
     }
 
     fill_payload(mine, 3);
-    if (not w.write(mine))
+    if (w.write(mine))
     {
         std::fprintf(stderr, "  [FAIL] parent lost its claim to the fork\n");
         ok = false;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import errno
 import os
 import signal
 import struct
@@ -34,14 +35,14 @@ def board(request):
 def test_late_reader_sees_current_value(board):
     bb, name = board
     w = bb.declare("arm/state", "arm_driver")
-    assert w.write(struct.pack("<II", 1, 42))
+    w.write(struct.pack("<II", 1, 42))
 
     # The reader opens the board only now, and never waits for a second write.
     other = kickmsg.Blackboard.try_open(NS, name)
     assert other is not None
     out = other.observe("arm/state").read()
 
-    assert out.status == kickmsg.BlackboardStatus.Ok
+    assert out
     assert struct.unpack("<II", out.data) == (1, 42)
     assert out.update_count == 1
     assert bool(out) is True
@@ -51,21 +52,21 @@ def test_late_reader_sees_current_value(board):
 def test_observe_before_declare_resolves_lazily(board):
     bb, _ = board
     reader = bb.observe("late/key")
-    assert reader.read().status == kickmsg.BlackboardStatus.Missing
+    assert reader.read().errno == errno.ENOENT
 
     w = bb.declare("late/key")
     w.write(b"here")
     # Same reader object, no re-observe.
     out = reader.read()
-    assert out.status == kickmsg.BlackboardStatus.Ok
+    assert out
     assert out.data == b"here"
 
 
 def test_missing_and_unset_are_distinct(board):
     bb, _ = board
     w = bb.declare("declared/only")
-    assert bb.observe("never/declared").read().status == kickmsg.BlackboardStatus.Missing
-    assert bb.observe("declared/only").read().status == kickmsg.BlackboardStatus.Unset
+    assert bb.observe("never/declared").read().errno == errno.ENOENT
+    assert bb.observe("declared/only").read().errno == errno.ENOMSG
 
 
 def test_declare_twice_from_live_owner_raises(board):
@@ -83,7 +84,7 @@ def test_released_key_keeps_its_value(board):
     w.release()
 
     out = reader.read()
-    assert out.status == kickmsg.BlackboardStatus.Ok
+    assert out
     assert out.data == b"last-known"
     assert reader.owner_alive() is False
 
@@ -96,7 +97,9 @@ def test_value_too_large_is_rejected(board):
     bb, _ = board
     w = bb.declare("k")
     w.write(b"small")
-    assert w.write(b"x" * 4096) is False
+    with pytest.raises(OSError) as oversize:
+        w.write(b"x" * 4096)
+    assert oversize.value.errno == errno.EMSGSIZE
     assert bb.observe("k").read().data == b"small"
 
 
@@ -240,7 +243,7 @@ def test_value_survives_owner_death_and_is_sweepable():
         reader = bb.observe("arm/state")
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            if reader.read().status == kickmsg.BlackboardStatus.Ok:
+            if reader.read():
                 break
             time.sleep(0.02)
         assert reader.read().data == b"survivor"
@@ -250,7 +253,7 @@ def test_value_survives_owner_death_and_is_sweepable():
 
         # The writer is gone; its last value is still there.
         out = reader.read()
-        assert out.status == kickmsg.BlackboardStatus.Ok
+        assert out
         assert out.data == b"survivor"
         assert reader.owner_alive() is False
 
@@ -259,7 +262,7 @@ def test_value_survives_owner_death_and_is_sweepable():
         assert snap.dead_owner_keys == 1
 
         assert diag.blackboard_sweep_stale(name, NS) == 1
-        assert reader.read().status == kickmsg.BlackboardStatus.Missing
+        assert reader.read().errno == errno.ENOENT
     finally:
         if writer.poll() is None:
             writer.send_signal(signal.SIGKILL)
@@ -278,8 +281,10 @@ def test_max_value_size_is_exactly_as_configured(request):
     try:
         assert bb.max_value_size == 128
         w = bb.declare("k")
-        assert w.write(b"x" * 128) is True
-        assert w.write(b"x" * 129) is False
+        w.write(b"x" * 128)
+        with pytest.raises(OSError) as over:
+            w.write(b"x" * 129)
+        assert over.value.errno == errno.EMSGSIZE
     finally:
         kickmsg.Blackboard.unlink(NS, name)
 

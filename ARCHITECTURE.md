@@ -1921,7 +1921,7 @@ resolve the new key and read the previous tenant's bytes.
 
 ```
 t1 = tenancy.load(acquire);  if (t1 != cached_tenancy) -> re-resolve
-v1 = publish.load(acquire);  k = v1 >> 1;  if (k == 0) -> Unset
+v1 = publish.load(acquire);  k = v1 >> 1;  if (k == 0) -> ENOMSG
 len = cell[k & 1].value_len.load(relaxed)
 if (len > value_capacity) { len = value_capacity }   // clamp BEFORE the memcpy
 memcpy(out, cell[k & 1].payload, len)
@@ -1935,9 +1935,37 @@ retry iff  v2 - (v1 & ~1ULL) >= 2 * CELLS_PER_KEY - 1
 
 The unsigned retry predicate is exact for both parities of `v1` and
 cannot overflow on a corrupt word. Retries are **bounded**: after
-`READ_RETRY_BUDGET` attempts the read reports `Busy` rather than
-spinning. `Busy` is transient by construction -- it means a writer
+`READ_RETRY_BUDGET` attempts the read reports `EAGAIN` rather than
+spinning. `EAGAIN` is transient by construction -- it means a writer
 outran the reader, never that anything is broken.
+
+### Errors are standard errno
+
+`Writer::write`, `Writer::release`, `Blackboard::wait` and
+`ReadOutcome::ec` are `std::error_code` over `std::errc`: every outcome
+the blackboard can report already has a standard errno that names it.
+
+| errno | means |
+|---|---|
+| `ENOENT` | no entry for this key |
+| `ENOMSG` | key declared, never written |
+| `EMSGSIZE` | read buffer too small, or written value over `max_value_size` |
+| `EAGAIN` | retry budget exhausted under a hot writer; transient |
+| `EBADMSG` | typed read: the value is not `sizeof(T)` bytes |
+| `EBADF` | default-constructed or moved-from handle |
+| `EPERM` | caller is a `fork()` child; the claim is the parent's |
+| `ENOTRECOVERABLE` | the entry was swept and re-tenanted -- the claim is gone |
+| `EBUSY` | the board lock stayed held for the whole bounded wait |
+| `ETIMEDOUT` | `wait()` returned without `change_seq` moving |
+
+Ignoring the result is the caller's choice: no board invariant depends
+on it.
+
+The Python bindings map the same outcomes onto Python's own standard:
+a failing `write()` or `release()` raises `OSError` with `.errno` set,
+and `ReadOutcome` exposes `.errno` to compare against the stdlib `errno`
+module. `wait()` stays a `bool` there -- a timeout is an ordinary answer,
+not a failure.
 
 **Values are always copied.** There is deliberately no zero-copy view: a
 writer may overwrite the cell mid-read, so unlike `SampleView`'s
@@ -1953,6 +1981,34 @@ to `bb_copy_payload()` -- a `noinline` helper that exists so the
 suppression names one frame and leaves `write()` and `read()` themselves
 checked. The blackboard stress scenario asserts
 that no torn value ever escapes, over hundreds of thousands of reads.
+
+### Listing the board
+
+`Reader` answers "what is under this key". Three calls answer "what keys
+are there": `snapshot()`, `keys()` and `read_all()`.
+
+`snapshot()` is the diagnostic one. It reports ownership -- `owner_pid`,
+`owner_node`, `owner_alive` -- and pays for it twice: it takes the board
+lock, because a takeover rewrites `owner_node` in place with no seqlock
+over those bytes, and it probes liveness with one OS call per active key
+once the lock is dropped.
+
+`keys()` and `read_all()` walk the entry array **unlocked**, running the
+read protocol above over each `Active` entry: `keys()` copies the key,
+`read_all()` copies the key and the value. A key overtaken by its writer
+mid-read is dropped rather than returned torn. `keys()` lists a
+declared-but-never-written key; `read_all()` has no value to return for
+one.
+
+The unlocked walk copies key bytes that `claim_free_slot()` may be
+writing -- the race `bb_key_equals` already carries for
+`Reader::resolve()`. `bb_read_key()` is the `noinline` helper that names
+that one frame for `tests/tsan.supp`; the tenancy re-check after the copy
+discards a torn key.
+
+Neither call is atomic across the board: a key claimed or written during
+the walk may or may not appear. `change_seq()` tells a caller whether the
+board moved under it -- read it first, list, then compare.
 
 ### Key claim and uniqueness
 

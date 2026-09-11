@@ -61,20 +61,6 @@ namespace
         return elapsed_time(nanoseconds{static_cast<int64_t>(updated_at_ns)});
     }
 
-    char const* status_name(blackboard::Status status)
-    {
-        char const* name = "?";
-        switch (status)
-        {
-            case blackboard::Ok:        { name = "Ok";        break; }
-            case blackboard::Missing:   { name = "Missing";   break; }
-            case blackboard::Unset:     { name = "Unset";     break; }
-            case blackboard::Truncated: { name = "Truncated"; break; }
-            case blackboard::Busy:      { name = "Busy";      break; }
-            case blackboard::SizeMismatch: { name = "SizeMismatch"; break; }
-        }
-        return name;
-    }
 }
 
 int main()
@@ -110,7 +96,7 @@ int main()
     ArmState seen{};
     auto     out = state_view.read(seen);
     std::printf("[reader] arm/state -> %s (%s, fault %u, %.1f C) age %.3fs owner_alive=%d\n",
-                status_name(out.status), lifecycle_name(seen.lifecycle),
+                out.ec.message().c_str(), lifecycle_name(seen.lifecycle),
                 seen.fault_code, static_cast<double>(seen.temperature_c),
                 age_of(out.updated_at_ns).count(),
                 static_cast<int>(state_view.owner_alive()));
@@ -118,15 +104,15 @@ int main()
     uint32_t mode = 0;
     out = mode_view.read(mode);
     std::printf("[reader] arm/mode  -> %s (%u) age %.3fs\n",
-                status_name(out.status), mode, age_of(out.updated_at_ns).count());
+                out.ec.message().c_str(), mode, age_of(out.updated_at_ns).count());
     std::printf("[reader] a Subscriber here would have received nothing at all.\n\n");
 
     // --- Two states a topic cannot express --------------------------------
     ArmState ignored{};
     std::printf("[reader] arm/gripper     -> %s   (no writer ever declared it)\n",
-                status_name(hmi_board.observe("arm/gripper").read(ignored).status));
+                hmi_board.observe("arm/gripper").read(ignored).ec.message().c_str());
     std::printf("[reader] arm/calibration -> %s     (declared, never written)\n\n",
-                status_name(hmi_board.observe("arm/calibration").read(ignored).status));
+                hmi_board.observe("arm/calibration").read(ignored).ec.message().c_str());
 
     // --- Change notification, without polling -----------------------------
     // Read the sequence BEFORE acting on the current values, then wait on it:
@@ -145,7 +131,7 @@ int main()
     for (int i = 0; i < 3; ++i)
     {
         uint64_t seq = hmi_board.change_seq();
-        if (hmi_board.wait(seq, 250ms))
+        if (not hmi_board.wait(seq, 250ms))
         {
             state_view.read(seen);
             std::printf("[reader] woke on change: arm/state = %s fault %u\n",
