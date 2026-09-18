@@ -10,6 +10,36 @@
 
 namespace kickmsg
 {
+    namespace
+    {
+        /// Mark the row as being written. The following release fence orders field stores.
+        void open_generation(ParticipantEntry& e)
+        {
+            uint32_t g = e.generation.load(std::memory_order_relaxed);
+            e.generation.store((g + 1) | 1u, std::memory_order_relaxed);
+        }
+
+        /// Mark the row as settled. The caller publishes preceding writes with a fence.
+        void settle_generation(ParticipantEntry& e)
+        {
+            uint32_t g = e.generation.load(std::memory_order_relaxed);
+            e.generation.store((g + 2) & ~1u, std::memory_order_relaxed);
+        }
+    }
+
+    bool acquire_tenancy(ParticipantEntry& e, uint32_t generation)
+    {
+        // An even-to-odd CAS holds the row until its owner settles it.
+        if ((generation & 1u) != 0)
+        {
+            return false;
+        }
+        uint32_t expected = generation;
+        return e.generation.compare_exchange_strong(
+            expected, generation + 1,
+            std::memory_order_acq_rel, std::memory_order_relaxed);
+    }
+
     std::size_t Registry::region_size(uint32_t capacity)
     {
         return sizeof(RegistryHeader)
@@ -18,9 +48,7 @@ namespace kickmsg
 
     std::string Registry::make_shm_name(std::string const& kmsg_namespace)
     {
-        return compose_shm_name(
-            sanitize_shm_component(kmsg_namespace, "namespace"),
-            "registry");
+        return compose_shm_name(sanitize_shm_component(kmsg_namespace, "namespace"), "registry");
     }
 
     RegistryHeader* Registry::header()
@@ -74,19 +102,14 @@ namespace kickmsg
                 {
                     if (h->version != registry::VERSION)
                     {
-                        throw std::runtime_error(
-                            "Registry version mismatch on " + name);
+                        throw std::runtime_error("Registry version mismatch on " + name);
                     }
-                    // capacity is read from shared memory and drives every
-                    // entries[0..capacity) walk; a corrupt value would send
-                    // snapshot()/sweep_stale() off the mapping. Bound it
-                    // (overflow-safe) against the actual segment size.
+                    // Bound the entry array by the mapped size.
                     std::size_t avail = shm.size() - sizeof(RegistryHeader);
                     if (shm.size() < sizeof(RegistryHeader)
                         or h->capacity > avail / sizeof(ParticipantEntry))
                     {
-                        throw std::runtime_error(
-                            "Registry capacity exceeds segment on " + name);
+                        throw std::runtime_error("Registry capacity exceeds segment on " + name);
                     }
                     Registry out;
                     out.name_ = name;
@@ -172,21 +195,19 @@ namespace kickmsg
             for (uint32_t i = 0; i < cap; ++i)
             {
                 uint32_t expected = registry::Free;
-                if (not es[i].state.compare_exchange_strong(
-                        expected, registry::Claiming,
-                        std::memory_order_acq_rel,
-                        std::memory_order_relaxed))
+                if (not es[i].state.compare_exchange_strong(expected, registry::Claiming,
+                        std::memory_order_acq_rel, std::memory_order_relaxed))
                 {
                     continue;
                 }
 
-                // pid_starttime must be written before pid's release-store
-                // so a sweeper's acquire-load of pid sees a matching
-                // starttime.
+                // Mark the row odd before changing fields that a snapshot may still read.
+                open_generation(es[i]);
+                std::atomic_thread_fence(std::memory_order_release);
+
+                // The release-store of pid also publishes pid_starttime.
                 es[i].pid_starttime.store(my_starttime, std::memory_order_relaxed);
                 es[i].pid.store(my_pid, std::memory_order_release);
-
-                es[i].generation.fetch_add(1, std::memory_order_relaxed);
 
                 es[i].channel_type.store(static_cast<uint32_t>(channel_type),
                                          std::memory_order_relaxed);
@@ -202,6 +223,10 @@ namespace kickmsg
                 std::memset(es[i]._padding, 0, sizeof(es[i]._padding));
 
                 es[i].state.store(registry::Active, std::memory_order_release);
+
+                // Publish an even generation only after all fields and state are set.
+                std::atomic_thread_fence(std::memory_order_release);
+                settle_generation(es[i]);
                 return i;
             }
             return INVALID_SLOT;
@@ -212,8 +237,7 @@ namespace kickmsg
         {
             return slot;
         }
-        // Registry full -- sweep dead-pid residue and retry.  Bounded to
-        // avoid livelock when many registrants race on a full registry.
+        // Bound retries when concurrent registrations compete for freed rows.
         for (int attempt = 0; attempt < 3; ++attempt)
         {
             if (sweep_stale() == 0)
@@ -241,12 +265,30 @@ namespace kickmsg
         {
             return;
         }
-        // Fields are intentionally not zeroed: a concurrent snapshot may
-        // still be reading them, and partial zeroing before state=Free
-        // would create torn reads that the seqlock can't catch.  The
-        // next claim overwrites every field.
-        es[slot_index].generation.fetch_add(1, std::memory_order_relaxed);
-        es[slot_index].state.store(registry::Free, std::memory_order_release);
+        auto& e = es[slot_index];
+
+        // Keep descriptive fields for concurrent readers. Clear identity under
+        // Reclaiming and publish Free last, after all metadata writes.
+        uint32_t expected = registry::Active;
+        if (not e.state.compare_exchange_strong(expected, registry::Reclaiming,
+                std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+            return;
+        }
+
+        // Order the state change before clearing identity.
+        std::atomic_thread_fence(std::memory_order_release);
+        open_generation(e);
+        e.pid.store(0, std::memory_order_relaxed);
+        e.pid_starttime.store(0, std::memory_order_relaxed);
+        settle_generation(e);
+
+        // Sweeps skip our Reclaiming hold; publish Free only after all writes.
+        std::atomic_thread_fence(std::memory_order_release);
+        uint32_t retiring = registry::Reclaiming;
+        e.state.compare_exchange_strong(retiring, registry::Free,
+                                        std::memory_order_release,
+                                        std::memory_order_relaxed);
     }
 
     std::vector<Participant> Registry::snapshot() const
@@ -265,6 +307,10 @@ namespace kickmsg
                 continue;
             }
             uint32_t g1 = es[i].generation.load(std::memory_order_acquire);
+            if ((g1 & 1u) != 0)
+            {
+                continue;
+            }
 
             Participant p{};
             p.pid           = es[i].pid.load(std::memory_order_relaxed);
@@ -273,20 +319,11 @@ namespace kickmsg
             p.channel_type  = es[i].channel_type.load(std::memory_order_relaxed);
             p.role          = es[i].role.load(std::memory_order_relaxed);
             p.kind          = es[i].kind.load(std::memory_order_relaxed);
-            p.shm_name.assign(
-                es[i].shm_name,
-                ::strnlen(es[i].shm_name, sizeof(es[i].shm_name)));
-            p.topic_name.assign(
-                es[i].topic_name,
-                ::strnlen(es[i].topic_name, sizeof(es[i].topic_name)));
-            p.node_name.assign(
-                es[i].node_name,
-                ::strnlen(es[i].node_name, sizeof(es[i].node_name)));
+            p.shm_name.assign  (es[i].shm_name,   ::strnlen(es[i].shm_name, sizeof(es[i].shm_name)));
+            p.topic_name.assign(es[i].topic_name, ::strnlen(es[i].topic_name, sizeof(es[i].topic_name)));
+            p.node_name.assign (es[i].node_name,  ::strnlen(es[i].node_name, sizeof(es[i].node_name)));
 
-            // Seqlock recheck.  The fence is load-bearing: an acquire load
-            // only orders later accesses, so without it the relaxed field
-            // reads could be satisfied after g2/s2 (cf. read_seqretry's
-            // smp_rmb).
+            // Keep field reads before the generation and state recheck.
             std::atomic_thread_fence(std::memory_order_acquire);
             uint32_t g2 = es[i].generation.load(std::memory_order_acquire);
             uint32_t s2 = es[i].state.load(std::memory_order_acquire);
@@ -319,10 +356,8 @@ namespace kickmsg
             }
 
             bool alive  = process_exists(p.pid);
-            bool is_pub = (p.role == registry::Publisher
-                        or p.role == registry::Both);
-            bool is_sub = (p.role == registry::Subscriber
-                        or p.role == registry::Both);
+            bool is_pub = (p.role == registry::Publisher  or p.role == registry::Both);
+            bool is_sub = (p.role == registry::Subscriber or p.role == registry::Both);
 
             if (is_pub)
             {
@@ -370,61 +405,59 @@ namespace kickmsg
         for (uint32_t i = 0; i < cap; ++i)
         {
             uint32_t s = es[i].state.load(std::memory_order_acquire);
+            // A Reclaiming owner may still be writing, even with pid == 0.
+            // Sweeps leave these rows alone; a crash can strand the slot.
             if (s != registry::Active and s != registry::Claiming)
             {
                 continue;
             }
-            // Acquire syncs with register_participant's release-store of
-            // pid, so we see a valid pid even while state==Claiming.
-            uint64_t pid = es[i].pid.load(std::memory_order_acquire);
-            if (pid == 0)
+            // Validate that pid and start time belong to the same generation.
+            // The acquire-load of pid pairs with registration's release-store.
+            uint32_t g1           = es[i].generation.load(std::memory_order_acquire);
+            if ((g1 & 1u) != 0)
             {
-                // Registrant hasn't stored its pid yet -- reclaiming here
-                // would race with its pending field writes.
+                // An odd row may belong to a writer or another sweeper.
                 continue;
             }
+            uint64_t pid          = es[i].pid.load(std::memory_order_acquire);
             uint64_t stored_start = es[i].pid_starttime.load(
                                         std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (es[i].generation.load(std::memory_order_acquire) != g1)
+            {
+                continue;  // spliced across a tenancy change
+            }
+
+            if (pid == 0)
+            {
+                // The claimant has not published its identity yet.
+                continue;
+            }
             if (not owner_is_dead(pid, stored_start))
             {
                 continue;
             }
 
-            // Phase 1: CAS to Reclaiming to block concurrent registrants
-            // and close the ABA window on a direct state->Free CAS.
-            uint32_t expected = s;
-            if (not es[i].state.compare_exchange_strong(
-                    expected, registry::Reclaiming,
-                    std::memory_order_acq_rel,
-                    std::memory_order_relaxed))
+            // Acquire only the even generation whose owner was checked.
+            // A changed or already-held generation must fail without touching state.
+            if (not acquire_tenancy(es[i], g1))
             {
                 continue;
             }
 
-            // Re-verify under our exclusive hold.  A full dereg+register
-            // cycle could have slipped in between our initial pid read
-            // and the CAS above.
-            uint64_t post_pid   = es[i].pid.load(std::memory_order_acquire);
-            uint64_t post_start = es[i].pid_starttime.load(
-                                      std::memory_order_relaxed);
-            if (post_pid != pid or post_start != stored_start or
-                not owner_is_dead(post_pid, post_start))
-            {
-                // Restore via CAS, not blind store: a live tenant may
-                // have legitimately dereg'd (state==Free) and a blind
-                // store of `s` would resurrect the slot.
-                uint32_t reclaiming_expected = registry::Reclaiming;
-                es[i].state.compare_exchange_strong(
-                    reclaiming_expected, s,
-                    std::memory_order_release,
-                    std::memory_order_relaxed);
-                continue;
-            }
+            es[i].state.store(registry::Reclaiming, std::memory_order_release);
 
-            // Phase 2: finalize.  Fields are left untouched -- same
-            // reasoning as deregister().
-            es[i].generation.fetch_add(1, std::memory_order_relaxed);
-            es[i].state.store(registry::Free, std::memory_order_release);
+            // The generation is already odd. Clear identity before settling it;
+            // publish Free last so another registrant cannot start during these writes.
+            std::atomic_thread_fence(std::memory_order_release);
+            es[i].pid.store(0, std::memory_order_relaxed);
+            es[i].pid_starttime.store(0, std::memory_order_relaxed);
+            settle_generation(es[i]);
+
+            std::atomic_thread_fence(std::memory_order_release);
+            uint32_t reclaiming = registry::Reclaiming;
+            es[i].state.compare_exchange_strong(reclaiming, registry::Free,
+                                                std::memory_order_release, std::memory_order_relaxed);
             ++freed;
         }
         return freed;

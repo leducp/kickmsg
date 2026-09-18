@@ -21,9 +21,7 @@ using namespace std::chrono;
 
 namespace
 {
-    // CACHE_LINE-aligned heap buffer for the injected-region tests.
-    // posix_memalign is POSIX-only; Windows uses _aligned_malloc, whose
-    // memory MUST be released with _aligned_free (not free()).
+    // Windows aligned allocations must be released with _aligned_free.
     void* aligned_buffer_alloc(std::size_t align, std::size_t size)
     {
 #if defined(_WIN32)
@@ -112,9 +110,7 @@ TEST_F(RegionTest, OpenNonexistentThrows)
 #ifndef _WIN32
 TEST(SharedMemoryTest, TryOpenOnSizeZeroSegmentReturnsFalse)
 {
-    // A creator that did shm_open(O_CREAT) but not yet ftruncate() leaves a
-    // size-0 object. try_open must report not-ready (so create_or_open /
-    // spin_open retry) rather than mmap(., 0, .) -> EINVAL -> throw.
+    // An object created before ftruncate has size zero; opening must retry.
     char const* name = "/kickmsg_test_size0";
     ::shm_unlink(name);
     int fd = ::shm_open(name, O_RDWR | O_CREAT, 0666);
@@ -171,10 +167,7 @@ TEST_F(RegionTest, CreateOrOpenValidatesGeometryOnOpenBranch)
     auto creator = kickmsg::SharedRegion::create_or_open(
         SHM_NAME, kickmsg::channel::PubSub, cfg, "creator");
 
-    // Corrupt a geometry field that config_hash does NOT cover (pool_offset
-    // is computed layout, not a cfg field).  A second create_or_open hits
-    // the open branch with a matching config_hash, so only the geometry
-    // validation can catch it.
+    // Change an offset not covered by config_hash, then exercise the open branch.
     creator.header()->pool_offset = UINT64_MAX;
 
     EXPECT_THROW(
@@ -356,14 +349,10 @@ TEST_F(RegionTest, RepairLockedEntryUnblocksPublishing)
     uint64_t seq = e1.sequence.load(std::memory_order_acquire);
     EXPECT_EQ(seq, kickmsg::seq_skip(1));
 
-    // The repaired entry should have INVALID_SLOT
-    uint32_t slot_idx = e1.slot_idx.load(std::memory_order_acquire);
-    EXPECT_EQ(slot_idx, kickmsg::INVALID_SLOT);
+    // The entry has no slot claim; repair must leave it unchanged.
+    EXPECT_EQ(kickmsg::meta_slot_biased(e1.meta.load(std::memory_order_acquire)), 0u);
 
-    // Now publish enough to wrap around: pos 2, 3, 4, 5
-    // pos=4 wraps to idx=0 and expects prev_seq=1 (pos 0's committed seq) -- OK
-    // pos=5 wraps to idx=1 and expects prev_seq=2 (the repaired seq) -- this
-    // would fail with the old code that stored prev_seq instead of pos+1
+    // Publish positions 2 through 5 to reuse both repaired entries.
     for (int i = 0; i < 4; ++i)
     {
         val = static_cast<uint32_t>(200 + i);
@@ -383,11 +372,8 @@ TEST_F(RegionTest, RepairLockedEntryUnblocksPublishing)
 
 TEST_F(RegionTest, RepairStaleEntryFromCrashedPublisherBeforeCasLock)
 {
-    // Case B: publisher claimed write_pos (fetch_add) but crashed before
-    // CAS-locking the entry.  The entry still has the committed sequence
-    // from the previous wrap.  After more than one full wrap, the entry
-    // is detectably stale (> 1 ring revolution behind) and
-    // repair_locked_entries() should advance it.
+    // Stage a publisher crash after claiming write_pos but before locking.
+    // The entry retains a committed sequence from more than one wrap ago.
 
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = 1;
@@ -413,15 +399,9 @@ TEST_F(RegionTest, RepairStaleEntryFromCrashedPublisherBeforeCasLock)
     auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
     auto* entries = kickmsg::ring_entries(ring);
 
-    // Simulate: a publisher claimed pos=4 (fetch_add) targeting idx=0,
-    // then crashed before the CAS lock.  The entry stays at seq=1.
-    // Advance write_pos past pos=4 by TWO more full wraps so the entry
-    // becomes > 1 wrap stale.
-    // write_pos after the 4 real publishes is 4.  Set it to 4 + 2*cap = 12.
+    // Leave idx 0 at seq 1 and advance write_pos to 12, two wraps ahead.
     ring->write_pos.store(12, std::memory_order_release);
-    // Don't touch entries -- they keep their old sequences.  Entry idx=0
-    // has seq=1, but expected seq at pos=8 (the slot in the scan window)
-    // is 9.  (pos=8 maps to idx=0 because 8 & 3 = 0.)  1 + 4 < 9 -> stale.
+    // The scan sees pos 8 at idx 0; seq 1 is more than one wrap behind seq 9.
 
     auto report = region.diagnose();
     EXPECT_GT(report.locked_entries, 0u)
@@ -450,7 +430,6 @@ TEST_F(RegionTest, RepairStaleEntryFromCrashedPublisherBeforeCasLock)
 TEST_F(RegionTest, RepairLockedEntryAtPositionZero)
 {
     // Edge case: crash at pos=0 where prev_seq was 0.
-    // Old code stored prev_seq=0, new code stores pos+1=1.
 
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = 1;
@@ -472,7 +451,8 @@ TEST_F(RegionTest, RepairLockedEntryAtPositionZero)
     EXPECT_EQ(repaired, 1u);
     EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire),
               kickmsg::seq_skip(0));
-    EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire), kickmsg::INVALID_SLOT);
+    EXPECT_EQ(kickmsg::meta_slot_biased(entries[0].meta.load(std::memory_order_acquire)),
+              0u);
 
     // Publishing should work: pos=1,2,3 use fresh indices, pos=4 wraps to idx=0
     // and expects prev_seq=1 -- matches the repaired value
@@ -661,9 +641,7 @@ TEST_F(RegionTest, ReclaimDeadRingsPreservesInFlight)
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     auto* h = region.header();
 
-    // Dead owner holding a Live ring with a publisher still admitted: the
-    // reclaim must flip state to Free but keep in_flight (so the mid-commit
-    // publisher's fetch_sub can't underflow into the state bits).
+    // Keep in_flight so a late publisher decrement cannot underflow state.
     auto* ring = kickmsg::sub_ring_at(region.base(), h, 0);
     ring->owner_pid.store(0x7fffffff, std::memory_order_release);
     ring->state_flight.store(kickmsg::ring::make_packed(kickmsg::ring::Live, 1),
@@ -873,10 +851,7 @@ TEST_F(RegionTest, SchemaConcurrentClaimsOneWins)
 
 TEST_F(RegionTest, SchemaReaderDuringClaimingReturnsNullopt)
 {
-    // Invariant: schema() must return nullopt unless state == Set.
-    // We force the Claiming state directly (the real transition is too
-    // brief to observe deterministically from another thread) and confirm
-    // readers don't see torn payload bytes.
+    // Stage Claiming directly so the reader cannot race past this state.
     auto cfg    = default_cfg();
     auto region = kickmsg::SharedRegion::create(
                       SHM_NAME, kickmsg::channel::PubSub, cfg);
@@ -901,10 +876,7 @@ TEST_F(RegionTest, SchemaReaderDuringClaimingReturnsNullopt)
 
 TEST_F(RegionTest, SchemaResetRecoversWedgedClaimingState)
 {
-    // Crash scenario: a claimant CAS'd Unset -> Claiming and died before
-    // the release-store of Set.  Every try_claim_schema() caller will
-    // observe Claiming and return false after bounded yields.
-    // reset_schema_claim() is the operator-driven recovery.
+    // Stage a claimant that stopped before publishing Set.
     auto cfg    = default_cfg();
     auto region = kickmsg::SharedRegion::create(
                       SHM_NAME, kickmsg::channel::PubSub, cfg);
@@ -956,9 +928,6 @@ TEST_F(RegionTest, SchemaResetIsNoOpWhenNotClaiming)
 
 TEST_F(RegionTest, SchemaCreateOrOpenIgnoresOpenerSchemaWhenCreatorHadNone)
 {
-    // Separation of concerns, open-branch path: if the creator leaves
-    // schema unset and a later opener passes cfg.schema, that schema is
-    // silently ignored (use try_claim_schema to publish it instead).
     auto cfg = default_cfg();
     // Note: cfg.schema intentionally left empty.
     auto existing = kickmsg::SharedRegion::create(
@@ -977,10 +946,7 @@ TEST_F(RegionTest, SchemaCreateOrOpenIgnoresOpenerSchemaWhenCreatorHadNone)
 
 TEST_F(RegionTest, SchemaCrossHandleObservesClaim)
 {
-    // Mirror the real cross-process flow: one SharedRegion handle claims,
-    // a second SharedRegion handle opened against the same SHM observes
-    // the claim.  This exercises the acquire-load in schema() across
-    // independent mapping handles, not just within a single object.
+    // Use independent mappings to check schema publication.
     auto cfg = default_cfg();
     auto r1  = kickmsg::SharedRegion::create(
                    SHM_NAME, kickmsg::channel::PubSub, cfg);
@@ -1006,9 +972,7 @@ TEST_F(RegionTest, SchemaCrossHandleObservesClaim)
 
 TEST_F(RegionTest, SchemaResetViaSecondHandleAfterCrash)
 {
-    // Mirror the cross-process crash-recovery flow: one handle wedges
-    // (simulated claimant crashed mid-claim), a second handle opened
-    // against the same SHM calls reset_schema_claim().
+    // Recover an abandoned claim through a second mapping.
     auto cfg = default_cfg();
     auto r1  = kickmsg::SharedRegion::create(
                    SHM_NAME, kickmsg::channel::PubSub, cfg);
@@ -1033,9 +997,6 @@ TEST_F(RegionTest, SchemaResetViaSecondHandleAfterCrash)
 
 TEST_F(RegionTest, DiagnoseReportsSchemaStuck)
 {
-    // Wedged Claiming must surface via HealthReport alongside the other
-    // crash-residue indicators so supervisors can detect it on a
-    // routine health-check loop.
     auto cfg    = default_cfg();
     auto region = kickmsg::SharedRegion::create(
                       SHM_NAME, kickmsg::channel::PubSub, cfg);
@@ -1058,9 +1019,6 @@ TEST_F(RegionTest, DiagnoseReportsSchemaStuck)
 
 TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
 {
-    // Separation of concerns: schema presence is orthogonal to channel
-    // geometry, so create_or_open() from a different Config::schema must
-    // NOT trip the config mismatch check.
     auto cfg = default_cfg();
     cfg.schema = make_schema("creator/Type", 1, 0xAA, 0xBB);
 
@@ -1081,9 +1039,7 @@ TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
     EXPECT_STREQ(got->name, "creator/Type");
 }
 
-// -----------------------------------------------------------------------------
 // stats() -- cross-process counter snapshot
-// -----------------------------------------------------------------------------
 
 TEST_F(RegionTest, StatsOnFreshRegionReportsZeros)
 {
@@ -1198,9 +1154,7 @@ TEST_F(RegionTest, StatsPoolFreeTracksAllocations)
     EXPECT_EQ(s.pool_free, cfg.pool_size - 1);
 }
 
-// -----------------------------------------------------------------------------
 // attach_create / attach_open -- caller-provided memory
-// -----------------------------------------------------------------------------
 
 class InjectedRegionTest : public ::testing::Test
 {
@@ -1348,9 +1302,6 @@ TEST_F(InjectedRegionTest, UnlinkOnInjectedRegionIsNoOp)
 
 TEST_F(InjectedRegionTest, AttachOpenRejectsBufferSmallerThanHeader)
 {
-    // A buffer smaller than sizeof(Header) must be rejected BEFORE any
-    // dereference of magic/version/total_size -- otherwise the load is
-    // an out-of-bounds read on hostile or accidentally-small input.
     alignas(kickmsg::CACHE_LINE) std::byte tiny[kickmsg::CACHE_LINE]{};
     static_assert(sizeof(tiny) < sizeof(kickmsg::Header));
 
@@ -1371,9 +1322,6 @@ TEST_F(InjectedRegionTest, MoveLeavesSourceWithNullBase)
 
     auto dst = std::move(src);
     EXPECT_EQ(dst.base(), live_base);
-    // After move, the source must NOT still alias the destination's
-    // live memory -- otherwise base()/header() on the moved-from object
-    // returns a dangling-looking-live pointer instead of nullptr.
     EXPECT_EQ(src.base(), nullptr);
 }
 
@@ -1393,10 +1341,7 @@ TEST_F(InjectedRegionTest, MoveAssignLeavesSourceWithNullBase)
     EXPECT_EQ(src.base(), nullptr);
 }
 
-// Threat-model tests for validate_header_geometry: a kickmsg-stamped
-// buffer always passes; deliberately corrupting any geometry field must
-// fail attach_open with a runtime_error, never let downstream code
-// compute wild pointers.
+// Reject invalid shared-memory geometry before using it for pointer arithmetic.
 class CorruptedHeaderTest : public InjectedRegionTest
 {
 public:
@@ -1523,12 +1468,6 @@ TEST_F(CorruptedHeaderTest, RejectsCreatorNameLenPastTail)
                  std::runtime_error);
 }
 
-// ---------------------------------------------------------------------------
-// Repair theft-safety: a slow-but-alive publisher whose lock is stolen must
-// be detected at its commit CAS (never blind-stored over), a healthy commit
-// must survive the grace pass, and a steal must back off if the entry
-// changes first.
-// ---------------------------------------------------------------------------
 
 #include "kickmsg/os/Time.h"
 
@@ -1558,6 +1497,7 @@ TEST_F(RegionTest, RepairStealsProvenStaleLockAndResumedCommitFails)
     // Stalled holder at pos=4 (idx 0): claimed the position, locked the
     // entry, then was descheduled past commit_timeout.
     ring->write_pos.store(5, std::memory_order_release);
+    uint64_t const claim_before = entries[0].meta.load(std::memory_order_acquire);
     uint64_t expected = 1;
     ASSERT_TRUE(entries[0].sequence.compare_exchange_strong(
         expected, kickmsg::seq_lock(4),
@@ -1567,21 +1507,22 @@ TEST_F(RegionTest, RepairStealsProvenStaleLockAndResumedCommitFails)
     EXPECT_EQ(region.repair_locked_entries(), 1u);
     EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire),
               kickmsg::seq_skip(4));
-    EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire),
-              kickmsg::INVALID_SLOT);
-    EXPECT_EQ(entries[0].payload_len.load(std::memory_order_acquire), 0u);
+    // Keep the predecessor's claim for the next publisher to release.
+    EXPECT_EQ(entries[0].meta.load(std::memory_order_acquire), claim_before);
 
-    // The holder resumes and commits: the CAS from its own lock value must
-    // fail and leave the repaired entry untouched.  The old blind-store
-    // protocol re-stamped the same sequence here -- the torn-entry /
-    // sequence-rewind corruption this protocol exists to prevent.
+    // The resumed holder's commit CAS must fail.
     uint64_t lock_val = kickmsg::seq_lock(4);
     EXPECT_FALSE(entries[0].sequence.compare_exchange_strong(
         lock_val, 5u, std::memory_order_release, std::memory_order_relaxed));
     EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire),
               kickmsg::seq_skip(4));
-    EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire),
-              kickmsg::INVALID_SLOT);
+    EXPECT_EQ(entries[0].meta.load(std::memory_order_acquire), claim_before);
+
+    // Once the next wrap has taken the entry over, the stale holder's
+    // take-over is refused too: its position is no longer the newest here.
+    entries[0].meta.store(kickmsg::meta_pack(8, 3), std::memory_order_release);
+    EXPECT_FALSE(kickmsg::meta_precedes(
+        entries[0].meta.load(std::memory_order_acquire), 4));
 }
 
 TEST_F(RegionTest, RepairGraceSparesInFlightCommit)
@@ -1624,17 +1565,14 @@ TEST_F(RegionTest, RepairGraceSparesInFlightCommit)
         repaired = region.repair_locked_entries();
     });
 
-    // Commit while the repairer sits in its grace sleep: the re-check sees
-    // the value changed and must NOT steal.  (If the repairer is so delayed
-    // that its scan runs after the commit, it finds no candidate and the
-    // assertions below still hold.)
+    // Commit during the grace period; repair must leave the changed entry alone.
     while (not started.load(std::memory_order_acquire))
     {
         kickmsg::yield();
     }
     kickmsg::sleep(10ms);
-    entries[0].slot_idx.store(kickmsg::INVALID_SLOT, std::memory_order_relaxed);
-    entries[0].payload_len.store(0, std::memory_order_relaxed);
+    entries[0].meta.store(kickmsg::meta_pack(4, kickmsg::INVALID_SLOT),
+                          std::memory_order_relaxed);
     uint64_t lock_val = kickmsg::seq_lock(4);
     EXPECT_TRUE(entries[0].sequence.compare_exchange_strong(
         lock_val, 5u, std::memory_order_release, std::memory_order_relaxed));
@@ -1658,13 +1596,194 @@ TEST_F(RegionTest, StealBacksOffWhenEntryChangesFirst)
     auto* entries = kickmsg::ring_entries(ring);
 
     // A repairer observed the lock, but the holder committed first.
-    entries[0].slot_idx.store(3, std::memory_order_relaxed);
-    entries[0].payload_len.store(7, std::memory_order_relaxed);
+    uint64_t const committed = kickmsg::meta_pack(4, 3);
+    entries[0].meta.store(committed, std::memory_order_relaxed);
     entries[0].sequence.store(5, std::memory_order_release);
 
-    EXPECT_FALSE(kickmsg::entry_steal_and_clear(entries[0], 4,
+    EXPECT_FALSE(kickmsg::entry_steal_and_skip(entries[0], 4,
                                                 kickmsg::seq_lock(4)));
     EXPECT_EQ(entries[0].sequence.load(std::memory_order_acquire), 5u);
-    EXPECT_EQ(entries[0].slot_idx.load(std::memory_order_acquire), 3u);
-    EXPECT_EQ(entries[0].payload_len.load(std::memory_order_acquire), 7u);
+    EXPECT_EQ(entries[0].meta.load(std::memory_order_acquire), committed);
+}
+
+// Handles must use their validated geometry after shared header changes.
+TEST_F(RegionTest, HandlesUseAValidatedGeometrySnapshot)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 4;
+    cfg.pool_size         = 8;
+    cfg.max_payload_size  = 8;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher  pub(region);
+
+    uint32_t first = 7;
+    ASSERT_GE(pub.send(&first, sizeof(first)), 0);
+
+    // Change every shared field used for pointer arithmetic.
+    auto* h = region.header();
+    h->pool_offset       = 1;
+    h->slot_stride       = 1ULL << 40;
+    h->sub_rings_offset  = 1;
+    h->sub_ring_stride   = 1ULL << 40;
+    h->pool_size         = UINT32_MAX;
+    h->slot_data_size    = UINT64_MAX;
+    h->sub_ring_capacity = 1ULL << 40;
+    h->sub_ring_mask     = UINT64_MAX;
+    h->max_subs          = UINT32_MAX;
+
+    // Both handles keep working off their own copies.
+    auto sample = sub.try_receive();
+    ASSERT_TRUE(sample.has_value());
+    uint32_t got = 0;
+    std::memcpy(&got, sample->data(), sizeof(got));
+    EXPECT_EQ(got, 7u);
+
+    uint32_t second = 9;
+    ASSERT_GE(pub.send(&second, sizeof(second)), 0);
+    auto view = sub.try_receive_view();
+    ASSERT_TRUE(view.has_value());
+    ASSERT_EQ(view->len(), sizeof(second));
+    std::memcpy(&got, view->data(), sizeof(got));
+    EXPECT_EQ(got, 9u);
+}
+
+TEST_F(RegionTest, CorruptFreeStackHeadFailsAllocationInsteadOfFaulting)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 4;
+    cfg.pool_size         = 8;
+    cfg.max_payload_size  = 8;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Publisher pub(region);
+
+    region.header()->free_top.store(kickmsg::tagged_pack(0, 0xfffffffe),
+                                    std::memory_order_release);
+
+    auto a = pub.allocate();
+    EXPECT_EQ(a.data, nullptr);
+
+    uint32_t value = 1;
+    EXPECT_EQ(pub.send(&value, sizeof(value)), -EAGAIN);
+}
+
+// Resume a stalled writer after a newer writer commits to the same entry.
+TEST_F(RegionTest, StalledPublisherCannotOverwriteANewerEntry)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 1;   // every position lands on the same entry
+    cfg.pool_size         = 8;
+    cfg.max_payload_size  = 8;
+    cfg.commit_timeout    = 1us;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+
+    auto* h       = region.header();
+    auto* ring    = kickmsg::sub_ring_at(region.base(), h, 0);
+    auto& entry   = kickmsg::ring_entries(ring)[0];
+
+    // Publisher A claims pos 0 and locks the entry, then stalls before
+    // taking the metadata over.
+    uint32_t a_slot = kickmsg::treiber_pop(h->free_top, region.base(), h);
+    ASSERT_NE(a_slot, kickmsg::INVALID_SLOT);
+    auto*    a      = kickmsg::slot_at(region.base(), h, a_slot);
+    uint32_t stale  = 111;
+    std::memcpy(kickmsg::slot_data(a), &stale, sizeof(stale));
+    a->payload_len.store(sizeof(stale), std::memory_order_relaxed);
+    a->refcount.store(1, std::memory_order_release);
+    ring->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE, std::memory_order_acq_rel);
+    uint64_t pos      = ring->write_pos.fetch_add(1, std::memory_order_acq_rel);
+    uint64_t expected = 0;
+    ASSERT_TRUE(entry.sequence.compare_exchange_strong(
+        expected, kickmsg::seq_lock(pos),
+        std::memory_order_acquire, std::memory_order_relaxed));
+
+    // A repairer steals the stalled lock, then publisher B commits the next
+    // generation over the same entry.
+    EXPECT_EQ(region.repair_locked_entries(), 1u);
+    kickmsg::Publisher b(region);
+    uint32_t fresh = 222;
+    ASSERT_GE(b.send(&fresh, sizeof(fresh)), 0);
+
+    // A resumes and runs the take-over from Publisher::publish().
+    uint64_t const my_meta  = kickmsg::meta_pack(pos, a_slot);
+    uint64_t       old_meta = entry.meta.load(std::memory_order_acquire);
+    bool           taken    = false;
+    while (kickmsg::meta_precedes(old_meta, pos))
+    {
+        if (entry.meta.compare_exchange_weak(old_meta, my_meta,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            taken = true;
+            break;
+        }
+    }
+    EXPECT_FALSE(taken);
+
+    // B's message is delivered intact.
+    auto sample = sub.try_receive();
+    ASSERT_TRUE(sample.has_value());
+    uint32_t got = 0;
+    std::memcpy(&got, sample->data(), sizeof(got));
+    EXPECT_EQ(got, 222u);
+
+    ring->state_flight.fetch_sub(kickmsg::ring::IN_FLIGHT_ONE, std::memory_order_release);
+}
+
+// Repair must retain the predecessor's claim until its reference is released.
+TEST_F(RegionTest, StealKeepsThePredecessorReleasable)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 1;
+    cfg.pool_size         = 8;
+    cfg.max_payload_size  = 8;
+    cfg.commit_timeout    = 1us;
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto* h    = region.header();
+    auto* ring = kickmsg::sub_ring_at(region.base(), h, 0);
+    auto& entry = kickmsg::ring_entries(ring)[0];
+
+    {
+        kickmsg::Subscriber sub(region);
+        kickmsg::Publisher  pub(region);
+        uint32_t            value = 42;
+        ASSERT_GE(pub.send(&value, sizeof(value)), 0);
+
+        // The published slot is the entry's claim.
+        uint32_t claimed = kickmsg::meta_slot_biased(
+            entry.meta.load(std::memory_order_acquire));
+        ASSERT_NE(claimed, 0u);
+
+        // A publisher claims pos 1 and stalls before its take-over.
+        ring->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
+                                     std::memory_order_acq_rel);
+        uint64_t pos      = ring->write_pos.fetch_add(1, std::memory_order_acq_rel);
+        uint64_t expected = 1;
+        ASSERT_TRUE(entry.sequence.compare_exchange_strong(
+            expected, kickmsg::seq_lock(pos),
+            std::memory_order_acquire, std::memory_order_relaxed));
+
+        EXPECT_EQ(region.repair_locked_entries(), 1u);
+
+        // The steal left the claim intact, so the predecessor is still
+        // reachable for whoever takes the entry over next.
+        EXPECT_EQ(kickmsg::meta_slot_biased(entry.meta.load(std::memory_order_acquire)),
+                  claimed);
+
+        ring->state_flight.fetch_sub(kickmsg::ring::IN_FLIGHT_ONE,
+                                     std::memory_order_release);
+    }
+
+    // Without a crash, all slots must return without orphan recovery.
+    EXPECT_EQ(region.stats().pool_free, cfg.pool_size);
+    EXPECT_EQ(region.reclaim_orphaned_slots(), 0u);
 }

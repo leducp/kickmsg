@@ -7,9 +7,7 @@
 
 namespace kickmsg
 {
-    /// Reservation returned by Publisher::allocate(): a writable pointer
-    /// into shared memory plus the maximum number of bytes the caller may
-    /// write through it.  data == nullptr signals pool exhaustion.
+    /// Writable shared-memory reservation. data == nullptr means pool exhaustion.
     struct Allocation
     {
         void*       data;
@@ -22,7 +20,8 @@ namespace kickmsg
         Publisher(SharedRegion& region, WakeBackend* backend = nullptr)
             : base_{region.base()}
             , header_{region.header()}
-            , commit_timeout_{microseconds{header_->commit_timeout_us}}
+            , geom_{region.geometry()}
+            , commit_timeout_{microseconds{geom_.commit_timeout_us}}
             , pending_slot_{INVALID_SLOT}
             , wake_backend_{backend}
         {
@@ -36,8 +35,10 @@ namespace kickmsg
         Publisher(Publisher&& other) noexcept
             : base_{other.base_}
             , header_{other.header_}
+            , geom_{other.geom_}
             , commit_timeout_{other.commit_timeout_}
             , pending_slot_{other.pending_slot_}
+            , reservation_{other.reservation_}
             , dropped_{other.dropped_}
             , wake_backend_{other.wake_backend_}
         {
@@ -51,8 +52,10 @@ namespace kickmsg
                 release_pending();
                 base_           = other.base_;
                 header_         = other.header_;
+                geom_           = other.geom_;
                 commit_timeout_ = other.commit_timeout_;
                 pending_slot_   = other.pending_slot_;
+                reservation_    = other.reservation_;
                 dropped_        = other.dropped_;
                 wake_backend_   = other.wake_backend_;
                 other.pending_slot_ = INVALID_SLOT;
@@ -60,31 +63,35 @@ namespace kickmsg
             return *this;
         }
 
-        /// Reserve a slot.  Returns {data, max_size}; data is nullptr if
-        /// the pool is exhausted.
+        /// Reserve a slot; data is nullptr if the pool is exhausted.
+        /// Invalidates any previous reservation and returns its slot to the pool.
         Allocation allocate();
 
-        /// Commit the currently reserved slot, recording `len` as the
-        /// payload size.
-        ///
-        /// Returns the number of rings delivered to.  0 means no pending
-        /// allocation, oversized `len` (the pending slot is recycled), or
-        /// zero live subscribers -- indistinguishable by design.
+        /// Current reservation token, or 0 if none. Changes on allocate() and publish().
+        uint64_t reservation_id() const
+        {
+            if (pending_slot_ == INVALID_SLOT)
+            {
+                return 0;
+            }
+            return reservation_;
+        }
+
+        /// Publish len bytes from the current reservation. Returns rings delivered to.
+        /// Returns 0 for no reservation, oversized len, or no live subscribers.
+        /// An oversized len releases the reservation.
         std::size_t publish(std::size_t len);
 
-        /// Allocate, copy, and publish in one call.
-        /// Returns bytes written on success (NOT a delivery count: a
-        /// successful send may have reached zero subscribers), -EMSGSIZE
-        /// if too large, -EAGAIN if pool exhausted.
+        /// Allocate, copy, and publish. Returns bytes written, even with no subscribers,
+        /// -EMSGSIZE if too large, or -EAGAIN if the pool is exhausted.
         int32_t send(void const* data, std::size_t len);
 
         /// Number of per-ring delivery drops (CAS lock contention or pool exhaustion).
         uint64_t dropped() const { return dropped_; }
 
     private:
-        /// Result of waiting for the previous wrap's occupant to commit.
-        /// stable_lock: one lock value spanned the whole timeout window,
-        /// proving its (unique) holder stale -- the steal precondition.
+        /// stable_lock means one lock value persisted for the full timeout,
+        /// allowing recovery to steal that position.
         struct CommitWait
         {
             uint64_t last_seq;
@@ -105,9 +112,15 @@ namespace kickmsg
         bool wake_ring(SubRingHeader* ring);
 
         void*        base_;
+        /// Shared mutable state only (free_top, counters).  Anything that
+        /// drives pointer math comes from geom_; see Geometry.
         Header*      header_;
+        Geometry     geom_;
         microseconds commit_timeout_;
         uint32_t     pending_slot_;
+        /// Monotonic reservation counter; see reservation_id().  Never reset,
+        /// so a stale token can never alias a later reservation.
+        uint64_t     reservation_{0};
         uint64_t     dropped_{0};
         WakeBackend* wake_backend_{nullptr};
     };

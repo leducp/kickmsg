@@ -380,15 +380,23 @@ class AllocatedSlot:
         Release the buffer object that exposes the underlying memory of the object.
         """
 
-    def publish(self) -> int:
+    def publish(self, len: int) -> int:
         """
-        Commit the reserved slot.  Returns the number of rings the sample was delivered to.  After this call, any NEW memoryview(slot) fails with BufferError.
+        Publish len bytes. Returns the number of rings delivered to.
+        Further memoryview(slot) requests raise BufferError.
         """
 
     def __len__(self) -> int: ...
 
     @property
     def published(self) -> bool: ...
+
+    @property
+    def valid(self) -> bool:
+        """False after publish() or another Publisher.allocate().
+
+        Existing buffers cannot be revoked; stop using them before either call.
+        """
 
     def __repr__(self) -> str: ...
 
@@ -400,9 +408,11 @@ class Publisher:
         Copy `data` into a slot and publish (atomic convenience).  Returns the number of bytes written.  Raises ValueError if the message exceeds max_payload_size, BlockingIOError if the slot pool is exhausted, OSError on other failures.
         """
 
-    def allocate(self, len: int) -> AllocatedSlot | None:
+    def allocate(self) -> AllocatedSlot | None:
         """
-        Reserve a slot of `len` bytes and return an AllocatedSlot.  Use memoryview(slot) or numpy.asarray(slot) to fill it in place (zero-copy), then call slot.publish().  Returns None if the pool is exhausted.
+        Reserve a slot, or return None if the pool is exhausted.
+        Fill it through memoryview(slot) or numpy.asarray(slot), then publish(len).
+        Invalidates the previous reservation and its exported buffers.
         """
 
     @property

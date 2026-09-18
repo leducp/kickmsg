@@ -8,10 +8,7 @@
 
 namespace kickmsg
 {
-    /// Runtime snapshot of a single subscriber ring.
-    /// Values are relaxed/acquire-loaded, so the snapshot is internally
-    /// consistent per-ring but may race mildly across rings -- fine for a
-    /// diagnostic view; not intended as a strongly-consistent read.
+    /// Ring diagnostics. Fields may be read at different times during live traffic.
     struct RingStats
     {
         uint32_t state;          ///< ring::State as a raw int (0=Free, 1=Live, 2=Draining, 3=Reclaiming)
@@ -21,9 +18,7 @@ namespace kickmsg
         uint64_t lost_count;     ///< Cumulative subscriber losses on this ring
     };
 
-    /// Aggregate region snapshot returned by SharedRegion::stats().
-    /// Safe to call under live traffic: all reads are relaxed/acquire,
-    /// no writes.
+    /// Read-only region diagnostics, safe during live traffic.
     struct RegionStats
     {
         std::vector<RingStats> rings;   ///< One entry per subscriber-ring slot (length == max_subs)
@@ -36,9 +31,7 @@ namespace kickmsg
         uint64_t pool_size;             ///< Total pool capacity (static)
     };
 
-    /// Static header metadata returned by SharedRegion::info().
-    /// All fields are written once at creation and never mutated, so this
-    /// read is a plain copy of stable bytes.
+    /// Header metadata copied from fields set at creation.
     struct RegionInfo
     {
         std::string   shm_name;
@@ -65,19 +58,17 @@ namespace kickmsg
         SharedRegion(SharedRegion const&) = delete;
         SharedRegion& operator=(SharedRegion const&) = delete;
 
-        // Hand-written move ops so the moved-from object's base_/size_
-        // are reset to a default-constructed state.  A defaulted move
-        // would leave them aliasing the destination's live memory --
-        // base() on the moved-from object would silently return a
-        // dangling-looking-live pointer instead of nullptr.
+        // Clear base_ and size_ in the moved-from object.
         SharedRegion(SharedRegion&& other) noexcept
             : shm_{std::move(other.shm_)}
             , name_{std::move(other.name_)}
             , base_{other.base_}
             , size_{other.size_}
+            , geom_{other.geom_}
         {
             other.base_ = nullptr;
             other.size_ = 0;
+            other.geom_ = Geometry{};
         }
 
         SharedRegion& operator=(SharedRegion&& other) noexcept
@@ -88,8 +79,10 @@ namespace kickmsg
                 name_  = std::move(other.name_);
                 base_  = other.base_;
                 size_  = other.size_;
+                geom_  = other.geom_;
                 other.base_ = nullptr;
                 other.size_ = 0;
+                other.geom_ = Geometry{};
             }
             return *this;
         }
@@ -104,18 +97,12 @@ namespace kickmsg
                                    channel::Config const& cfg,
                                    char const* creator_name = "");
 
-        /// Open an existing region.  When `expected_identity` and the
-        /// stamped identity_hash are both nonzero they must match: a
-        /// mismatch (two logical channels colliding on one shm name)
-        /// throws instead of silently sharing the region.
+        /// Open an existing region. If expected_identity and the stored identity are
+        /// both nonzero, they must match or this throws.
         static SharedRegion open(char const* name, uint64_t expected_identity = 0);
 
-        /// Create the region if it doesn't exist, otherwise open the
-        /// existing one.  On the open branch, cfg.schema is IGNORED --
-        /// schema is orthogonal to channel geometry and doesn't
-        /// participate in the config-hash mismatch check.  Use
-        /// try_claim_schema() afterwards to publish a descriptor
-        /// regardless of which side ended up creating the region.
+        /// Create or open a region. Opening ignores cfg.schema; use try_claim_schema()
+        /// to publish a descriptor. Schema is separate from geometry validation.
         static SharedRegion create_or_open(char const* name, channel::Type type,
                                            channel::Config const& cfg,
                                            char const* creator_name = "");
@@ -159,71 +146,37 @@ namespace kickmsg
         Header*       header()       { return static_cast<Header*>(base_); }
         Header const* header() const { return static_cast<Header const*>(base_); }
 
+        /// Geometry captured after validation; pointer arithmetic uses this local copy.
+        Geometry const& geometry() const { return geom_; }
+
         channel::Type channel_type() const { return header()->channel_type; }
 
         /// The shared-memory name this region was created or opened with.
         /// Empty for a default-constructed SharedRegion (before create/open).
         std::string const& name() const { return name_; }
 
-        /// Read the payload schema descriptor if one has been published.
-        ///
-        /// Returns nullopt when the schema slot is still Unset, or while a
-        /// concurrent claim is mid-write (Claiming).  The library never
-        /// interprets the bytes: callers apply their own mismatch policy
-        /// against the returned SchemaInfo (identity / layout / version /
-        /// name / algo tags).
+        /// Read the published payload schema, or nullopt while Unset or Claiming.
+        /// The caller decides whether the descriptor is compatible.
         std::optional<SchemaInfo> schema() const;
 
-        /// Atomically publish a schema descriptor to the region.
-        ///
-        /// Returns true if this call claimed the slot (Unset -> Claiming ->
-        /// Set), false if some other claimant got there first -- in which
-        /// case the caller should read back with schema() and apply its
-        /// own mismatch policy.  When another claim is mid-write, this
-        /// call briefly yields until the state settles or a small bounded
-        /// budget is exhausted; if the state is still Claiming at that
-        /// point (likely a crashed claimant), this call still returns
-        /// false and the operator should use reset_schema_claim() to
-        /// recover the wedged slot.
-        ///
-        /// Safe under live traffic and across processes; only reachable
-        /// at connect-time scale (not on the hot path).
+        /// Publish a schema with Unset -> Claiming -> Set. Returns true on success.
+        /// If another claim is in progress, wait for a bounded number of yields,
+        /// then return false. Read schema() to check the published descriptor.
+        /// Safe during live traffic. A dead claimant requires reset_schema_claim().
         bool try_claim_schema(SchemaInfo const& info);
 
-        /// Recover a schema slot wedged in the Claiming state by a
-        /// crashed claimant (CAS'd Unset -> Claiming then died before the
-        /// release-store of Set).  Atomically CASes Claiming -> Unset so a
-        /// new claim can proceed; returns true if the reset actually
-        /// happened, false if the state was not Claiming.
-        ///
-        /// NOT safe under live traffic.  Only call after confirming the
-        /// crashed claimant is gone: a slow-but-alive writer could still
-        /// be mid-memcpy into schema_data and would then release-store
-        /// Set, racing a new claim into torn bytes.  Mirrors the safety
-        /// contract of reset_retired_rings() -- a deliberate post-crash
-        /// action, not a routine maintenance call.
+        /// Reset Claiming to Unset after confirming the claimant has stopped.
+        /// Returns true if reset, false if the state was not Claiming.
+        /// Unsafe during an active claim: its writer could overwrite a new claim.
         bool reset_schema_claim();
 
-        /// Read-only health check. Safe under live traffic; does NOT mutate
-        /// the region. Counts locked entries and ring states, and probes
-        /// per-ring owner liveness (a bounded number of cheap OS calls, one
-        /// per occupied ring -- intended for a periodic health timer, not a
-        /// hot path).
+        /// Read-only health check, safe during live traffic. Probes each occupied
+        /// ring's owner; intended for periodic monitoring, not the message path.
         ///
-        /// Supervisor policy:
-        ///  - locked_entries > 0: crash residue, call repair_locked_entries()
-        ///  - retired_rings > 0: safe for reset_retired_rings() after
-        ///    confirming the crashed publisher is gone
-        ///  - draining_rings > 0: usually transient (subscriber tearing down),
-        ///    persistent counts may indicate a stuck teardown
-        ///  - dead_rings > 0: a subscriber holding a Live/Draining ring died;
-        ///    call reclaim_dead_rings() to recover the ring slot
-        ///  - live_rings: normal occupancy
-        ///  - schema_stuck: a claimant is in the Claiming state. This is a
-        ///    point-in-time read, so a healthy in-progress try_claim_schema()
-        ///    can transiently set it -- treat it as advisory and act
-        ///    (reset_schema_claim()) only if it persists AND the claimant is
-        ///    confirmed gone.
+        /// Locked entries can be repaired under live traffic. Retired rings and a
+        /// stuck schema claim require confirmation that their writers have stopped.
+        /// Draining and schema_stuck can be transient; dead_rings identifies owners
+        /// that reclaim_dead_rings() can recover.
         struct HealthReport
         {
             uint32_t locked_entries;   ///< Entries holding a position-tagged lock, or committed >1 wrap stale
@@ -235,91 +188,58 @@ namespace kickmsg
         };
         HealthReport diagnose();
 
-        /// Repair entries left mid-commit by a crashed publisher, committing
-        /// them as skip markers so future publishers wrap past.  Safe under
-        /// live traffic: locks are stolen only after a grace re-check proves
-        /// the holder stale (one commit_timeout, same value), every steal is
-        /// CAS-owned, and a merely-slow publisher detects the theft as a
-        /// drop.  Blocks one commit_timeout when locked entries exist.
-        /// Returns the number of entries repaired.
+        /// Replace stalled commits with skip markers. Safe during live traffic:
+        /// recheck locks after one commit_timeout and steal by CAS. A resumed
+        /// publisher detects the stolen lock and drops its commit.
+        /// Waits one commit_timeout if locks exist; returns entries repaired.
         std::size_t repair_locked_entries();
 
-        /// Reset retired rings (Free | in_flight>0) so new subscribers can
-        /// claim them. These rings were left stuck by a subscriber teardown
-        /// that timed out on a crashed publisher's in_flight.
-        ///
-        /// Only safe after confirming the crashed publisher is gone.
-        /// Unlike repair_locked_entries(), this is a deliberate post-crash
-        /// action, not a routine maintenance call.
-        /// Returns the number of rings reset.
+        /// Reset Free rings with in_flight > 0 so subscribers can reuse them.
+        /// Only call after confirming the admitted publishers have stopped.
+        /// Returns the number reset.
         std::size_t reset_retired_rings();
 
-        /// Reclaim rings whose owner process is provably dead (pid + start
-        /// time checked against the OS); a slow-but-alive subscriber is
-        /// never touched.  Two-phase like Registry::sweep_stale: single-shot
-        /// CAS to Reclaiming, death re-verified under that exclusivity, then
-        /// freed or restored -- safe for concurrent reclaimers; in_flight
-        /// churn just defers a ring to the next call.  in_flight itself is
-        /// preserved (a mid-commit publisher must still fetch_sub), so a
-        /// reclaimed ring may land retired for reset_retired_rings();
-        /// slot refs are recovered by reclaim_orphaned_slots().
-        /// Returns the number of rings reclaimed.
+        /// Reclaim rings with a dead owner, checked by PID and start time.
+        /// CAS to Reclaiming, recheck death, then free or restore the ring.
+        /// Concurrent changes defer a ring to the next call. Preserve in_flight
+        /// for late publisher decrements; remaining counts require reset_retired_rings()
+        /// and remaining slot references require reclaim_orphaned_slots().
+        /// Returns the number reclaimed.
         ///
-        /// Residuals: a subscriber that crashes in the few instructions
-        /// between winning the claim CAS and recording its pid leaves
-        /// owner_pid == 0, which this cannot attribute and so will not
-        /// reclaim.  A reclaimer that crashes mid-pass leaves the ring
-        /// Reclaiming; a later call recovers it (dead owner) or the owner's
-        /// own teardown does (live owner).
+        /// A crash before the owner PID is recorded can strand a ring. A later
+        /// call or owner teardown can recover a ring left at Reclaiming.
         std::size_t reclaim_dead_rings();
 
-        /// Runtime counter snapshot -- safe under live traffic.
-        ///
-        /// Reads the cross-process per-ring counters (`write_pos`,
-        /// `dropped_count`, `lost_count`) plus ring state and an approximate
-        /// pool-free count.  Intended for external monitoring and the CLI's
-        /// `stats` / `watch` subcommands.
-        ///
-        /// Cheap (no syscalls, no locks, a handful of atomic loads) but not a
-        /// strongly-consistent view: individual per-ring values are consistent
-        /// with themselves (sequential loads on one variable), but different
-        /// rings may be read at slightly different instants.  The free-stack
-        /// walk for `pool_free` is bounded by `pool_size` so it can't loop
-        /// forever under racing pushes/pops.
+        /// Read ring counters and an approximate free-slot count under live traffic.
+        /// Uses no locks or syscalls. Fields may be sampled at different times;
+        /// the free-stack walk is bounded by pool_size.
         RegionStats stats() const;
 
         /// Static header snapshot -- geometry + creator metadata.  All
         /// fields are written once at creation, so this is a plain copy.
         RegionInfo info() const;
 
-        /// Reclaim orphaned slots (refcount > 0 but not referenced by any ring entry).
-        /// These are caused by publisher crashes between allocate and publish, or by
-        /// skipped drain on subscriber teardown timeout.
-        ///
-        /// NOT safe under live traffic. Call only when:
-        ///  - all publishers are quiesced (a publisher between refcount pre-set
-        ///    and ring push has rc > 0 with no ring entry yet), AND
-        ///  - no outstanding SampleView exists (a view holds a refcount pin on
-        ///    its slot without any ring entry reference; reclaiming it would free
-        ///    memory still being read).
-        /// Returns the number of slots reclaimed.
+        /// Reclaim slots with no ring claim or free-stack membership.
+        /// Only call with all publishers stopped and no outstanding SampleView: both
+        /// can hold slots without ring entries. Returns the number reclaimed.
         std::size_t reclaim_orphaned_slots();
 
     private:
-        /// Stamp channel geometry, creator metadata, optional schema, and
-        /// finally MAGIC into an already-mapped region.  Shared between
-        /// create() and create_or_open()'s creator branch so the two paths
-        /// never diverge on layout or ordering.
+        /// Initialize the mapped region and publish MAGIC last.
         void stamp_new_region(channel::Type type, channel::Config const& cfg,
                               char const* creator_name, std::size_t total_size,
                               std::size_t sub_rings_offset, std::size_t pool_offset,
                               std::size_t ring_stride,     std::size_t slot_stride,
                               uint16_t    creator_len);
 
+        /// Copy geometry after stamp_new_region() or validate_opened().
+        void capture_geometry();
+
         SharedMemory shm_;
         std::string  name_;
         void*        base_{nullptr};
         std::size_t  size_{0};
+        Geometry     geom_{};
     };
 }
 

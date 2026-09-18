@@ -1,4 +1,7 @@
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include <gtest/gtest.h>
@@ -6,15 +9,14 @@
 #include "kickmsg/Naming.h"
 #include "kickmsg/Node.h"
 #include "kickmsg/Registry.h"
+#include "kickmsg/os/Process.h"
 
 class RegistryTest : public ::testing::Test
 {
 protected:
     static constexpr char const* KMSG_NAMESPACE = "kickmsg_regtest";
 
-    // Mirror Node::make_topic_name / make_broadcast_name so test
-    // expectations match what Node actually composes on every platform
-    // (readable on Linux, hashed on macOS to fit PSHMNAMLEN).
+    // Use the same platform-specific naming rules as Node.
     static std::string topic_shm(char const* topic)
     {
         return kickmsg::compose_shm_name(
@@ -29,8 +31,6 @@ protected:
             "broadcast_" + kickmsg::sanitize_shm_component(channel, "channel"));
     }
 
-    // Mirror Registry::make_shm_name (private) so tests stay aligned with
-    // whatever the Registry actually composes per platform.
     static std::string registry_shm()
     {
         return kickmsg::compose_shm_name(
@@ -151,9 +151,6 @@ TEST_F(RegistryTest, CapacityExhaustionReturnsInvalidSlot)
 
 TEST_F(RegistryTest, VersionMismatchOnSmallerExistingRegionThrows)
 {
-    // Validate the open path still works when the region already exists:
-    // open_or_create should happily attach to an existing compatible
-    // region of a different capacity (capacity is only used on create).
     auto created = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 8);
     EXPECT_EQ(created.capacity(), 8u);
 
@@ -164,9 +161,7 @@ TEST_F(RegistryTest, VersionMismatchOnSmallerExistingRegionThrows)
 
 TEST_F(RegistryTest, OpenRejectsCorruptCapacity)
 {
-    // Establish an 8-slot registry, then corrupt capacity in the raw segment
-    // to far exceed the mapping.  A fresh open must reject it instead of
-    // letting snapshot()/sweep_stale() walk entries past the mapped pages.
+    // Change the stored capacity so the entry array exceeds the mapping.
     auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 8);
 
     kickmsg::SharedMemory raw;
@@ -202,10 +197,7 @@ TEST_F(RegistryTest, SweepStaleRemovesDeadPidEntries)
 
 TEST_F(RegistryTest, SweepStaleReclaimsWedgedClaimingSlot)
 {
-    // A registrant that dies between the Free→Claiming CAS and the
-    // release-store of Active leaves the slot stuck.  sweep_stale must
-    // reclaim it — otherwise the registry leaks capacity on every such
-    // crash.  Simulate by reaching into the raw SHM and patching a slot.
+    // Stage an abandoned claim before identity publication.
     auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
 
     // Fill slot 0 with a legitimate entry.
@@ -235,8 +227,7 @@ TEST_F(RegistryTest, SweepStaleReclaimsWedgedClaimingSlot)
 
 TEST_F(RegistryTest, SweepStaleSkipsClaimingSlotsWithoutPid)
 {
-    // A Claiming slot with pid==0 may be a registrant between CAS and its
-    // first field write.  Reclaiming would race with its stores.  Must skip.
+    // A claim with pid == 0 may still have a live writer.
     auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
 
     auto shm_name = registry_shm();
@@ -258,9 +249,583 @@ TEST_F(RegistryTest, SweepStaleSkipsClaimingSlotsWithoutPid)
                                     std::memory_order_release);
 }
 
-// -----------------------------------------------------------------------------
-// Node integration — Node advertise/subscribe/etc should populate the registry
-// -----------------------------------------------------------------------------
+TEST_F(RegistryTest, SnapshotRejectsARowCaughtMidRetirement)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
+
+    uint32_t slot = reg.register_participant(
+        "/shm", "/topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Publisher, "node");
+    ASSERT_NE(slot, kickmsg::INVALID_SLOT);
+    ASSERT_EQ(reg.snapshot().size(), 1u);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[slot];
+
+    // A settled row carries an even generation.
+    ASSERT_EQ(e.generation.load(std::memory_order_acquire) & 1u, 0u);
+
+    // Pause retirement after clearing pid but before settling generation.
+    e.generation.fetch_add(1, std::memory_order_relaxed);
+    e.pid.store(0, std::memory_order_relaxed);
+    e.pid_starttime.store(0, std::memory_order_relaxed);
+
+    EXPECT_TRUE(reg.snapshot().empty());
+
+    e.pid.store(kickmsg::current_pid(), std::memory_order_relaxed);
+    e.generation.fetch_add(1, std::memory_order_relaxed);
+    auto settled = reg.snapshot();
+    ASSERT_EQ(settled.size(), 1u);
+    EXPECT_NE(settled[0].pid, 0u);
+
+    reg.deregister(slot);
+}
+
+// Keep one row stable while another is repeatedly registered and retired.
+TEST_F(RegistryTest, ConcurrentChurnNeverYieldsAnIncoherentSnapshot)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
+
+    uint32_t stable = reg.register_participant(
+        "/stable", "/stable-topic", kickmsg::channel::PubSub,
+        kickmsg::registry::Pubsub, kickmsg::registry::Publisher, "stable-node");
+    ASSERT_NE(stable, kickmsg::INVALID_SLOT);
+
+    std::atomic<bool>     stop{false};
+    std::atomic<uint64_t> stable_seen{0};
+    std::atomic<uint64_t> zero_pid{0};
+    std::atomic<uint64_t> mixed{0};
+    std::atomic<uint64_t> free_unsettled{0};
+
+    std::thread churn([&]
+    {
+        while (not stop.load(std::memory_order_relaxed))
+        {
+            uint32_t slot = reg.register_participant(
+                "/churn", "/churn-topic", kickmsg::channel::PubSub,
+                kickmsg::registry::Pubsub, kickmsg::registry::Subscriber,
+                "churn-node");
+            if (slot != kickmsg::INVALID_SLOT)
+            {
+                reg.deregister(slot);
+            }
+        }
+    });
+
+    // Check that a stable even Active row has a PID.
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    uint32_t const cap = reinterpret_cast<kickmsg::RegistryHeader*>(
+        raw.address())->capacity;
+
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        for (int spin = 0; spin < 2000; ++spin)
+        {
+            for (uint32_t i = 0; i < cap; ++i)
+            {
+                uint32_t s1 = entries[i].state.load(std::memory_order_acquire);
+                if (s1 != kickmsg::registry::Active)
+                {
+                    continue;
+                }
+                uint32_t g1 = entries[i].generation.load(std::memory_order_acquire);
+                if ((g1 & 1u) != 0)
+                {
+                    continue;
+                }
+                uint64_t pid = entries[i].pid.load(std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                uint32_t g2 = entries[i].generation.load(std::memory_order_acquire);
+                uint32_t s2 = entries[i].state.load(std::memory_order_acquire);
+                if (s2 != kickmsg::registry::Active or g1 != g2)
+                {
+                    continue;
+                }
+                if (pid == 0)
+                {
+                    zero_pid.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            // Free permits a new writer, so its generation must already be even.
+            for (uint32_t i = 0; i < cap; ++i)
+            {
+                uint32_t g1 = entries[i].generation.load(std::memory_order_acquire);
+                uint32_t st = entries[i].state.load(std::memory_order_acquire);
+                if (st != kickmsg::registry::Free)
+                {
+                    continue;
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                uint32_t g2 = entries[i].generation.load(std::memory_order_acquire);
+                if (g1 != g2)
+                {
+                    continue;   // the row moved under us; nothing proven
+                }
+                if ((g1 & 1u) != 0)
+                {
+                    free_unsettled.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        for (auto const& p : reg.snapshot())
+        {
+            if (p.pid == 0)
+            {
+                zero_pid.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            bool const is_stable = p.shm_name == "/stable"
+                               and p.topic_name == "/stable-topic"
+                               and p.node_name == "stable-node"
+                               and p.role == kickmsg::registry::Publisher;
+            bool const is_churn  = p.shm_name == "/churn"
+                               and p.topic_name == "/churn-topic"
+                               and p.node_name == "churn-node"
+                               and p.role == kickmsg::registry::Subscriber;
+            if (is_stable)
+            {
+                stable_seen.fetch_add(1, std::memory_order_relaxed);
+            }
+            else if (not is_churn)
+            {
+                // Fields came from different registrations.
+                mixed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    churn.join();
+
+    EXPECT_EQ(zero_pid.load(), 0u) << "snapshot returned a retired identity";
+    EXPECT_EQ(free_unsettled.load(), 0u)
+        << "a claimable row was published with an unsettled generation";
+    EXPECT_EQ(mixed.load(), 0u)    << "snapshot spliced two tenancies";
+    EXPECT_GT(stable_seen.load(), 0u) << "oracle never saw the stable row";
+
+    reg.deregister(stable);
+}
+
+TEST_F(RegistryTest, RowHandoffBetweenOwnersKeepsEveryTenancyVisible)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+
+    for (int round = 0; round < 64; ++round)
+    {
+        uint32_t slot = reg.register_participant(
+            "/shm", "/topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+            kickmsg::registry::Publisher, "node");
+        ASSERT_NE(slot, kickmsg::INVALID_SLOT) << "round " << round;
+
+        uint32_t gen = entries[0].generation.load(std::memory_order_acquire);
+        EXPECT_EQ(gen & 1u, 0u) << "settled row has an odd generation, round " << round;
+
+        auto rows = reg.snapshot();
+        ASSERT_EQ(rows.size(), 1u) << "registered owner invisible, round " << round;
+        EXPECT_NE(rows[0].pid, 0u);
+
+        reg.deregister(slot);
+        EXPECT_TRUE(reg.snapshot().empty()) << "round " << round;
+        EXPECT_EQ(entries[0].generation.load(std::memory_order_acquire) & 1u, 0u)
+            << "row left odd after retirement, round " << round;
+    }
+}
+
+// Use two rows so registration can proceed without an automatic sweep.
+TEST_F(RegistryTest, ARetiringRowIsNeitherVisibleNorClaimable)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 2);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+
+    uint32_t slot = reg.register_participant(
+        "/retiring", "/retiring-topic", kickmsg::channel::PubSub,
+        kickmsg::registry::Pubsub, kickmsg::registry::Publisher, "retiring-node");
+    ASSERT_EQ(slot, 0u);
+
+    // Pause retirement after clearing identity, before publishing Free.
+    entries[0].state.store(kickmsg::registry::Reclaiming, std::memory_order_release);
+    entries[0].pid.store(0, std::memory_order_relaxed);
+    entries[0].pid_starttime.store(0, std::memory_order_relaxed);
+
+    // Invisible: no Active row with a cleared identity.
+    EXPECT_TRUE(reg.snapshot().empty());
+
+    // Unclaimable: the next registrant must take the OTHER row, not this one.
+    uint32_t next = reg.register_participant(
+        "/next", "/next-topic", kickmsg::channel::PubSub,
+        kickmsg::registry::Pubsub, kickmsg::registry::Subscriber, "next-node");
+    ASSERT_NE(next, kickmsg::INVALID_SLOT);
+    EXPECT_NE(next, slot) << "a retiring row was handed to a second owner";
+
+    auto rows = reg.snapshot();
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].node_name, "next-node");
+    EXPECT_NE(rows[0].pid, 0u);
+    EXPECT_EQ(entries[next].generation.load(std::memory_order_acquire) & 1u, 0u);
+
+    reg.deregister(next);
+}
+
+// Odd abandoned claims remain unavailable because a sweep cannot
+// distinguish them from an active writer or reclaimer.
+TEST_F(RegistryTest, SweepRefusesAnAbandonedOddClaimRatherThanRaceItsHolder)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[0];
+
+    // Died after opening its seqlock and publishing an identity that is gone.
+    e.state.store(kickmsg::registry::Claiming, std::memory_order_release);
+    e.generation.store(1, std::memory_order_relaxed);
+    e.pid_starttime.store(1, std::memory_order_relaxed);
+    e.pid.store(0x3fffffff, std::memory_order_release);
+
+    EXPECT_EQ(reg.sweep_stale(), 0u)
+        << "recovery raced a row whose writer it cannot identify";
+    EXPECT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Claiming);
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire), 1u);
+
+    EXPECT_EQ(reg.register_participant(
+                  "/shm", "/topic", kickmsg::channel::PubSub,
+                  kickmsg::registry::Pubsub, kickmsg::registry::Publisher, "node"),
+              kickmsg::INVALID_SLOT);
+
+    e.state.store(kickmsg::registry::Free, std::memory_order_release);
+    e.generation.store(0, std::memory_order_relaxed);
+}
+
+TEST_F(RegistryTest, SweepLeavesARowHeldByAnotherOwnerAlone)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[0];
+
+    uint32_t slot = reg.register_participant(
+        "/shm", "/topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Publisher, "node");
+    ASSERT_NE(slot, kickmsg::INVALID_SLOT);
+
+    // Mid-retirement: Reclaiming held, identity cleared, Free not yet published.
+    e.state.store(kickmsg::registry::Reclaiming, std::memory_order_release);
+    e.pid.store(0, std::memory_order_relaxed);
+    uint32_t const gen_before = e.generation.load(std::memory_order_acquire);
+
+    EXPECT_TRUE(reg.snapshot().empty()) << "a retiring row must not be visible";
+
+    EXPECT_EQ(reg.sweep_stale(), 0u);
+    EXPECT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Reclaiming);
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire), gen_before);
+
+    EXPECT_EQ(reg.register_participant(
+                  "/other", "/other-topic", kickmsg::channel::PubSub,
+                  kickmsg::registry::Pubsub, kickmsg::registry::Subscriber,
+                  "other-node"),
+              kickmsg::INVALID_SLOT)
+        << "registration recycled a row another owner is still writing";
+    EXPECT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Reclaiming);
+
+    // Let the owner finish; the row comes back on its own.
+    e.pid_starttime.store(0, std::memory_order_relaxed);
+    reg.deregister(slot);
+}
+
+TEST_F(RegistryTest, FullRegistryRegistrationCannotStealAPausedRetirement)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[0];
+
+    uint32_t slot = reg.register_participant(
+        "/old", "/old-topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Publisher, "old-node");
+    ASSERT_NE(slot, kickmsg::INVALID_SLOT);
+
+    // Pause A after clearing pid, before clearing starttime and settling generation.
+    e.state.store(kickmsg::registry::Reclaiming, std::memory_order_release);
+    e.generation.fetch_add(1, std::memory_order_relaxed);   // bracket opened
+    e.pid.store(0, std::memory_order_relaxed);
+
+    // B registers.  The registry is full, so this sweeps.
+    uint32_t b = reg.register_participant(
+        "/new", "/new-topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Subscriber, "new-node");
+    EXPECT_EQ(b, kickmsg::INVALID_SLOT)
+        << "a paused retirement was recycled out from under its owner";
+
+    // Resume A's remaining retirement writes.
+    e.pid_starttime.store(0, std::memory_order_relaxed);
+    e.generation.store((e.generation.load(std::memory_order_relaxed) + 2) & ~1u,
+                       std::memory_order_relaxed);
+    uint32_t retiring = kickmsg::registry::Reclaiming;
+    EXPECT_TRUE(e.state.compare_exchange_strong(retiring, kickmsg::registry::Free,
+                                                std::memory_order_release,
+                                                std::memory_order_relaxed))
+        << "the owner lost its own row";
+
+    // Only now is the row available, with a coherent identity.
+    uint32_t next = reg.register_participant(
+        "/new", "/new-topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Subscriber, "new-node");
+    ASSERT_NE(next, kickmsg::INVALID_SLOT);
+    auto rows = reg.snapshot();
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].node_name, "new-node");
+    EXPECT_NE(rows[0].pid, 0u);
+    EXPECT_NE(rows[0].pid_starttime, 0u)
+        << "a resuming owner zeroed the replacement's start time";
+    reg.deregister(next);
+}
+
+TEST_F(RegistryTest, ASecondSweepCannotTakeARowAlreadyHeldBySweeping)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[0];
+
+    // Pause sweeper A after claiming Reclaiming, before clearing the dead identity.
+    e.pid.store(0x3fffffff, std::memory_order_relaxed);
+    e.pid_starttime.store(1, std::memory_order_relaxed);
+    e.state.store(kickmsg::registry::Reclaiming, std::memory_order_release);
+    uint32_t const gen_before = e.generation.load(std::memory_order_acquire);
+
+    // Sweeper B runs, explicitly and via a full-registry registration.
+    EXPECT_EQ(reg.sweep_stale(), 0u)
+        << "a second sweeper took a row the first one holds";
+    EXPECT_EQ(reg.register_participant(
+                  "/replacement", "/replacement-topic", kickmsg::channel::PubSub,
+                  kickmsg::registry::Pubsub, kickmsg::registry::Publisher,
+                  "replacement-node"),
+              kickmsg::INVALID_SLOT);
+    EXPECT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Reclaiming);
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire), gen_before);
+    EXPECT_EQ(e.pid.load(std::memory_order_acquire), 0x3fffffffu)
+        << "a second sweeper cleared the identity under the first one";
+
+    // A finishes; the row returns to service.
+    e.pid.store(0, std::memory_order_relaxed);
+    e.pid_starttime.store(0, std::memory_order_relaxed);
+    e.state.store(kickmsg::registry::Free, std::memory_order_release);
+}
+
+TEST_F(RegistryTest, AcquireTenancyRefusesAVersionItDidNotValidate)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[0];
+
+    uint32_t first = reg.register_participant(
+        "/old", "/old-topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Publisher, "old-node");
+    ASSERT_NE(first, kickmsg::INVALID_SLOT);
+
+    // A sweeper validated this tenancy and captured its version, then paused.
+    uint32_t const validated = e.generation.load(std::memory_order_acquire);
+    ASSERT_EQ(validated & 1u, 0u);
+
+    // A real handoff: the owner retires, a second live owner takes the row.
+    reg.deregister(first);
+    uint32_t second = reg.register_participant(
+        "/new", "/new-topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Subscriber, "new-node");
+    ASSERT_EQ(second, first) << "the test needs the row to be reused";
+    ASSERT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Active);
+
+    // Try acquisition with the generation saved before the row was reused.
+    EXPECT_FALSE(kickmsg::acquire_tenancy(e, validated))
+        << "a sweeper acquired a tenancy it never looked at";
+    EXPECT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Active);
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire) & 1u, 0u)
+        << "a refused acquisition left the row marked in flux";
+
+    reg.deregister(second);
+    EXPECT_TRUE(reg.snapshot().empty()) << "deregistration was silently dropped";
+    uint32_t reuse = reg.register_participant(
+        "/reuse", "/reuse-topic", kickmsg::channel::PubSub,
+        kickmsg::registry::Pubsub, kickmsg::registry::Publisher, "reuse-node");
+    EXPECT_NE(reuse, kickmsg::INVALID_SLOT) << "registry capacity leaked";
+    reg.deregister(reuse);
+}
+
+TEST_F(RegistryTest, AcquireTenancySucceedsOnceForTheValidatedVersion)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[0];
+
+    uint32_t slot = reg.register_participant(
+        "/shm", "/topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Publisher, "node");
+    ASSERT_NE(slot, kickmsg::INVALID_SLOT);
+
+    uint32_t const validated = e.generation.load(std::memory_order_acquire);
+    EXPECT_TRUE(kickmsg::acquire_tenancy(e, validated));
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire) & 1u, 1u)
+        << "an acquired row must read as in flux";
+
+    // A second caller holding the same validated version loses.
+    EXPECT_FALSE(kickmsg::acquire_tenancy(e, validated));
+
+    // Put the row back the way sweep_stale's phase 2 would.
+    e.pid.store(0, std::memory_order_relaxed);
+    e.pid_starttime.store(0, std::memory_order_relaxed);
+    uint32_t g = e.generation.load(std::memory_order_relaxed);
+    e.generation.store((g + 2) & ~1u, std::memory_order_relaxed);
+    e.state.store(kickmsg::registry::Free, std::memory_order_release);
+}
+
+TEST_F(RegistryTest, AcquireTenancyRefusesAVersionAnotherAcquirerIsHolding)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[0];
+
+    uint32_t slot = reg.register_participant(
+        "/shm", "/topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Publisher, "node");
+    ASSERT_NE(slot, kickmsg::INVALID_SLOT);
+
+    // Pause A before publishing Reclaiming; only its odd generation marks the hold.
+    uint32_t const validated = e.generation.load(std::memory_order_acquire);
+    ASSERT_TRUE(kickmsg::acquire_tenancy(e, validated));
+    uint32_t const held = e.generation.load(std::memory_order_acquire);
+    ASSERT_EQ(held & 1u, 1u);
+    ASSERT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Active);
+
+    // B reads that new version and must be refused.
+    EXPECT_FALSE(kickmsg::acquire_tenancy(e, held))
+        << "a second acquirer took the version the first one is holding";
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire), held)
+        << "a refused acquisition moved the version";
+
+    // Nor may a real sweep take it, however dead the row's identity looks.
+    e.pid.store(0x3fffffff, std::memory_order_relaxed);
+    e.pid_starttime.store(1, std::memory_order_relaxed);
+    EXPECT_EQ(reg.sweep_stale(), 0u)
+        << "sweep_stale acquired a row another recoverer holds";
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire), held);
+
+    // A settles its own reclamation.
+    e.state.store(kickmsg::registry::Reclaiming, std::memory_order_release);
+    e.pid.store(0, std::memory_order_relaxed);
+    e.pid_starttime.store(0, std::memory_order_relaxed);
+    e.generation.store((held + 2) & ~1u, std::memory_order_relaxed);
+    e.state.store(kickmsg::registry::Free, std::memory_order_release);
+}
+
+TEST_F(RegistryTest, SweepsConcurrentWithChurnNeverLeakCapacity)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 2);
+
+    std::atomic<bool>     stop{false};
+    std::atomic<uint64_t> lost{0};
+    std::atomic<uint64_t> cycles{0};
+
+    std::thread sweeper([&]
+    {
+        while (not stop.load(std::memory_order_relaxed))
+        {
+            // All owners are alive; no row should be reclaimed.
+            if (reg.sweep_stale() != 0)
+            {
+                lost.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        uint32_t slot = reg.register_participant(
+            "/churn", "/churn-topic", kickmsg::channel::PubSub,
+            kickmsg::registry::Pubsub, kickmsg::registry::Publisher, "churn-node");
+        if (slot == kickmsg::INVALID_SLOT)
+        {
+            lost.fetch_add(1, std::memory_order_relaxed);
+            break;   // capacity leaked: a deregistration was dropped earlier
+        }
+        reg.deregister(slot);
+        cycles.fetch_add(1, std::memory_order_relaxed);
+    }
+    stop.store(true, std::memory_order_relaxed);
+    sweeper.join();
+
+    EXPECT_EQ(lost.load(), 0u)
+        << "a sweep reclaimed a live row or a deregistration was dropped";
+    EXPECT_GT(cycles.load(), 0u);
+    EXPECT_TRUE(reg.snapshot().empty());
+}
+
+TEST_F(RegistryTest, DeregisterIsANoOpOnARowItNoLongerHolds)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+
+    uint32_t slot = reg.register_participant(
+        "/shm", "/topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+        kickmsg::registry::Publisher, "node");
+    ASSERT_NE(slot, kickmsg::INVALID_SLOT);
+
+    reg.deregister(slot);
+    ASSERT_EQ(entries[0].state.load(std::memory_order_acquire),
+              kickmsg::registry::Free);
+    uint32_t const settled = entries[0].generation.load(std::memory_order_acquire);
+
+    // Second call: the row is Free, so nothing may move.
+    reg.deregister(slot);
+    EXPECT_EQ(entries[0].state.load(std::memory_order_acquire),
+              kickmsg::registry::Free);
+    EXPECT_EQ(entries[0].generation.load(std::memory_order_acquire), settled);
+}
+
+// Node integration -- Node advertise/subscribe/etc should populate the registry
 
 TEST_F(RegistryTest, NodeAdvertiseRegistersPublisher)
 {
@@ -310,8 +875,6 @@ TEST_F(RegistryTest, NodeBroadcastRegistersBoth)
 
 TEST_F(RegistryTest, NodeAdvertiseThenSubscribeUpgradesToBoth)
 {
-    // A Node that both advertises and subscribes to the same topic should
-    // appear once in the registry with role=Both (not two entries).
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = 2;
     cfg.sub_ring_capacity = 4;
@@ -361,9 +924,7 @@ TEST_F(RegistryTest, MultipleNodesEachAppearOnce)
     EXPECT_TRUE(nodes.count("sub_b"));
 }
 
-// -----------------------------------------------------------------------------
-// list_topics — topic-centric aggregation
-// -----------------------------------------------------------------------------
+// list_topics -- topic-centric aggregation
 
 TEST_F(RegistryTest, ListTopicsGroupsByShmName)
 {

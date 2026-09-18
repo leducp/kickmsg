@@ -1,17 +1,6 @@
 /// @file stall_repair_test.cc
-/// @brief False-positive-death fuzz test for the theft-safe commit protocol.
-///
-/// A child publisher is SIGSTOPped at random instants, so it sometimes
-/// freezes while holding a position-tagged entry lock.  With a tight
-/// commit_timeout the stall makes the lock "provably stale": an external
-/// repairer (the parent) runs repair_locked_entries() during the stall and
-/// steals the entry.  The publisher is then SIGCONTed and resumes.
-///
-/// The theft guard + CAS commit in Publisher::publish() must turn every
-/// such steal into a clean publisher drop:
-///   - never a torn payload (magic/checksum validated on every sample),
-///   - never a per-publisher sequence rewind (seq strictly increasing),
-///   - never refcount corruption (structural pool checks at the end).
+/// Pause child publishers with SIGSTOP, repair their locks, then resume them.
+/// Check payloads, sequence order, and pool references after lock theft.
 
 #include <atomic>
 #include <cerrno>
@@ -50,10 +39,7 @@ static uint32_t compute_checksum(StallPayload const& p)
     return p.magic ^ p.pub_id ^ p.seq ^ 0xDEADBEEF;
 }
 
-// --- Seeded stall-timing fuzzer ---------------------------------------------
-// Each SIGSTOP fires at a random instant so a long soak explores new stall
-// windows instead of re-hitting a fixed schedule.  The seed is logged at
-// startup; set KICKMSG_STALL_SEED to replay a specific run.
+// Randomize stall timing. Set KICKMSG_STALL_SEED to replay a logged seed.
 namespace
 {
     uint64_t g_rng_state = 0;
@@ -116,9 +102,7 @@ static pid_t checked_fork(char const* site)
 /// increasing seq in a tight loop until SIGTERM flips the stop flag.
 static void child_publisher_main()
 {
-    // Replace the inherited shm-cleanup SIGTERM handler: the parent still
-    // uses the segment, so the child must convert SIGTERM into a clean loop
-    // exit instead of unlinking the region out from under it.
+    // The child must not unlink shared memory still used by the parent.
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = child_stop_handler;
@@ -439,9 +423,8 @@ int main(int argc, char** argv)
     steals += region.repair_locked_entries();
     std::size_t const reclaimed = region.reclaim_orphaned_slots();
 
-    // Each steal can orphan at most one slot ref (entry_steal_and_clear
-    // deliberately leaks the displaced reference); more reclaims than
-    // steals means the normal path leaked.
+    // Repair preserves slot claims. Only terminated publishers can orphan
+    // references; more reclaims than steals indicates a normal-path leak.
     std::printf("  Reclaimed slots: %zu (steal budget %" PRIu64 ")\n", reclaimed, steals);
     if (reclaimed > steals)
     {
