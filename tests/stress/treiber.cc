@@ -16,7 +16,7 @@ bool run_treiber_stress()
         shm_name, kickmsg::channel::PubSub, cfg, "treiber");
 
     auto* base = region.base();
-    auto* hdr  = region.header();
+    auto* header  = region.header();
 
     constexpr int    NUM_THREADS = 8;
     int const        CYCLES      = 100000 / TSAN_SCALE;
@@ -26,7 +26,7 @@ bool run_treiber_stress()
     {
         for (int i = 0; i < CYCLES; ++i)
         {
-            uint32_t idx = kickmsg::treiber_pop(hdr->free_top, base, hdr);
+            uint32_t idx = kickmsg::treiber_pop(header->free_top, base, region.geometry());
             if (idx == kickmsg::INVALID_SLOT)
             {
                 contention_hits.fetch_add(1);
@@ -35,11 +35,11 @@ bool run_treiber_stress()
                 continue;
             }
 
-            auto* slot = kickmsg::slot_at(base, hdr, idx);
+            auto* slot = kickmsg::slot_at(base, region.geometry(), idx);
             auto* data = kickmsg::slot_data(slot);
             std::memset(data, static_cast<int>(idx & 0xFF), cfg.max_payload_size);
 
-            kickmsg::treiber_push(hdr->free_top, slot, idx);
+            kickmsg::treiber_push(header->free_top, slot, idx);
         }
     };
 

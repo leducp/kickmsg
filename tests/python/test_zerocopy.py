@@ -5,7 +5,9 @@ Both paths use the Python buffer protocol:
   - `memoryview(view)`  → read-only view into the subscriber-pinned SHM slot
 The memoryview pins its source object alive (Py_buffer::obj + Py_INCREF),
 so retaining a memoryview past the Python reference to slot/view keeps the
-underlying shared memory valid until the last memoryview is released.
+mapping alive until the last memoryview is released.  It does not keep a
+reservation valid: a writable view outlives publish() or the next allocate()
+only as a dangling pointer into a recycled slot.
 """
 
 from __future__ import annotations

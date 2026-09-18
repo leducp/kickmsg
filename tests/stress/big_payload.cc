@@ -53,37 +53,37 @@ namespace
             return false;
         }
 
-        BigHeader hdr;
-        std::memcpy(&hdr, data, sizeof(hdr));
+        BigHeader header;
+        std::memcpy(&header, data, sizeof(header));
 
-        if (hdr.magic != BigHeader::MAGIC
-            or hdr.pub_id >= static_cast<uint32_t>(NUM_PUBS)
-            or hdr.byte_count != BIG_BODY_SIZE)
+        if (header.magic != BigHeader::MAGIC
+            or header.pub_id >= static_cast<uint32_t>(NUM_PUBS)
+            or header.byte_count != BIG_BODY_SIZE)
         {
             std::fprintf(stderr, "  [FAIL] sub%d (%s): bad header (magic=%08x pub=%u bytes=%u)\n",
-                         sub_id, pass_label, hdr.magic, hdr.pub_id, hdr.byte_count);
+                         sub_id, pass_label, header.magic, header.pub_id, header.byte_count);
             return false;
         }
 
         uint8_t const* body = data + sizeof(BigHeader);
         for (std::size_t i = 0; i < BIG_BODY_SIZE; ++i)
         {
-            if (body[i] != pattern_byte(hdr.pub_id, hdr.seq, i))
+            if (body[i] != pattern_byte(header.pub_id, header.seq, i))
             {
                 std::fprintf(stderr, "  [FAIL] sub%d (%s): torn body at byte %zu "
                              "(pub %u seq %u: got %02x, want %02x)\n",
-                             sub_id, pass_label, i, hdr.pub_id, hdr.seq,
-                             body[i], pattern_byte(hdr.pub_id, hdr.seq, i));
+                             sub_id, pass_label, i, header.pub_id, header.seq,
+                             body[i], pattern_byte(header.pub_id, header.seq, i));
                 return false;
             }
         }
 
         uint64_t sum = kickmsg::hash::fnv1a_64(body, BIG_BODY_SIZE);
-        if (sum != hdr.checksum)
+        if (sum != header.checksum)
         {
             std::fprintf(stderr, "  [FAIL] sub%d (%s): checksum mismatch "
                          "(pub %u seq %u: got %016" PRIx64 ", want %016" PRIx64 ")\n",
-                         sub_id, pass_label, hdr.pub_id, hdr.seq, sum, hdr.checksum);
+                         sub_id, pass_label, header.pub_id, header.seq, sum, header.checksum);
             return false;
         }
         return true;
@@ -92,17 +92,17 @@ namespace
     void check_reorder(uint8_t const* data, std::vector<uint32_t>& last_seq, BigSubStats& stats,
                        int sub_id)
     {
-        BigHeader hdr;
-        std::memcpy(&hdr, data, sizeof(hdr));
-        auto& prev = last_seq[hdr.pub_id];
-        if (prev != UINT32_MAX and hdr.seq <= prev)
+        BigHeader header;
+        std::memcpy(&header, data, sizeof(header));
+        auto& prev = last_seq[header.pub_id];
+        if (prev != UINT32_MAX and header.seq <= prev)
         {
             std::fprintf(stderr, "  [FAIL] sub%d: pub %u seq %u after seq %u (reorder)\n",
-                         sub_id, hdr.pub_id, hdr.seq, prev);
+                         sub_id, header.pub_id, header.seq, prev);
             ++stats.reordered;
             return;
         }
-        prev = hdr.seq;
+        prev = header.seq;
         ++stats.received;
     }
 }
@@ -148,13 +148,13 @@ bool run_big_payload()
                 body[b] = pattern_byte(static_cast<uint32_t>(pub_id), i, b);
             }
 
-            BigHeader hdr;
-            hdr.magic      = BigHeader::MAGIC;
-            hdr.pub_id     = static_cast<uint32_t>(pub_id);
-            hdr.seq        = i;
-            hdr.byte_count = static_cast<uint32_t>(BIG_BODY_SIZE);
-            hdr.checksum   = kickmsg::hash::fnv1a_64(body, BIG_BODY_SIZE);
-            std::memcpy(buf.data(), &hdr, sizeof(hdr));
+            BigHeader header;
+            header.magic      = BigHeader::MAGIC;
+            header.pub_id     = static_cast<uint32_t>(pub_id);
+            header.seq        = i;
+            header.byte_count = static_cast<uint32_t>(BIG_BODY_SIZE);
+            header.checksum   = kickmsg::hash::fnv1a_64(body, BIG_BODY_SIZE);
+            std::memcpy(buf.data(), &header, sizeof(header));
 
             int32_t rc;
             while ((rc = pub.send(buf.data(), buf.size())) < 0)

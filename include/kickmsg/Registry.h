@@ -15,11 +15,9 @@ namespace kickmsg
 {
     namespace registry
     {
-        constexpr uint32_t VERSION          = 3;
+        constexpr uint32_t VERSION          = 4;
         constexpr uint64_t MAGIC            = 0x214745524B43494BULL; // "KICKREG!"
-        // Supports up to ~200-400 topics with a few participants each,
-        // plus headroom for transient tasks.  4096 × 512 B = 2 MB per
-        // namespace.
+        // 4096 entries use 2 MB per namespace.
         constexpr uint32_t DEFAULT_CAPACITY = 4096;
         constexpr std::size_t SHM_NAME_MAX   = 128;
         constexpr std::size_t TOPIC_NAME_MAX = 128;
@@ -32,14 +30,8 @@ namespace kickmsg
             Both       = 3,  ///< Node is both producer and consumer on this channel
         };
 
-        /// What the channel is used for, from the user-facing API's point
-        /// of view.  channel_type (in types.h) is the low-level ring
-        /// geometry (PubSub vs Broadcast); Kind distinguishes Mailbox
-        /// from PubSub even though both share channel::PubSub geometry.
-        /// Open enum: new kinds are added without a registry::VERSION bump
-        /// (the field is a uint32_t, so no offset moves).  Readers MUST
-        /// tolerate an unknown value -- never switch exhaustively without a
-        /// default.
+        /// Logical channel kind; Mailbox and Pubsub share PubSub ring geometry.
+        /// Readers must tolerate unknown values. New kinds do not change the layout.
         enum Kind : uint32_t
         {
             Pubsub     = 1,
@@ -48,9 +40,8 @@ namespace kickmsg
             Blackboard = 4,
         };
 
-        /// Only `Active` slots are visible to snapshot readers.
-        /// `Reclaiming` is the exclusive lock held by `sweep_stale` to
-        /// prevent ABA on the state CAS.
+        /// Snapshots include only Active rows with a stable even generation.
+        /// Reclaiming rows are unavailable to registrants and sweepers.
         enum SlotState : uint32_t
         {
             Free       = 0,
@@ -60,18 +51,17 @@ namespace kickmsg
         };
     }
 
-    /// In-SHM entry, 512 B.  Readers go through `Registry::snapshot()`.
-    /// Scalar fields are atomic so a snapshot reader racing with a new-
-    /// tenant writer never hits a C++ data race; the seqlock (generation
-    /// + state) discards torn copies.  Do not reorder fields without
-    /// bumping `registry::VERSION`.
+    /// Shared-memory entry, 512 bytes. Use Registry::snapshot() to read it.
+    /// Scalar fields are atomic; generation and state detect changes during a copy.
+    /// Changing the layout requires a registry::VERSION bump.
     struct ParticipantEntry
     {
         std::atomic<uint32_t> state;
         std::atomic<uint32_t> channel_type;
         std::atomic<uint32_t> role;
         std::atomic<uint32_t> kind;
-        std::atomic<uint32_t> generation;     ///< seqlock version, bumped on every mutation
+        /// Even means settled; odd means a writer or sweeper holds the row.
+        std::atomic<uint32_t> generation;
         std::atomic<uint64_t> pid;            ///< release/acquire-accessed; inspected while state==Claiming
         std::atomic<uint64_t> pid_starttime;  ///< OS-reported start time, or 0 if unavailable
         std::atomic<uint64_t> created_at_ns;
@@ -84,6 +74,12 @@ namespace kickmsg
         "ParticipantEntry layout is part of the registry ABI");
     static_assert(offsetof(ParticipantEntry, _padding) == 368,
         "ParticipantEntry field offsets must match expected 368 B prefix");
+
+    /// CAS the validated even generation to odd to acquire the row.
+    /// Returns false without changes if the version differs or is already odd.
+    /// The caller must verify owner death before acquisition.
+    /// Odd rows left by a crash remain unavailable to live recovery.
+    bool acquire_tenancy(ParticipantEntry& e, uint32_t generation);
 
     /// Plain copyable snapshot of one participant.
     struct Participant
@@ -99,10 +95,8 @@ namespace kickmsg
         std::string node_name;
     };
 
-    /// Topic-centric grouping of registry entries: all participants on
-    /// one shm_name, split by role (producer / consumer) and by pid
-    /// liveness (alive / stall).  A Role::Both participant appears in
-    /// both producers and consumers.
+    /// Participants grouped by shm_name, role, and process liveness.
+    /// Role::Both appears in both producer and consumer lists.
     struct TopicSummary
     {
         std::string              shm_name;
@@ -139,13 +133,13 @@ namespace kickmsg
         Registry& operator=(Registry&&) noexcept = default;
 
         /// `capacity` is only used on the create branch; an existing
-        /// registry keeps its creator's capacity.
+        /// registry keeps its creator's capacity. Throws VersionMismatch on an
+        /// existing registry from another kickmsg build.
         static Registry open_or_create(std::string const& kmsg_namespace,
                                        uint32_t capacity = registry::DEFAULT_CAPACITY);
 
-        /// Returns nullopt if the region doesn't exist.  For read-only
-        /// tools that must not create a 2 MB SHM as a side effect of
-        /// inspection.  Throws on version mismatch.
+        /// Open without creating a region. Returns nullopt if absent; throws
+        /// VersionMismatch on a registry from another kickmsg build.
         static std::optional<Registry> try_open(std::string const& kmsg_namespace);
 
         static void unlink(std::string const& kmsg_namespace);
@@ -159,7 +153,8 @@ namespace kickmsg
                                       registry::Role     role,
                                       std::string const& node_name);
 
-        /// Idempotent — `INVALID_SLOT` or already-Free slots are no-ops.
+        /// Retire a slot still owned by the caller. INVALID_SLOT and non-Active
+        /// rows are ignored. A stale index can retire a replacement owner.
         void deregister(uint32_t slot_index);
 
         /// Copy of all `Active` entries.  Does not filter by process
@@ -172,8 +167,12 @@ namespace kickmsg
         /// Results are sorted by shm_name for stable output.
         std::vector<TopicSummary> list_topics() const;
 
-        /// CAS-resets `Active` slots whose `pid` no longer exists.
-        /// Returns the number of slots freed.
+        /// Reclaim even-generation Active or Claiming rows whose owner is dead.
+        /// Returns the number freed. Safe during live registration and concurrent sweeps.
+        ///
+        /// Odd generations and Reclaiming rows are skipped because their holder may
+        /// still be writing. A crash in either state can strand a slot until the
+        /// registry is replaced; live sweeping cannot safely recover it.
         uint32_t sweep_stale();
 
         std::string const& name() const { return name_; }
@@ -192,6 +191,7 @@ namespace kickmsg
 
         SharedMemory shm_;
         std::string  name_;
+        uint32_t     capacity_{0};  ///< Validated at open; the shared header copy is peer-writable
     };
 }
 

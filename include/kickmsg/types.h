@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
 
 namespace kickmsg
@@ -20,23 +21,30 @@ namespace kickmsg
     static_assert(std::atomic<uint32_t>::is_always_lock_free,
         "Kickmsg requires lock-free 32-bit atomics.");
 
+    /// A shared-memory object was stamped by an incompatible kickmsg build.
+    /// Fatal by design: one namespace cannot mix versions.
+    class VersionMismatch : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
-    constexpr uint32_t    VERSION         = 8;
+    constexpr uint32_t    VERSION         = 9;
     constexpr uint32_t    INVALID_SLOT    = UINT32_MAX;
     constexpr std::size_t CACHE_LINE      = 64;
 
-    // ---- Entry sequence-word encoding ----
+    /// Entry::meta stores slot + 1 in 24 bits; zero means no slot.
+    constexpr uint64_t    MAX_POOL_SIZE   = (1ULL << 24) - 2;
+
+    // [tag:2 | pos:62]
+    //   00: committed, pos + 1
+    //   01: skip marker, pos + 1; no payload, but the slot claim remains valid
+    //   10: publisher lock at pos
+    //   11: repairer lock at pos
     //
-    //   [tag:2 | pos:62]   00 -> committed (word is pos + 1)
-    //                      01 -> skip marker (word carries pos + 1; metadata untrustworthy)
-    //                      10 -> locked by the publisher at `pos`
-    //                      11 -> stolen by a repairer at `pos`
-    //
-    // Lock values are unique (one publisher per position, locks once), so an
-    // unchanged lock across an interval proves one holder spanned it -- the
-    // staleness proof repair relies on.  Stolen entries commit the skip tag:
-    // the stolen-from publisher's plain metadata stores can land at any later
-    // time, so nothing may ever trust slot_idx/payload_len under it.
+    // Each position has one publisher. An unchanged lock across the grace
+    // period can be stolen. Readers count skip markers as lost samples.
     constexpr uint64_t SEQ_LOCK_BIT   = 1ULL << 63;
     constexpr uint64_t SEQ_REPAIR_BIT = 1ULL << 62;
 
@@ -50,39 +58,14 @@ namespace kickmsg
     constexpr uint64_t seq_skip(uint64_t pos)      { return SEQ_REPAIR_BIT | (pos + 1); }
     constexpr uint64_t seq_pos(uint64_t seq)       { return seq & (SEQ_REPAIR_BIT - 1); }
 
-    // A healthy commit (memcpy + atomic release-store) finishes in a few
-    // microseconds; even under moderate CAS contention it stays well under
-    // a millisecond.  10 ms is therefore ~1000× a normal commit -- enough
-    // to absorb routine preemption without falsely evicting a live
-    // publisher, while still recovering from a real crash fast enough to
-    // avoid stalling subscribers.  Applications running under severe
-    // oversubscription (threads ≫ cores) may want to raise this; hard
-    // real-time setups may want to lower it.  Override via
-    // channel::Config::commit_timeout.
+    // Override via channel::Config::commit_timeout. Increase under heavy
+    // scheduling delays to reduce recovery of slow but live publishers.
     constexpr microseconds DEFAULT_COMMIT_TIMEOUT = 10ms;
 
-    /// Optional payload schema descriptor.
-    ///
-    /// The library never interprets any byte of this structure: it stores it
-    /// in the shared-memory header so that multiple processes (possibly built
-    /// at different times, from different sources) can agree -- or disagree --
-    /// on the payload format carried by the channel.
-    ///
-    /// Policy (which fields to fill, how to compute the hashes, what counts as
-    /// a mismatch) is entirely up to the user.  Typical usage:
-    ///   - identity: cryptographic or non-cryptographic hash of a canonical
-    ///     descriptor of the logical type (name + version + field list).
-    ///   - layout: fingerprint of this binary's in-memory layout
-    ///     (e.g. a checksum over (offset, size, kind) tuples per member).
-    ///     Useful to distinguish "wrong type" from "same type, different ABI".
-    ///   - name: human-readable identifier for diagnostics.
-    ///   - version: user-defined version number.
-    ///   - identity_algo / layout_algo: opaque tags that let the user's tooling
-    ///     know which algorithm produced the corresponding bytes (e.g. 1=sha256,
-    ///     2=fnv128).  The library never reads them.
-    ///
-    /// Size is fixed at 512 bytes (8 cache lines) to leave generous room for
-    /// future fields without requiring another layout-version bump.
+    /// Opaque payload schema, stored in shared memory. Callers choose hashes,
+    /// algorithm tags, versioning, and compatibility rules.
+    /// identity names the logical type; layout describes its binary layout.
+    /// The fixed 512-byte layout includes reserved space for future fields.
     struct SchemaInfo
     {
         std::array<uint8_t, 64> identity;       ///< Logical fingerprint (user-defined bytes)
@@ -99,9 +82,8 @@ namespace kickmsg
     static_assert(std::is_trivially_copyable<SchemaInfo>::value,
         "SchemaInfo must be trivially copyable for memcpy into shared memory");
 
-    /// Schema-slot publication state.  Drives a small state machine in the
-    /// header so a claim writes the payload bytes between Claiming and Set,
-    /// and readers only observe the payload once Set is published.
+    /// Writers fill schema_data while Claiming and release-store Set.
+    /// Readers access it only after acquiring Set.
     namespace schema
     {
         enum State : uint32_t
@@ -111,18 +93,9 @@ namespace kickmsg
             Set      = 2,  ///< Payload is stable and safe to read
         };
 
-        /// Bitmask describing how two SchemaInfo values differ.
-        ///
-        /// Returned by diff().  Zero (Equal) means all checked fields match.
-        /// The library only compares fields with current semantic meaning --
-        /// `flags` and `reserved[]` are deliberately excluded so that
-        /// forward-compatible additions (a new flag bit, a new field carved
-        /// from reserved) do NOT retroactively break existing comparisons.
-        ///
-        /// The library never decides what counts as a mismatch for the
-        /// caller: users combine these bits per their own policy (e.g.
-        /// "Identity mismatch is fatal, Version mismatch triggers a
-        /// negotiation, Name mismatch is just logged").
+        /// Fields that differ between two schemas. Zero means all checked fields match.
+        /// Flags and reserved bytes are ignored for forward compatibility.
+        /// The caller decides which differences are acceptable.
         enum Diff : uint32_t
         {
             Equal        = 0,
@@ -134,9 +107,7 @@ namespace kickmsg
             LayoutAlgo   = 1u << 5,  ///< layout_algo tags differ
         };
 
-        /// Compute a bitwise diff of the semantically-meaningful fields of
-        /// two schema descriptors.  Pure, side-effect free; library does
-        /// not apply any mismatch policy.
+        /// Compare schema fields without applying a compatibility policy.
         uint32_t diff(SchemaInfo const& a, SchemaInfo const& b);
     }
 
@@ -180,13 +151,6 @@ namespace kickmsg
         };
     }
 
-    // ---- Shared-memory layout structures ----
-    //
-    // Convention: atomic fields accessed without explicit memory_order
-    // (e.g. slot->refcount = 0) are in contexts where ordering is irrelevant
-    // (quiesced GC, post-join verification, single-threaded init).
-    // Explicit memory_order at all synchronization points makes them
-    // visually distinct from incidental reads.
 
     /// Shared-memory region header. Written once by the creator, read by all.
     /// Layout version changes require a VERSION bump.
@@ -218,35 +182,24 @@ namespace kickmsg
         uint16_t    creator_name_len;   ///< Length of creator name string
         // creator_name bytes follow immediately after sizeof(Header)
 
-        /// Payload schema descriptor -- opt-in, off the hot path.
-        /// Published via a tiny state machine (Unset -> Claiming -> Set):
-        /// writers update schema_data while schema_state == Claiming, then
-        /// release-store Set.  Readers acquire-load schema_state and only
-        /// read schema_data if the state is Set.
+        /// Write schema_data under Claiming, then release-store Set.
+        /// Readers acquire Set before copying schema_data.
         alignas(CACHE_LINE) std::atomic<uint32_t> schema_state;
         alignas(CACHE_LINE) SchemaInfo            schema_data;
 
         alignas(CACHE_LINE) std::atomic<uint64_t> free_top; ///< Treiber free-stack head (tagged: gen|idx)
-        std::atomic<uint64_t> steal_count;  ///< Entries stolen from a stale holder (each may orphan one slot ref until GC)
+        std::atomic<uint64_t> steal_count;  ///< Entries stolen from a stalled publisher
         uint64_t              identity_hash; ///< Logical-identity fingerprint, written once pre-MAGIC (0 = unstamped); detects shm-name collisions at open
     };
 
-    // The creator_name tail bytes are written at offset sizeof(Header) in the
-    // shared-memory mapping.  Guaranteeing sizeof(Header) is a multiple of
-    // CACHE_LINE ensures those bytes start on a fresh cache line and never
-    // share a line with any atomic field above (schema_state, schema_data,
-    // free_top).  The aliasing of alignas(CACHE_LINE) on several members plus
-    // struct-level alignment normally produces this automatically, but we
-    // assert it to catch accidental layout edits.
+    // The creator name follows Header and must not share a cache line
+    // with its atomics.
     static_assert(sizeof(Header) % CACHE_LINE == 0,
         "Header size must be cache-line multiple to isolate atomic fields "
         "from the creator_name tail written at offset sizeof(Header)");
 
-    // The magic/version prefix is the cross-build handshake: a build that
-    // opens a region stamped by a different VERSION must still be able to
-    // read these two fields at their fixed offsets to reject it.  They are
-    // therefore frozen for ALL future versions -- any edit that moves them
-    // silently defeats the version-mismatch guard.
+    // Keep magic and version at fixed offsets across all ABI versions
+    // so incompatible mappings can be rejected.
     static_assert(std::is_standard_layout<Header>::value,
         "Header is placed in shared memory via reinterpret_cast");
     static_assert(offsetof(Header, magic) == 0,
@@ -254,13 +207,61 @@ namespace kickmsg
     static_assert(offsetof(Header, version) == 8,
         "version offset is a permanent ABI contract across all versions");
 
+    // [tag:40 | slot + 1:24]; tag is the low 40 bits of pos + 1.
+    // Zero in the slot field means no claim. Each claim owns one slot reference.
+    // Replacing a claim transfers the duty to release its reference.
+    // Publishers CAS only older position tags, preventing late writes from
+    // overwriting newer entries.
+    constexpr uint64_t META_SLOT_BITS = 24;
+    constexpr uint64_t META_SLOT_MASK = (1ULL << META_SLOT_BITS) - 1;
+    constexpr uint64_t META_TAG_MASK  = (1ULL << 40) - 1;
+
+    constexpr uint64_t meta_tag(uint64_t m) { return m >> META_SLOT_BITS; }
+
+    /// Biased slot field: 0 means the entry names no slot (also the value a
+    /// freshly zeroed region carries, which must not read as slot 0).
+    constexpr uint32_t meta_slot_biased(uint64_t m)
+    {
+        return static_cast<uint32_t>(m & META_SLOT_MASK);
+    }
+
+    constexpr uint64_t meta_pack(uint64_t pos, uint32_t slot_idx)
+    {
+        uint64_t tag = (pos + 1) & META_TAG_MASK;
+        return (tag << META_SLOT_BITS)
+             | ((static_cast<uint64_t>(slot_idx) + 1) & META_SLOT_MASK);
+    }
+
+    /// True if m precedes pos under 40-bit serial-number ordering.
+    /// Requires positions to be less than 2^39 apart.
+    constexpr bool meta_precedes(uint64_t m, uint64_t pos)
+    {
+        uint64_t diff = (meta_tag(m) - ((pos + 1) & META_TAG_MASK)) & META_TAG_MASK;
+        return diff != 0 and (diff & (1ULL << 39)) != 0;
+    }
+
+    /// Validated local copy of geometry used for pointer arithmetic.
+    /// Shared header fields remain writable by peers after validation.
+    struct Geometry
+    {
+        uint64_t sub_rings_offset;
+        uint64_t sub_ring_stride;
+        uint64_t sub_ring_capacity;
+        uint64_t sub_ring_mask;
+        uint64_t pool_offset;
+        uint64_t slot_stride;
+        uint64_t pool_size;
+        uint64_t slot_data_size;
+        uint64_t max_subs;
+        uint64_t commit_timeout_us;
+    };
+
     /// Ring entry: one per position in a subscriber ring.
     /// Packed to guarantee binary layout across compilers.
     struct Entry
     {
-        std::atomic<uint64_t> sequence;     ///< Commit barrier (pos + 1) and seqlock for data consistency
-        std::atomic<uint32_t> slot_idx;     ///< Index into the slot pool (INVALID_SLOT if released by drain)
-        std::atomic<uint32_t> payload_len;  ///< Actual payload bytes written to the slot
+        std::atomic<uint64_t> sequence;  ///< Commit barrier (pos + 1) and seqlock for data consistency
+        std::atomic<uint64_t> meta;      ///< Slot claim; see the meta-word encoding above
     };
     static_assert(sizeof(Entry) == 16 and std::is_standard_layout<Entry>::value,
         "Entry layout drives cross-process ring-stride math");
@@ -277,10 +278,7 @@ namespace kickmsg
             Reclaiming = 3,  ///< reclaim_dead_rings() holds the ring exclusively while re-verifying owner death
         };
 
-        /// Packed [in_flight:30 | state:2] in a single uint32_t.
-        /// Single-variable atomics eliminate cross-variable ordering concerns:
-        /// publisher CAS atomically checks state and increments in_flight,
-        /// so acquire/release is sufficient (no Dekker protocol, no seq_cst).
+        /// Packed [in_flight:30 | state:2]. One CAS checks Live and admits a publisher.
         constexpr uint32_t STATE_MASK    = 0x3u;
         constexpr uint32_t IN_FLIGHT_ONE = 0x4u;
 
@@ -296,14 +294,8 @@ namespace kickmsg
         };
     }
 
-    /// Per-subscriber ring header in shared memory.
-    /// state_flight packs ring state and in_flight publisher count into one
-    /// atomic, enabling single-CAS admission without cross-variable fences.
-    /// write_pos, has_waiter, dropped_count, lost_count share a cache line:
-    /// the hot path already owns this line when incrementing write_pos, so
-    /// the extra fetch_add on a drop/loss path introduces no new cache-
-    /// coherency traffic.  Writers on different rings target different
-    /// lines (128 B stride), so no cross-ring false sharing either.
+    /// Per-subscriber ring header. state_flight combines state and publisher
+    /// admission count. Hot counters share a line; separate rings use distinct lines.
     struct SubRingHeader
     {
         alignas(CACHE_LINE) std::atomic<uint32_t> state_flight; ///< Packed [in_flight:30 | state:2]
@@ -314,10 +306,7 @@ namespace kickmsg
         std::atomic<uint64_t> dropped_count;                    ///< Cumulative publisher drops on this ring (all publishers)
         std::atomic<uint64_t> lost_count;                       ///< Cumulative subscriber losses on this ring (all subscribers)
     };
-    // owner_pid/owner_starttime live in state_flight's cache-line padding, so
-    // the struct stays 2 lines and the ring-stride math is unchanged. They are
-    // cold (written once on claim, read only by reclaim_dead_rings), so sharing
-    // the line with the hot state_flight costs nothing in steady state.
+    // Owner fields use state_flight's padding without changing the two-line layout.
     static_assert(sizeof(SubRingHeader) == 2 * CACHE_LINE,
         "SubRingHeader must stay 2 cache lines -- expanding it past the "
         "write_pos line padding requires reconsidering ring-stride math in Region.cc");
@@ -328,8 +317,11 @@ namespace kickmsg
     {
         std::atomic<uint32_t> refcount;  ///< Number of ring references + SampleView pins
         std::atomic<uint32_t> next_free; ///< Next slot index in the Treiber free-stack chain
+        /// Length written before publication and read under a validated slot pin.
+        std::atomic<uint32_t> payload_len;
+        uint32_t              _padding;
     };
-    static_assert(sizeof(SlotHeader) == 8 and std::is_standard_layout<SlotHeader>::value,
+    static_assert(sizeof(SlotHeader) == 16 and std::is_standard_layout<SlotHeader>::value,
         "SlotHeader layout drives cross-process slot-stride math");
     static_assert(std::is_standard_layout<SubRingHeader>::value,
         "SubRingHeader is placed in shared memory via reinterpret_cast");
@@ -357,30 +349,29 @@ namespace kickmsg
     constexpr uint32_t tagged_idx(uint64_t tagged) { return static_cast<uint32_t>(tagged); }
     constexpr uint32_t tagged_gen(uint64_t tagged) { return static_cast<uint32_t>(tagged >> 32); }
 
-    SubRingHeader* sub_ring_at(void* base, Header const* h, uint32_t idx);
+    SubRingHeader* sub_ring_at(void* base, Geometry const& geometry, uint32_t idx);
 
-    /// Forget the ring's owner and any wake it was waiting for. Call this before marking
-    /// the ring free, never after: once it is free someone else can claim it, and these
-    /// stores would wipe out what the new owner just wrote.
+    /// Clear owner and wake mode before publishing Free, while no replacement
+    /// can claim the ring.
     void clear_owner(SubRingHeader* ring);
     Entry*         ring_entries(SubRingHeader* ring);
-    SlotHeader*    slot_at(void* base, Header const* h, uint32_t idx);
+    SlotHeader*    slot_at(void* base, Geometry const& geometry, uint32_t idx);
     SlotHeader*    slot_at(void* pool_base, std::size_t slot_stride, uint32_t idx);
     uint8_t*       slot_data(SlotHeader* slot);
     char*          header_creator_name(Header* h);
 
     uint64_t compute_config_hash(channel::Type type, channel::Config const& cfg);
 
-    /// Take ownership of a ring entry observed at `observed` (a stale lock
-    /// or a >1-wrap-stale committed value) and commit it as an empty skip
-    /// marker at position `pos`.  Returns false without touching the entry
-    /// if it changed first -- a live writer beat us; never steal then.
-    bool entry_steal_and_clear(Entry& e, uint64_t pos, uint64_t observed);
+    /// CAS a stale observed sequence to a repair lock, then publish a skip at pos.
+    /// Returns false if the sequence changed. Keeps Entry::meta and its reference
+    /// for the next publisher or drainer to release.
+    bool entry_steal_and_skip(Entry& e, uint64_t pos, uint64_t observed);
 
     void     treiber_push(std::atomic<uint64_t>& top, SlotHeader* slot, uint32_t slot_idx);
     void     treiber_push(std::atomic<uint64_t>& top, void* pool_base, std::size_t slot_stride, uint32_t slot_idx);
-    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* base, Header const* h);
-    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* pool_base, std::size_t slot_stride);
+    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* base, Geometry const& geometry);
+    /// Return INVALID_SLOT if a shared free-list index is outside pool_size.
+    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* pool_base, std::size_t slot_stride, uint64_t pool_size);
 
 }
 

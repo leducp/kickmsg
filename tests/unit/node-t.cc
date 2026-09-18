@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 
+#include "kickmsg/Naming.h"
 #include "kickmsg/Node.h"
 
 class NodeTest : public ::testing::Test
@@ -14,9 +15,17 @@ protected:
         }
     }
 
+    /// Unlinked up front too, so a region left by a crashed run cannot leak in.
     void track(std::string name)
     {
+        kickmsg::SharedMemory::unlink(name);
         shm_names_.push_back(std::move(name));
+    }
+
+    /// Same composition as Node: on macOS the shm name is a hash, not "/ns_suffix".
+    void track(char const* ns, char const* suffix)
+    {
+        track(kickmsg::compose_shm_name(ns, suffix));
     }
 
     kickmsg::channel::Config small_cfg()
@@ -36,7 +45,7 @@ private:
 TEST_F(NodeTest, AdvertiseAndSubscribe)
 {
     // Topic-centric: SHM name is /{prefix}_{topic}, no node name in path
-    track("/test_data");
+    track("test", "data");
 
     kickmsg::Node pub_node("pubnode", "test");
     auto pub = pub_node.advertise("data", small_cfg());
@@ -62,7 +71,7 @@ TEST_F(NodeTest, AdvertiseTwiceDoesNotWipeLiveRegion)
     // SharedRegion::create() (O_TRUNC + memset) on the live segment.  A
     // subscriber that joined after the first advertise must keep working
     // across the second advertise.
-    track("/test_dup");
+    track("test", "dup");
 
     kickmsg::Node node("node", "test");
     auto pub1 = node.advertise("dup", small_cfg());
@@ -100,7 +109,7 @@ TEST_F(NodeTest, NamingConventions)
 
 TEST_F(NodeTest, JoinBroadcastTwoNodes)
 {
-    track("/test_broadcast_events");
+    track("test", "broadcast_events");
 
     auto cfg = small_cfg();
 
@@ -131,7 +140,7 @@ TEST_F(NodeTest, JoinBroadcastTwoNodes)
 
 TEST_F(NodeTest, MailboxPattern)
 {
-    track("/test_nodeA_mbx_inbox");
+    track("test", "nodeA_mbx_inbox");
 
     auto cfg = small_cfg();
 
@@ -167,7 +176,7 @@ namespace
 
 TEST_F(NodeTest, TopicSchemaBakedViaAdvertise)
 {
-    track("/test_imu");
+    track("test", "imu");
 
     auto cfg = small_cfg();
     cfg.schema = make_node_schema("app/Imu", 2, 0xAA);
@@ -197,7 +206,7 @@ TEST_F(NodeTest, TryClaimTopicSchemaLateBinding)
 {
     // Late-arrival flow: subscriber creates the region, publisher arrives
     // and claims the schema via the Node API.
-    track("/test_telemetry");
+    track("test", "telemetry");
 
     auto cfg = small_cfg();
 
@@ -238,7 +247,7 @@ TEST_F(NodeTest, UnlinkTopicRemovesShm)
     // the unlink path (without it, the /dev/shm entry would persist); on
     // Windows the last-handle-close already removed the mapping and
     // unlink is a harmless no-op -- both produce the same post-condition.
-    track("/test_ephemeral");
+    track("test", "ephemeral");
 
     {
         kickmsg::Node node("node", "test");
@@ -294,7 +303,7 @@ TEST_F(NodeTest, SubscribeOrCreateTwiceReusesSameRegion)
     // on the same topic yields independent handles that wrap the SAME
     // underlying mmap (emplace_or_reuse dedupes).  A publisher on one
     // handle must be visible to a subscriber on either.
-    track("/test_shared");
+    track("test", "shared");
 
     kickmsg::Node node("node", "test");
     auto cfg = small_cfg();
@@ -333,7 +342,7 @@ TEST_F(NodeTest, RosStyleTopicNamesAreSanitizedIntoShmPath)
     // sanitize_shm_component: ROS-style absolute paths with interior '/'
     // must round-trip into a POSIX-valid "/<prefix>_robot.arm.joint1"
     // region, reachable by a peer that passes the same raw topic string.
-    track("/test.ns_robot.arm.joint1");
+    track("test.ns", "robot.arm.joint1");
 
     kickmsg::Node pub_node("drv", "/test/ns");
     auto pub = pub_node.advertise("/robot/arm/joint1", small_cfg());
@@ -359,7 +368,7 @@ TEST_F(NodeTest, ShmNameCollisionDetectedByIdentityStamp)
     // two distinct logical topics land on the same shm name "/test_a_b".
     // The identity hash stamped at create (over the RAW topic string) must
     // reject the open instead of silently sharing the region.
-    track("/test_a_b");
+    track("test", "a_b");
 
     kickmsg::Node pub_node("pubnode", "test");
     auto pub = pub_node.advertise("a:b", small_cfg());
@@ -399,7 +408,7 @@ TEST_F(NodeTest, EmptyTopicNameThrows)
 
 TEST_F(NodeTest, MailboxMultipleWriters)
 {
-    track("/test_owner_mbx_inbox");
+    track("test", "owner_mbx_inbox");
 
     auto cfg = small_cfg();
 
@@ -430,7 +439,7 @@ TEST_F(NodeTest, MailboxMultipleWriters)
 
 TEST_F(NodeTest, RelaxedMailboxOwnerFirst)
 {
-    track("/test_owner_mbx_inbox");
+    track("test", "owner_mbx_inbox");
 
     auto cfg = small_cfg();
 
@@ -450,7 +459,7 @@ TEST_F(NodeTest, RelaxedMailboxOwnerFirst)
 
 TEST_F(NodeTest, RelaxedMailboxSenderFirst)
 {
-    track("/test_owner_mbx_inbox");
+    track("test", "owner_mbx_inbox");
 
     auto cfg = small_cfg();
 
@@ -473,7 +482,7 @@ TEST_F(NodeTest, RelaxedMailboxForcesMaxSubscribersOne)
 {
     // If a caller passes cfg.max_subscribers != 1, the mailbox APIs must
     // override it. Verify by reading back the region info.
-    track("/test_owner_mbx_inbox");
+    track("test", "owner_mbx_inbox");
 
     auto cfg = small_cfg();
     cfg.max_subscribers = 4;  // mailbox should clamp to 1

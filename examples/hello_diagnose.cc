@@ -56,23 +56,23 @@ int main()
     std::cout << "\n=== Step 2: Inject faults (simulating publisher crashes) ===\n";
 
     auto* base = region.base();
-    auto* hdr  = region.header();
+    auto* header  = region.header();
 
     // Fault 1: Lock a ring entry (simulates publisher crash mid-commit)
     {
-        auto* ring    = kickmsg::sub_ring_at(base, hdr, 0);
+        auto* ring    = kickmsg::sub_ring_at(base, region.geometry(), 0);
         auto* entries = kickmsg::ring_entries(ring);
         // Pretend a publisher claimed pos=write_pos and locked the entry
         uint64_t wp = ring->write_pos.load(std::memory_order_acquire);
         ring->write_pos.store(wp + 1, std::memory_order_release);
-        entries[wp & hdr->sub_ring_mask].sequence.store(
+        entries[wp & header->sub_ring_mask].sequence.store(
             kickmsg::seq_lock(wp), std::memory_order_release);
         std::cout << "  Injected: stale lock at ring 0, pos " << wp << "\n";
     }
 
     // Fault 2: Stuck ring (simulates subscriber teardown timeout after publisher crash)
     {
-        auto* ring = kickmsg::sub_ring_at(base, hdr, 1);
+        auto* ring = kickmsg::sub_ring_at(base, region.geometry(), 1);
         ring->state_flight.store(
             kickmsg::ring::make_packed(kickmsg::ring::Free, 1),
             std::memory_order_release);

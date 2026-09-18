@@ -284,11 +284,11 @@ static int child_subscriber_main(int sub_id, int ready_wfd, int report_wfd)
 
 static bool verify_rings_free(kickmsg::SharedRegion& region)
 {
-    auto* hdr = region.header();
+    auto* header = region.header();
     bool  ok  = true;
-    for (uint32_t i = 0; i < hdr->max_subs; ++i)
+    for (uint32_t i = 0; i < header->max_subs; ++i)
     {
-        auto*    ring   = kickmsg::sub_ring_at(region.base(), hdr, i);
+        auto*    ring   = kickmsg::sub_ring_at(region.base(), region.geometry(), i);
         uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
         if (kickmsg::ring::get_state(packed) != kickmsg::ring::Free)
         {
@@ -312,14 +312,14 @@ static bool verify_rings_free(kickmsg::SharedRegion& region)
 static bool verify_slots(kickmsg::SharedRegion& region)
 {
     auto* base = region.base();
-    auto* hdr  = region.header();
+    auto* header  = region.header();
 
-    std::vector<bool> in_free(hdr->pool_size, false);
-    uint32_t top = kickmsg::tagged_idx(hdr->free_top.load(std::memory_order_acquire));
+    std::vector<bool> in_free(header->pool_size, false);
+    uint32_t top = kickmsg::tagged_idx(header->free_top.load(std::memory_order_acquire));
 
     while (top != kickmsg::INVALID_SLOT)
     {
-        if (top >= hdr->pool_size)
+        if (top >= header->pool_size)
         {
             std::fprintf(stderr, "  [FAIL] free stack contains out-of-range index %u\n", top);
             return false;
@@ -332,18 +332,18 @@ static bool verify_slots(kickmsg::SharedRegion& region)
         }
         in_free[top] = true;
 
-        auto* slot = kickmsg::slot_at(base, hdr, top);
+        auto* slot = kickmsg::slot_at(base, region.geometry(), top);
         top = slot->next_free;
     }
 
     bool ok = true;
-    for (uint32_t i = 0; i < hdr->pool_size; ++i)
+    for (uint32_t i = 0; i < header->pool_size; ++i)
     {
         if (in_free[i])
         {
             continue;
         }
-        auto*    slot = kickmsg::slot_at(base, hdr, i);
+        auto*    slot = kickmsg::slot_at(base, region.geometry(), i);
         uint32_t rc   = slot->refcount;
         if (rc != 0)
         {
@@ -565,7 +565,7 @@ int main()
     uint64_t dropped = 0;
     for (uint32_t i = 0; i < cfg.max_subscribers; ++i)
     {
-        auto* ring = kickmsg::sub_ring_at(region.base(), region.header(), i);
+        auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), i);
         dropped += ring->dropped_count.load(std::memory_order_acquire);
     }
     std::size_t repaired = region.repair_locked_entries();

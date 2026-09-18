@@ -37,16 +37,16 @@ static void BM_TreiberPopPush(benchmark::State& state)
         SHM_NAME, kickmsg::channel::PubSub, cfg, "bench");
 
     auto* base = region.base();
-    auto* hdr  = region.header();
+    auto* header  = region.header();
 
     for (auto _ : state)
     {
-        uint32_t idx = kickmsg::treiber_pop(hdr->free_top, base, hdr);
+        uint32_t idx = kickmsg::treiber_pop(header->free_top, base, region.geometry());
         benchmark::DoNotOptimize(idx);
         if (idx != kickmsg::INVALID_SLOT)
         {
-            auto* slot = kickmsg::slot_at(base, hdr, idx);
-            kickmsg::treiber_push(hdr->free_top, slot, idx);
+            auto* slot = kickmsg::slot_at(base, region.geometry(), idx);
+            kickmsg::treiber_push(header->free_top, slot, idx);
         }
     }
 
@@ -249,7 +249,7 @@ static void BM_CASAdmission(benchmark::State& state)
     auto region = kickmsg::SharedRegion::create(
         SHM_NAME, kickmsg::channel::PubSub, cfg, "bench");
 
-    auto* ring = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
     // Set ring to Live so CAS admission succeeds
     ring->state_flight.store(
         kickmsg::ring::make_packed(kickmsg::ring::Live),

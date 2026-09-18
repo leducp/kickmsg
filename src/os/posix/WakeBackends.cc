@@ -27,9 +27,8 @@ namespace kickmsg
         /// Descriptors gathered on the stack before WaitSet::wait allocates.
         constexpr std::size_t STACK_FDS = 64;
 
-        /// Every option matters. Non-blocking keeps signal() off the publish path. TTL 0
-        /// and the loopback interface keep the wake on this host, and LOOP is what still
-        /// delivers it. A socket missing any of them is thrown away.
+        /// Non-blocking sockets keep signal() from waiting. TTL 0, loopback
+        /// interface, and multicast loopback restrict delivery to this host.
         bool configure_sender(int fd)
         {
             int flags = ::fcntl(fd, F_GETFL, 0);
@@ -93,8 +92,7 @@ namespace kickmsg
         }
         (void) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
 
-        // Every subscriber of this channel binds the same port, which SO_REUSEADDR is
-        // what permits; without it this socket blocks every later joiner.
+        // SO_REUSEADDR allows all channel subscribers to bind the same port.
         int on = 1;
         if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0)
         {
@@ -133,8 +131,7 @@ namespace kickmsg
 
     void UdpMulticastBackend::drain(int fd)
     {
-        // Bounded: the group is joinable by any local process, which could otherwise
-        // feed this loop indefinitely. What is left reads as a spurious wake.
+        // Bound draining so incoming traffic cannot keep the caller here forever.
         uint8_t buffer[64];
         for (int i = 0; i < DRAIN_MAX; ++i)
         {
@@ -186,10 +183,10 @@ namespace kickmsg
         }
         auto const count = fds_.size();
 
-        // poll() takes any count; only the stack buffer is bounded.
-        pollfd              stack[STACK_FDS] = {};
-        std::vector<pollfd> heap;
-        pollfd*             entries = stack;
+        // Reuse per-thread storage when the descriptor count exceeds the stack buffer.
+        pollfd  stack[STACK_FDS] = {};
+        pollfd* entries = stack;
+        static thread_local std::vector<pollfd> heap;
         if (count > STACK_FDS)
         {
             heap.resize(count);
@@ -214,8 +211,7 @@ namespace kickmsg
         {
             return false;
         }
-        // A count alone is not readability: POLLERR, POLLHUP and POLLNVAL also raise it,
-        // and a closed descriptor would then report ready forever and spin the caller.
+        // Only readability counts: poll also returns errors and closed descriptors.
         for (std::size_t i = 0; i < count; ++i)
         {
             if ((entries[i].revents & POLLIN) != 0)

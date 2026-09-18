@@ -25,6 +25,7 @@
 ///
 /// Exits 0 on success, non-zero on any assertion failure.
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
@@ -362,21 +363,34 @@ static bool test_declare_race_across_processes()
 
     auto bb = Blackboard::open_or_create(NS, NAME, cfg());
 
+    // A winner holds its claim until the parent closes this pipe, which it does
+    // only once every loser has exited.  A timed hold let a child that started
+    // late (TSAN's fork is slow) win legitimately after the release, which
+    // reads exactly like two simultaneous owners.
+    int hold[2];
+    if (::pipe(hold) != 0)
+    {
+        std::perror("pipe");
+        std::exit(1);
+    }
+
     pid_t pids[CHILDREN];
     for (int i = 0; i < CHILDREN; ++i)
     {
         pids[i] = checked_fork();
         if (pids[i] == 0)
         {
+            ::close(hold[1]);
             auto child_bb = Blackboard::open_or_create(NS, NAME, cfg());
             int  code     = 1;
             try
             {
                 auto w = child_bb.declare(KEY, "racer");
                 code = 0;
-                // Hold the claim until the parent reaps everyone, so a loser
-                // can never win by outliving the winner's release.
-                kickmsg::sleep(300ms);
+                char byte;
+                while (::read(hold[0], &byte, 1) < 0 and errno == EINTR)
+                {
+                }
                 w.release();
             }
             catch (std::exception const&)
@@ -386,11 +400,40 @@ static bool test_declare_race_across_processes()
             ::_exit(code);
         }
     }
+    ::close(hold[0]);
 
-    int winners = 0;
+    // Reap losers until only the holders remain.  More than one holder never
+    // exits on its own, so the deadline bounds that failure instead of hanging.
+    int  winners = 0;
+    int  reaped  = 0;
+    bool done[CHILDREN] = {};
+    auto const deadline = kickmsg::monotonic_ns() + 60s;
+    while (reaped < CHILDREN - 1 and kickmsg::monotonic_ns() < deadline)
+    {
+        for (int i = 0; i < CHILDREN; ++i)
+        {
+            int status = 0;
+            if (done[i] or ::waitpid(pids[i], &status, WNOHANG) != pids[i])
+            {
+                continue;
+            }
+            done[i] = true;
+            ++reaped;
+            if (WIFEXITED(status) and WEXITSTATUS(status) == 0)
+            {
+                ++winners;   // exited while holding: only possible after release
+            }
+        }
+        kickmsg::sleep(5ms);
+    }
+    ::close(hold[1]);
     for (int i = 0; i < CHILDREN; ++i)
     {
         int status = 0;
+        if (done[i])
+        {
+            continue;
+        }
         ::waitpid(pids[i], &status, 0);
         if (WIFEXITED(status) and WEXITSTATUS(status) == 0)
         {

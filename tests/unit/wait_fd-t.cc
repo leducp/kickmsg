@@ -59,7 +59,7 @@ TEST_F(WaitFdTest, UnusedSubscriberLeavesTheRingOnTheFutexPath)
     auto region = SharedRegion::create(SHM_NAME, channel::PubSub, bare_cfg());
     Subscriber sub(region);
 
-    auto* ring = sub_ring_at(region.base(), region.header(), sub.ring_index());
+    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
 
     std::thread publisher([&]()
     {
@@ -196,7 +196,7 @@ TEST_F(WaitFdTest, ArmMarksTheRingAsCarrierArmed)
     Subscriber sub(region);
     ASSERT_TRUE(sub.attach(waker));
 
-    auto* ring = sub_ring_at(region.base(), region.header(), sub.ring_index());
+    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
     EXPECT_EQ(ring::WaiterNone, ring->has_waiter.load());
     ASSERT_EQ(Subscriber::Wait::Armed, sub.arm_wait());
     EXPECT_EQ(ring::WaiterCarrier, ring->has_waiter.load());
@@ -210,7 +210,7 @@ TEST_F(WaitFdTest, DisarmIsIdempotent)
     Subscriber sub(region);
     ASSERT_TRUE(sub.attach(waker));
 
-    auto* ring = sub_ring_at(region.base(), region.header(), sub.ring_index());
+    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
     ASSERT_EQ(Subscriber::Wait::Armed, sub.arm_wait());
     sub.disarm_wait();
     sub.disarm_wait();
@@ -241,7 +241,7 @@ TEST_F(WaitFdTest, ArmReportsReadyWhenASampleIsAlreadyQueued)
 
     EXPECT_EQ(Subscriber::Wait::Ready, sub.arm_wait());
     // Ready must not have armed the ring: no publisher should be sending.
-    auto* ring = sub_ring_at(region.base(), region.header(), sub.ring_index());
+    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
     EXPECT_EQ(ring::WaiterNone, ring->has_waiter.load());
     sub.disarm_wait();
 
@@ -380,7 +380,7 @@ TEST_F(WaitFdTest, ReclaimingARingClearsAStaleWaiterMode)
     {
         Subscriber sub(region);
         ASSERT_TRUE(sub.attach(waker));
-        ring = sub_ring_at(region.base(), region.header(), sub.ring_index());
+        ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
         ASSERT_EQ(Subscriber::Wait::Armed, sub.arm_wait());
         ASSERT_EQ(ring::WaiterCarrier, ring->has_waiter.load());
         // Out of scope still armed, as a killed process would be.
@@ -519,7 +519,7 @@ TEST_F(WaitFdTest, ACallerSuppliedBackendIsSignalled)
     Subscriber sub(region);
 
     // Stands in for a subscriber armed on the carrier, which is all the publisher reads.
-    auto* ring = sub_ring_at(region.base(), region.header(), sub.ring_index());
+    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
     ring->has_waiter.store(ring::WaiterCarrier, std::memory_order_relaxed);
 
     CountingBackend injected;
@@ -537,7 +537,7 @@ TEST_F(WaitFdTest, APublisherWithNoBackendSignalsNothing)
     auto region = SharedRegion::create(SHM_NAME, channel::PubSub, bare_cfg());
     Subscriber sub(region);
 
-    auto* ring = sub_ring_at(region.base(), region.header(), sub.ring_index());
+    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
     ring->has_waiter.store(ring::WaiterCarrier, std::memory_order_relaxed);
 
     CountingBackend injected;

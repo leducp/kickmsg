@@ -58,15 +58,14 @@ protected:
     /// having gone away without running its destructor.
     static void orphan(Blackboard& bb, char const* key)
     {
-        for (uint32_t i = 0; i < bb.header()->capacity; ++i)
+        for (uint32_t i = 0; i < bb.capacity(); ++i)
         {
             auto* e = entry(bb, i);
             if (e->state.load(std::memory_order_acquire) != blackboard::Active)
             {
                 continue;
             }
-            if (::strnlen(e->key, blackboard::KEY_MAX) != std::strlen(key)
-                or std::memcmp(e->key, key, std::strlen(key)) != 0)
+            if (bb_load_key(e) != key)
             {
                 continue;
             }
@@ -536,7 +535,7 @@ TEST_F(BlackboardTest, CorruptValueLenIsClamped)
     ASSERT_FALSE(w.write(Sample{1, 1}));
 
     auto* h    = bb.header();
-    auto* cell = bb_cell_at(static_cast<void*>(h), 0, 1);
+    auto* cell = bb_cell_at(static_cast<void*>(h), bb.geometry(), 0, 1);
     cell->value_len.store(0xFFFFFFFFu, std::memory_order_relaxed);
 
     std::vector<uint8_t> out;
@@ -545,13 +544,76 @@ TEST_F(BlackboardTest, CorruptValueLenIsClamped)
     EXPECT_LE(result.len, bb.max_value_size());
 }
 
+// A peer rewrites the geometry after open: every walk and cell offset must keep
+// using the values validated at open.
+TEST_F(BlackboardTest, HandlesUseTheGeometryValidatedAtOpen)
+{
+    auto bb = open();
+    auto writer = bb.declare("k");
+    auto reader = bb.observe("k");
+    ASSERT_FALSE(writer.write(Sample{7, 3}));
+
+    auto* header = bb.header();
+    header->capacity       = blackboard::MAX_CAPACITY;
+    header->max_value_size = blackboard::MAX_VALUE_SIZE;
+
+    EXPECT_EQ(bb.capacity(), small_cfg().capacity);
+    EXPECT_EQ(bb.max_value_size(), small_cfg().max_value_size);
+
+    Sample got{};
+    ASSERT_FALSE(reader.read(got).ec);
+    EXPECT_EQ(got.id, 7u);
+    EXPECT_EQ(got.state, 3u);
+
+    std::vector<uint8_t> big(small_cfg().max_value_size + 1, 0);
+    EXPECT_EQ(writer.write(big.data(), big.size()), std::make_error_code(std::errc::message_size));
+    ASSERT_FALSE(writer.write(Sample{8, 4}));
+    ASSERT_FALSE(reader.read(got).ec);
+    EXPECT_EQ(got.id, 8u);
+
+    EXPECT_EQ(bb.snapshot().size(), 1u);
+    EXPECT_EQ(bb.keys().size(), 1u);
+    EXPECT_EQ(bb.read_all<Sample>().size(), 1u);
+    EXPECT_EQ(bb.sweep_stale(), 0u);
+    auto other = bb.declare("other");
+    EXPECT_FALSE(other.release());
+    EXPECT_FALSE(writer.release());
+}
+
+// Payloads move as whole words; a length ending mid-word must round-trip exactly,
+// including after a longer value left bytes in the same cell.
+TEST_F(BlackboardTest, PartialWordValuesRoundTrip)
+{
+    auto bb = open();
+    auto writer = bb.declare("k");
+    auto reader = bb.observe("k");
+
+    std::vector<uint8_t> in(small_cfg().max_value_size);
+    for (std::size_t i = 0; i < in.size(); ++i)
+    {
+        in[i] = static_cast<uint8_t>(i * 7 + 1);
+    }
+    ASSERT_FALSE(writer.write(in.data(), in.size()));
+
+    for (std::size_t len = 0; len <= 2 * sizeof(uint64_t) + 1; ++len)
+    {
+        ASSERT_FALSE(writer.write(in.data(), len)) << len;
+        std::vector<uint8_t> out;
+        auto result = reader.read(out);
+        ASSERT_FALSE(result.ec) << len;
+        ASSERT_EQ(out.size(), len);
+        EXPECT_TRUE(std::equal(out.begin(), out.end(), in.begin())) << len;
+    }
+}
+
 TEST_F(BlackboardTest, CorruptKeyBytesAreNotOverread)
 {
     auto bb = open();
     auto w  = bb.declare("k");
 
     auto* e = entry(bb, 0);
-    std::memset(e->key, 'x', sizeof(e->key));   // no NUL anywhere
+    std::string const no_nul(blackboard::KEY_MAX, 'x');
+    bb_store_key(e, no_nul.data(), no_nul.size());
 
     auto snap = bb.snapshot();
     ASSERT_EQ(snap.size(), 1u);
@@ -562,7 +624,12 @@ TEST_F(BlackboardTest, RejectsVersionMismatch)
 {
     auto bb = open();
     bb.header()->version = blackboard::VERSION + 1;
-    EXPECT_THROW(Blackboard::try_open(NS, NAME), std::runtime_error);
+    EXPECT_THROW(Blackboard::try_open(NS, NAME), kickmsg::VersionMismatch);
+
+    // A version-1 peer copies payloads and keys with plain memcpy, which would race ours.
+    bb.header()->version = 1;
+    EXPECT_THROW(Blackboard::try_open(NS, NAME), kickmsg::VersionMismatch);
+    EXPECT_THROW(Blackboard::open_or_create(NS, NAME, small_cfg()), kickmsg::VersionMismatch);
     bb.header()->version = blackboard::VERSION;
 }
 
@@ -951,8 +1018,8 @@ namespace
 
     void set_key(BlackboardEntry* e, uint64_t kh)
     {
-        std::memset(e->key, 0, sizeof(e->key));
-        std::memcpy(e->key, "victim", 6);
+        bb_store_key(e, "", 0);
+        bb_store_key(e, "victim", 6);
         e->key_hash.store(kh, std::memory_order_relaxed);
     }
 
@@ -970,15 +1037,15 @@ namespace
     constexpr CrashPoint CRASH_POINTS[] = {
         // --- claim: Free -> Claiming -> Active, all under the lock ---
         {"claim/lock-taken-nothing-done", true,
-         [](BlackboardEntry* e, uint64_t) { zero_meta(e); std::memset(e->key, 0, sizeof(e->key));
+         [](BlackboardEntry* e, uint64_t) { zero_meta(e); bb_store_key(e, "", 0);
                                             put(e, blackboard::Free); }},
         {"claim/state-claiming", true,
-         [](BlackboardEntry* e, uint64_t) { zero_meta(e); std::memset(e->key, 0, sizeof(e->key));
+         [](BlackboardEntry* e, uint64_t) { zero_meta(e); bb_store_key(e, "", 0);
                                             put(e, blackboard::Claiming); }},
         {"claim/key-written", true,
          [](BlackboardEntry* e, uint64_t) { zero_meta(e);
-                                            std::memset(e->key, 0, sizeof(e->key));
-                                            std::memcpy(e->key, "victim", 6);
+                                            bb_store_key(e, "", 0);
+                                            bb_store_key(e, "victim", 6);
                                             put(e, blackboard::Claiming); }},
         {"claim/fully-filled-not-committed", true,
          [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
@@ -1014,7 +1081,7 @@ namespace
          [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
                                                put(e, blackboard::Free); }},
         {"sweepfree/complete-lock-not-dropped", true,
-         [](BlackboardEntry* e, uint64_t) { zero_meta(e); std::memset(e->key, 0, sizeof(e->key));
+         [](BlackboardEntry* e, uint64_t) { zero_meta(e); bb_store_key(e, "", 0);
                                             put(e, blackboard::Free); }},
 
         // --- forged states, lock NOT held: a corrupt peer can write these and
@@ -1024,7 +1091,7 @@ namespace
                                                put(e, blackboard::Claiming); }},
         {"corrupt/active-without-key", false,
          [](BlackboardEntry* e, uint64_t) { zero_meta(e); dead_owner(e);
-                                            std::memset(e->key, 0, sizeof(e->key));
+                                            bb_store_key(e, "", 0);
                                             put(e, blackboard::Active); }},
         {"corrupt/free-carrying-identity", false,
          [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
@@ -1072,7 +1139,7 @@ TEST_F(BlackboardTest, CrashPointMatrix)
         if (st == blackboard::Active)
         {
             ok = ok and e->key_hash.load(std::memory_order_relaxed) != 0;
-            ok = ok and ::strnlen(e->key, blackboard::KEY_MAX) != 0;
+            ok = ok and not bb_load_key(e).empty();
         }
         if (st == blackboard::Free)
         {
