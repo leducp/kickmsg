@@ -26,7 +26,7 @@ namespace kickmsg
         if (pending_slot_ != INVALID_SLOT)
         {
             // Return the uncommitted slot to the free-stack.
-            auto* slot = slot_at(base_, header_, pending_slot_);
+            auto* slot = slot_at(base_, geom_, pending_slot_);
             treiber_push(header_->free_top, slot, pending_slot_);
             pending_slot_ = INVALID_SLOT;
         }
@@ -37,25 +37,23 @@ namespace kickmsg
         // Release any previously allocated but unpublished slot.
         release_pending();
 
-        uint32_t slot_idx = treiber_pop(header_->free_top, base_, header_);
+        uint32_t slot_idx = treiber_pop(header_->free_top, base_, geom_);
         if (slot_idx == INVALID_SLOT)
         {
             return Allocation{nullptr, 0};
         }
 
         pending_slot_ = slot_idx;
+        ++reservation_;
 
-        auto* slot = slot_at(base_, header_, slot_idx);
-        return Allocation{slot_data(slot), header_->slot_data_size};
+        auto* slot = slot_at(base_, geom_, slot_idx);
+        return Allocation{slot_data(slot), geom_.slot_data_size};
     }
 
     std::size_t Publisher::publish(std::size_t len)
     {
-        // Oversized len would otherwise be truncated by the uint32_t store
-        // into payload_len -- possibly to a small VALID length, bypassing
-        // the subscriber's bound check and delivering a silently wrong
-        // length.  Recycle the pending slot and report zero deliveries.
-        if (len > header_->slot_data_size)
+        // Reject oversized lengths before narrowing to uint32_t.
+        if (len > geom_.slot_data_size)
         {
             release_pending();
             return 0;
@@ -68,27 +66,29 @@ namespace kickmsg
         uint32_t slot_idx = pending_slot_;
         pending_slot_ = INVALID_SLOT;
 
-        auto*    slot     = slot_at(base_, header_, slot_idx);
-        uint64_t capacity = header_->sub_ring_capacity;
+        auto*    slot     = slot_at(base_, geom_, slot_idx);
+        uint64_t capacity = geom_.sub_ring_capacity;
+
+        // Relaxed: nobody can reach this slot until a commit below publishes
+        // it, and every commit is a release-CAS that carries this store.
+        slot->payload_len.store(static_cast<uint32_t>(len), std::memory_order_relaxed);
 
         // Pre-set refcount to max_subs before publishing to any ring,
         // so a fast eviction on ring[k] cannot free the slot before
         // we finish publishing to ring[k+1].
-        slot->refcount.store(static_cast<uint32_t>(header_->max_subs),
+        slot->refcount.store(static_cast<uint32_t>(geom_.max_subs),
                              std::memory_order_release);
 
         std::size_t delivered = 0;
         uint32_t    excess    = 0;
         bool        carrier   = false;
 
-        for (uint32_t i = 0; i < header_->max_subs; ++i)
+        for (uint32_t i = 0; i < geom_.max_subs; ++i)
         {
-            auto* ring = sub_ring_at(base_, header_, i);
+            auto* ring = sub_ring_at(base_, geom_, i);
 
-            // Relaxed pre-check: skip obviously non-Live rings without
-            // any RMW atomic. Stale reads are safe:
-            //  - Sees Free, actually Live: miss one delivery (acceptable).
-            //  - Sees Live, actually Draining: CAS catches it below.
+            // Relaxed pre-check: a stale Free may miss one delivery;
+            // a stale Live is checked by the admission CAS.
             uint32_t snapshot = ring->state_flight.load(std::memory_order_relaxed);
             if (ring::get_state(snapshot) != ring::Live)
             {
@@ -96,9 +96,7 @@ namespace kickmsg
                 continue;
             }
 
-            // CAS admission: atomically verify state==Live and increment
-            // in_flight. All ordering is on a single variable, so
-            // acquire/release is sufficient (no seq_cst needed).
+            // Check Live and increment in_flight in one acquire-release CAS.
             uint32_t old = snapshot;
             bool admitted = false;
             while (true)
@@ -126,12 +124,9 @@ namespace kickmsg
 
             // Admitted: in_flight incremented, state is Live.
 
-            // Claim a position in this ring. fetch_add is unconditional:
-            // no CAS retry loop, O(1) under contention, and compiles to
-            // a single LDADDAL on AArch64 with LSE atomics.
             uint64_t pos = ring->write_pos.fetch_add(1, std::memory_order_acq_rel);
 
-            uint64_t idx  = pos & header_->sub_ring_mask;
+            uint64_t idx  = pos & geom_.sub_ring_mask;
             auto* entries = ring_entries(ring);
             auto& e       = entries[idx];
 
@@ -157,16 +152,13 @@ namespace kickmsg
                 wait = wait_for_commit(e, prev_seq, commit_timeout_);
             }
 
-            // Two-phase commit: CAS to our lock, write data, CAS-commit.
-            // A repairer's theft makes both CASes fail instead of being
-            // blind-stored over.
+            // Lock and commit by CAS so a repairer can revoke this position.
             uint64_t const lock_val = seq_lock(pos);
             uint64_t observed = 0;
             if (pos >= capacity)
             {
                 observed = wait.last_seq;
             }
-            bool prev_was_skip = false;
             bool locked = false;
             for (int attempt = 0; attempt < 64; ++attempt)
             {
@@ -178,7 +170,6 @@ namespace kickmsg
                     if (e.sequence.compare_exchange_weak(expected, lock_val,
                             std::memory_order_acquire, std::memory_order_relaxed))
                     {
-                        prev_was_skip = seq_is_skip(observed);
                         locked = true;
                         break;
                     }
@@ -201,22 +192,7 @@ namespace kickmsg
                 continue;
             }
 
-            // Release the previous occupant's slot from the post-lock read
-            // (sees even a commit that landed after our wait timed out; a
-            // drain's INVALID marker fails the bound check).  Never for a
-            // skip predecessor (untrustworthy metadata), never below one
-            // wrap (zero-init slot_idx would read as valid slot 0).
-            if (pos >= capacity and not prev_was_skip)
-            {
-                uint32_t prev_slot = e.slot_idx.load(std::memory_order_acquire);
-                if (prev_slot < header_->pool_size)
-                {
-                    release_slot(prev_slot);
-                }
-            }
-
-            // Theft guard: a repairer may have stolen our lock during a
-            // stall; storing data now would tear the repaired entry.
+            // This early check avoids work; the metadata CAS below guards late writes.
             if (e.sequence.load(std::memory_order_acquire) != lock_val)
             {
                 carrier |= abandon_delivery(ring);
@@ -224,17 +200,43 @@ namespace kickmsg
                 continue;
             }
 
-            e.slot_idx.store(slot_idx, std::memory_order_relaxed);
-            e.payload_len.store(static_cast<uint32_t>(len), std::memory_order_relaxed);
+            // Replace only an older position's claim, so a late writer cannot
+            // overwrite a newer entry.
+            uint64_t const my_meta  = meta_pack(pos, slot_idx);
+            uint64_t       old_meta = e.meta.load(std::memory_order_acquire);
+            bool           taken    = false;
+            while (meta_precedes(old_meta, pos))
+            {
+                if (e.meta.compare_exchange_weak(old_meta, my_meta,
+                        std::memory_order_acq_rel, std::memory_order_acquire))
+                {
+                    taken = true;
+                    break;
+                }
+            }
+            if (not taken)
+            {
+                // A newer publisher owns this entry: our slot reference is
+                // still ours to drop.
+                carrier |= abandon_delivery(ring);
+                ++excess;
+                continue;
+            }
 
-            // CAS-commit: fails only on theft after the guard above.
-            // Release on success publishes the data stores.
+            // The entry now owns our reference. We must release its previous claim.
+            uint32_t prev_biased = meta_slot_biased(old_meta);
+            if (prev_biased != 0)
+            {
+                release_slot(prev_biased - 1);
+            }
+
+            // CAS-commit.  Release on success publishes the data stores.
             uint64_t expected_lock = lock_val;
             if (not e.sequence.compare_exchange_strong(expected_lock, pos + 1,
                     std::memory_order_release, std::memory_order_relaxed))
             {
+                // The entry owns our reference even if commit fails. Do not release it twice.
                 carrier |= abandon_delivery(ring);
-                ++excess;
                 continue;
             }
 
@@ -242,21 +244,15 @@ namespace kickmsg
             ring->state_flight.fetch_sub(ring::IN_FLIGHT_ONE,
                                          std::memory_order_release);
 
-            // seq_cst fence orders the write_pos fetch_add before the
-            // has_waiter load: without it a weakly-ordered CPU can read
-            // has_waiter == 0 stale and skip the wake to a subscriber already
-            // parked in futex_wait (a lost wakeup until its timeout). Pairs
-            // with the subscriber's fence. x86's locked RMW already fences,
-            // which is why this never surfaced on x86.
+            // Pair with the subscriber's fence: publish write_pos before checking
+            // has_waiter, so either the subscriber sees the position or we send a wake.
             std::atomic_thread_fence(std::memory_order_seq_cst);
             carrier |= wake_ring(ring);
             ++delivered;
         }
 
-        // Batch release excess refs for all non-delivered rings.
-        // Safe because: Free rings have no drain to race with, and
-        // Draining rings where CAS failed never admitted us (in_flight
-        // was never incremented), so their drain doesn't depend on us.
+        // Release references that were not transferred to ring entries.
+        // Any ring admission for these deliveries has already been released.
         if (excess > 0)
         {
             uint32_t prev = slot->refcount.fetch_sub(excess,
@@ -278,7 +274,7 @@ namespace kickmsg
 
     int32_t Publisher::send(void const* data, std::size_t len)
     {
-        if (len > header_->slot_data_size)
+        if (len > geom_.slot_data_size)
         {
             return -EMSGSIZE;
         }
@@ -298,10 +294,16 @@ namespace kickmsg
                                                      microseconds timeout)
     {
         constexpr int CHECK_INTERVAL = 1024;
-        nanoseconds start = kickmsg::monotonic_ns();
 
+        // Avoid a clock read when the predecessor is already committed.
         uint64_t first = e.sequence.load(std::memory_order_acquire);
-        uint64_t seq   = first;
+        if (not seq_is_locked(first) and seq_pos(first) >= expected_seq)
+        {
+            return CommitWait{first, false};
+        }
+
+        nanoseconds start = kickmsg::monotonic_ns();
+        uint64_t    seq   = first;
         int i = 0;
         while (true)
         {
@@ -355,7 +357,7 @@ namespace kickmsg
         {
             return;  // at most one wrap behind: normal contention residue
         }
-        if (entry_steal_and_clear(e, pos, seq))
+        if (entry_steal_and_skip(e, pos, seq))
         {
             header_->steal_count.fetch_add(1, std::memory_order_relaxed);
         }
@@ -365,11 +367,11 @@ namespace kickmsg
     {
         // idx is read from a ring entry a peer wrote; a crashed or hostile
         // publisher can leave it out of range (this also covers INVALID_SLOT).
-        if (idx >= header_->pool_size)
+        if (idx >= geom_.pool_size)
         {
             return;
         }
-        auto*    s    = slot_at(base_, header_, idx);
+        auto*    s    = slot_at(base_, geom_, idx);
         uint32_t prev = s->refcount.fetch_sub(1, std::memory_order_acq_rel);
         if (prev == 1)
         {

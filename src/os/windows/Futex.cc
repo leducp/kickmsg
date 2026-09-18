@@ -7,11 +7,8 @@
 
 namespace kickmsg
 {
-    // The watched word is the LOW 32 bits of the 64-bit counter; on a
-    // big-endian target &word addresses the HIGH half and the value check
-    // silently breaks (lost wakeups until timeout).  MSVC has no
-    // __BYTE_ORDER__, but every Windows target (x86, x64, ARM64) is
-    // little-endian.
+    // Wait on the low 32 bits of the counter. Supported Windows targets
+    // (x86, x64, ARM64) are little-endian.
 #if defined(__BYTE_ORDER__)
     static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
         "WaitOnAddress word aliasing assumes the low half of write_pos at offset 0");
@@ -22,9 +19,7 @@ namespace kickmsg
         auto* addr = reinterpret_cast<void*>(&word);
         auto  val  = static_cast<uint32_t>(expected);
 
-        // to_poll_ms rounds up, so a sub-millisecond budget still waits rather than
-        // returning at once and spinning, and clamps to INT_MAX -- below INFINITE, which
-        // this must never pass by accident.
+        // Round up fractional milliseconds and clamp below INFINITE.
         DWORD timeout_ms = static_cast<DWORD>(to_poll_ms(timeout));
 
         if (WaitOnAddress(addr, &val, sizeof(val), timeout_ms))
@@ -38,6 +33,9 @@ namespace kickmsg
         return -EINVAL;
     }
 
+    // WakeByAddressAll wakes only this process. Cross-process receive() can
+    // wait until timeout, during which unread messages may overflow the ring.
+    // See the Windows limitation in ARCHITECTURE.md.
     void futex_wake_all(std::atomic<uint64_t>& word)
     {
         WakeByAddressAll(reinterpret_cast<void*>(&word));

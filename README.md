@@ -315,7 +315,12 @@ invalid value falls back to `0600` with a warning on stderr.
 |----------|-------------|-------|
 | Linux | `shm_open` / `mmap` | `SYS_futex` |
 | macOS | `shm_open` / `mmap` | `__ulock_wait` / `__ulock_wake` |
-| Windows | `CreateFileMapping` / `MapViewOfFile` | `WaitOnAddress` / `WakeByAddressAll` |
+| Windows | `CreateFileMapping` / `MapViewOfFile` | `WaitOnAddress` / `WakeByAddressAll` (*) |
+
+(*) **Windows limitation:** `WakeByAddressAll` wakes only the calling process.
+A cross-process `receive()` may wait until timeout; unread messages can overflow
+the ring during that wait. Use a timeout within the ring's buffering budget,
+or poll. See [ARCHITECTURE.md](ARCHITECTURE.md) (Platform Abstraction).
 
 Actively validated on Linux x86-64, Linux ARM64 (Raspberry Pi 4B, 12 h continuous stress), and Darwin ARM64 (Apple Silicon, 12 h continuous stress: 2660 passes, 0 failures, 0 reorders) via `scripts/validate.sh` and `tests/endurance.sh`.
 

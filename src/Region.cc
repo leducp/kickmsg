@@ -23,6 +23,11 @@ namespace kickmsg
             {
                 throw std::runtime_error("pool_size must be > 0");
             }
+            // Slot indices ride in Entry::meta's 24-bit field; see types.h.
+            if (cfg.pool_size > MAX_POOL_SIZE)
+            {
+                throw std::runtime_error("pool_size exceeds MAX_POOL_SIZE");
+            }
             if (cfg.max_subscribers == 0)
             {
                 throw std::runtime_error("max_subscribers must be > 0");
@@ -58,17 +63,24 @@ namespace kickmsg
                 throw std::runtime_error("creator_name exceeds 65535 bytes");
             }
 
+            // Check additions and alignment before computing strides, which must not wrap.
+            if (cfg.sub_ring_capacity > (SIZE_MAX - sizeof(SubRingHeader) - CACHE_LINE) / sizeof(Entry))
+            {
+                throw std::runtime_error("Config too large: ring stride overflows");
+            }
+            if (cfg.max_payload_size > SIZE_MAX - sizeof(SlotHeader) - CACHE_LINE)
+            {
+                throw std::runtime_error("Config too large: slot stride overflows");
+            }
+
             RegionLayout layout;
             layout.creator_len      = static_cast<uint16_t>(name_len);
             layout.header_size      = align_up(sizeof(Header) + layout.creator_len, CACHE_LINE);
-            layout.ring_stride      = align_up(
-                sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
+            layout.ring_stride      = align_up(sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
             layout.slot_stride      = align_up(sizeof(SlotHeader) + cfg.max_payload_size, CACHE_LINE);
             layout.sub_rings_offset = layout.header_size;
 
-            // Overflow guards: a cfg with huge counts must not wrap total_size
-            // into a small value that maps a tiny region while publishers and
-            // subscribers stride off the end.
+            // Reject sizes that overflow the mapped region length.
             if (cfg.max_subscribers > (SIZE_MAX - layout.sub_rings_offset) / layout.ring_stride)
             {
                 throw std::runtime_error("Config too large: subscriber rings overflow");
@@ -81,6 +93,21 @@ namespace kickmsg
             layout.total_size = layout.pool_offset + cfg.pool_size * layout.slot_stride;
             return layout;
         }
+    }
+
+    void SharedRegion::capture_geometry()
+    {
+        auto const* h = header();
+        geom_.sub_rings_offset   = h->sub_rings_offset;
+        geom_.sub_ring_stride    = h->sub_ring_stride;
+        geom_.sub_ring_capacity  = h->sub_ring_capacity;
+        geom_.sub_ring_mask      = h->sub_ring_mask;
+        geom_.pool_offset        = h->pool_offset;
+        geom_.slot_stride        = h->slot_stride;
+        geom_.pool_size          = h->pool_size;
+        geom_.slot_data_size     = h->slot_data_size;
+        geom_.max_subs           = h->max_subs;
+        geom_.commit_timeout_us  = h->commit_timeout_us;
     }
 
     void SharedRegion::stamp_new_region(channel::Type type, channel::Config const& cfg,
@@ -111,14 +138,8 @@ namespace kickmsg
         h->creator_name_len  = creator_len;
         std::memcpy(header_creator_name(h), creator_name, creator_len);
 
-        // Optional payload schema: publish directly before the magic store.
-        // No claim state machine needed at creation because (a) we are the
-        // only writer -- no concurrent claimant can race -- and (b) the
-        // release-store of MAGIC below carries all preceding writes,
-        // including the memcpy into schema_data and this relaxed store of
-        // schema_state, across to any reader that acquire-loads MAGIC.
-        // The relaxed is therefore correct; do NOT "fix" it to release in
-        // isolation -- MAGIC is the sole publication fence for this region.
+        // The creator is the only writer. The release-store of MAGIC publishes
+        // the schema bytes and relaxed schema_state store.
         if (cfg.schema.has_value())
         {
             std::memcpy(&h->schema_data, &*cfg.schema, sizeof(SchemaInfo));
@@ -150,28 +171,20 @@ namespace kickmsg
         // Write magic LAST with release: create_or_open() polls magic with
         // acquire, so all preceding init stores are visible once magic == MAGIC.
         h->magic.store(MAGIC, std::memory_order_release);
+
+        // Capture the initialized geometry for later pointer arithmetic.
+        capture_geometry();
     }
 
     namespace
     {
-        /// Validate that an already-attached Header has internally
-        /// consistent geometry.
-        ///
-        /// Reject a Header whose geometry fields are not self-consistent.
-        /// attach_open() trusts caller-supplied bytes, and every offset /
-        /// stride / count / length below drives later pointer math in
-        /// Publisher, Subscriber, info() and the repair paths -- junk here
-        /// means wild pointers. A region kickmsg itself stamped always
-        /// passes; only corrupt or hostile input fails. open() runs it too
-        /// as defense in depth. Caller has already checked magic, version,
-        /// and size >= total_size.
+        /// Validate all geometry used for pointer arithmetic.
+        /// The caller has checked magic, version, and size >= total_size.
         void validate_header_geometry(Header const* h)
         {
-            // channel::None carries no ring geometry and is never stamped by
-            // create(); rejecting it here is what makes that guarantee hold
-            // against a corrupt or hostile peer region as well.
-            if (h->channel_type != channel::PubSub
-                and h->channel_type != channel::Broadcast)
+            // Only PubSub and Broadcast have ring geometry.
+            if (h->channel_type != channel::PubSub and
+                h->channel_type != channel::Broadcast)
             {
                 throw std::runtime_error("Header geometry: unsupported channel type");
             }
@@ -181,66 +194,78 @@ namespace kickmsg
                     "Header geometry: total_size smaller than Header");
             }
 
-            // No zero counts or strides -- divide-by-zero protection for
-            // the bound checks below depends on these, and stamp_new_region
-            // never produces a zero here.
-            if (h->max_subs == 0 or h->pool_size == 0
-                or h->slot_data_size == 0 or h->sub_ring_capacity == 0
-                or h->slot_stride == 0    or h->sub_ring_stride == 0)
+            // Nonzero counts and strides are required by the divisions below.
+            if (h->max_subs == 0 or
+                h->pool_size == 0 or
+                h->slot_data_size == 0 or
+                h->sub_ring_capacity == 0 or
+                h->slot_stride == 0 or
+                h->sub_ring_stride == 0)
             {
                 throw std::runtime_error(
                     "Header geometry: zero-cardinality field");
             }
 
+            // Slot indices must stay representable in Entry::meta, or a peer
+            // could name a slot the claim word cannot round-trip.
+            if (h->pool_size > MAX_POOL_SIZE)
+            {
+                throw std::runtime_error("Header geometry: pool_size exceeds MAX_POOL_SIZE");
+            }
             if (not is_power_of_two(h->sub_ring_capacity))
             {
-                throw std::runtime_error(
-                    "Header geometry: sub_ring_capacity not a power of 2");
+                throw std::runtime_error("Header geometry: sub_ring_capacity not a power of 2");
             }
             if (h->sub_ring_mask != h->sub_ring_capacity - 1)
             {
-                throw std::runtime_error(
-                    "Header geometry: sub_ring_mask inconsistent with capacity");
+                throw std::runtime_error("Header geometry: sub_ring_mask inconsistent with capacity");
             }
 
             // Sub-rings span [sub_rings_offset, pool_offset); pool spans
             // [pool_offset, total_size).
-            if (h->sub_rings_offset < sizeof(Header)
-                or h->sub_rings_offset >= h->pool_offset
-                or h->pool_offset >= h->total_size)
+            if (h->sub_rings_offset < sizeof(Header) or
+                h->sub_rings_offset >= h->pool_offset or
+                h->pool_offset >= h->total_size)
             {
-                throw std::runtime_error(
-                    "Header geometry: ring/pool offsets out of range");
+                throw std::runtime_error("Header geometry: ring/pool offsets out of range");
             }
 
             // creator_name tail lives in [sizeof(Header), sub_rings_offset);
             // bound it there so info() can't read into the ring/pool area.
             if (h->creator_name_len > h->sub_rings_offset - sizeof(Header))
             {
-                throw std::runtime_error(
-                    "Header geometry: creator_name_len exceeds tail");
+                throw std::runtime_error("Header geometry: creator_name_len exceeds tail");
+            }
+
+            // Shared atomics require cache-line-aligned offsets and strides.
+            if ((h->sub_rings_offset % CACHE_LINE) != 0 or
+                (h->pool_offset      % CACHE_LINE) != 0 or
+                (h->sub_ring_stride  % CACHE_LINE) != 0 or
+                (h->slot_stride      % CACHE_LINE) != 0)
+            {
+                throw std::runtime_error("Header geometry: offset or stride not cache-line aligned");
             }
 
             // Bound sub_ring_capacity by total_size before multiplying so
             // the min_ring_stride product can't overflow on a junk value.
             if (h->sub_ring_capacity > h->total_size / sizeof(Entry))
             {
-                throw std::runtime_error(
-                    "Header geometry: sub_ring_capacity exceeds region");
+                throw std::runtime_error("Header geometry: sub_ring_capacity exceeds region");
             }
-            std::size_t const min_ring_stride =
-                sizeof(SubRingHeader) + h->sub_ring_capacity * sizeof(Entry);
+            std::size_t const min_ring_stride = sizeof(SubRingHeader) + h->sub_ring_capacity * sizeof(Entry);
             if (h->sub_ring_stride < min_ring_stride)
             {
-                throw std::runtime_error(
-                    "Header geometry: sub_ring_stride too small");
+                throw std::runtime_error("Header geometry: sub_ring_stride too small");
             }
-            std::size_t const min_slot_stride =
-                sizeof(SlotHeader) + h->slot_data_size;
+            // Bound the payload size before adding to it, to prevent overflow.
+            if (h->slot_data_size > h->total_size - sizeof(SlotHeader))
+            {
+                throw std::runtime_error("Header geometry: slot_data_size exceeds region");
+            }
+            std::size_t const min_slot_stride = sizeof(SlotHeader) + h->slot_data_size;
             if (h->slot_stride < min_slot_stride)
             {
-                throw std::runtime_error(
-                    "Header geometry: slot_stride too small");
+                throw std::runtime_error("Header geometry: slot_stride too small");
             }
 
             // max_subs * sub_ring_stride must fit in the rings region.
@@ -248,29 +273,23 @@ namespace kickmsg
             std::size_t const rings_space = h->pool_offset - h->sub_rings_offset;
             if (h->max_subs > rings_space / h->sub_ring_stride)
             {
-                throw std::runtime_error(
-                    "Header geometry: subscriber rings overflow pool_offset");
+                throw std::runtime_error("Header geometry: subscriber rings overflow pool_offset");
             }
 
             // pool_size * slot_stride must fit in the pool region.
             std::size_t const pool_space = h->total_size - h->pool_offset;
             if (h->pool_size > pool_space / h->slot_stride)
             {
-                throw std::runtime_error(
-                    "Header geometry: slot pool overflow total_size");
+                throw std::runtime_error("Header geometry: slot pool overflow total_size");
             }
         }
 
-        // Validate an already-mapped region: throws on a buffer too small
-        // to even hold a Header, bad magic, bad version, buffer too small
-        // for the embedded total_size, or geometry fields that would make
-        // downstream pointer math wild.
+        // Validate the header and geometry before using offsets into the mapping.
         void validate_opened(void* address, std::size_t size)
         {
             if (size < sizeof(Header))
             {
-                throw std::runtime_error(
-                    "Buffer smaller than region Header");
+                throw std::runtime_error("Buffer smaller than region Header");
             }
             auto* h = static_cast<Header*>(address);
             if (h->magic.load(std::memory_order_acquire) != MAGIC)
@@ -283,8 +302,7 @@ namespace kickmsg
             }
             if (size < h->total_size)
             {
-                throw std::runtime_error(
-                    "Buffer smaller than embedded region total_size");
+                throw std::runtime_error("Buffer smaller than embedded region total_size");
             }
             validate_header_geometry(h);
         }
@@ -349,6 +367,7 @@ namespace kickmsg
         region.size_ = size;
         region.name_ = label;
         validate_opened(region.base_, region.size_);
+        region.capture_geometry();
         return region;
     }
 
@@ -379,12 +398,11 @@ namespace kickmsg
         region.base_ = region.shm_.address();
         region.size_ = region.shm_.size();
         validate_opened(region.base_, region.size_);
+        region.capture_geometry();
         uint64_t stamped = region.header()->identity_hash;
         if (expected_identity != 0 and stamped != 0 and stamped != expected_identity)
         {
-            throw std::runtime_error(
-                std::string{"Identity mismatch on existing region (shm name collision): "}
-                + name);
+            throw std::runtime_error(std::string{"Identity mismatch on existing region (shm name collision): "} + name);
         }
         return region;
     }
@@ -396,13 +414,8 @@ namespace kickmsg
         validate_config(type, cfg);
         RegionLayout layout = compute_layout(cfg, creator_name);
 
-        // Try to be the creator.  On success, try_create leaves the
-        // SharedMemory fully mapped -- we stamp the header directly rather
-        // than closing and re-entering SharedMemory::create, which would
-        // require either O_TRUNC (rejected on Darwin) or shm_unlink +
-        // recreate (introduces a tiny race window where a concurrent
-        // caller could see the name missing or point to a different
-        // object than the one they initially observed).
+        // Initialize the mapping returned by try_create; reopening could race
+        // with another creator or require truncating the shared object.
         SharedRegion region;
         region.name_ = name;
         if (region.shm_.try_create(name, layout.total_size))
@@ -425,31 +438,26 @@ namespace kickmsg
             if (shm.try_open(name))
             {
                 auto* h = static_cast<Header*>(shm.address());
-                if (h->magic.load(std::memory_order_acquire) == MAGIC
-                    and h->version == VERSION)
+                if (h->magic.load(std::memory_order_acquire) == MAGIC and
+                    h->version == VERSION)
                 {
                     if (h->config_hash != expected_hash)
                     {
-                        throw std::runtime_error(
-                            std::string{"Config mismatch on existing region: "} + name);
+                        throw std::runtime_error(std::string{"Config mismatch on existing region: "} + name);
                     }
                     if (cfg.identity != 0 and h->identity_hash != 0
                         and h->identity_hash != cfg.identity)
                     {
-                        throw std::runtime_error(
-                            std::string{"Identity mismatch on existing region "
-                                        "(shm name collision): "} + name);
+                        throw std::runtime_error(std::string{"Identity mismatch on existing region (shm name collision): "} + name);
                     }
                     SharedRegion region;
                     region.name_ = name;
                     region.shm_  = std::move(shm);
                     region.base_ = region.shm_.address();
                     region.size_ = region.shm_.size();
-                    // config_hash covers the cfg fields but NOT total_size,
-                    // offsets, or strides -- validate the geometry like
-                    // open()/attach_open() so a corrupt or partially-stamped
-                    // creator can't hand us junk that later pointer math trusts.
+                    // The config hash does not cover offsets, strides, or total_size.
                     validate_opened(region.base_, region.size_);
+                    region.capture_geometry();
                     return region;
                 }
                 // SHM exists but magic/version not ready yet -- creator
@@ -459,22 +467,13 @@ namespace kickmsg
             kickmsg::sleep(10ms);
         }
 
-        throw std::runtime_error(
-            std::string{"Timed out waiting for region init: "} + name);
+        throw std::runtime_error(std::string{"Timed out waiting for region init: "} + name);
     }
 
     void SharedRegion::unlink()
     {
-        // Release the OS-level name backing this region.  Existing
-        // mappings -- this process and every peer that already opened
-        // the region -- keep working until their last reference drops;
-        // only the region's discoverability by name is affected.  Any
-        // holder, creator or opener, may call this.  Future open-by-
-        // name behaviour is OS-dependent and intentionally left to the
-        // backend.
-        //
-        // Skipped for injected regions (shm_ never opened): the caller
-        // owns the memory; kickmsg has no OS-level name to release.
+        // Unlinking removes the name; existing mappings remain valid.
+        // Injected regions have no OS name to remove.
         if (shm_.is_open() and not name_.empty())
         {
             SharedMemory::unlink(name_);
@@ -487,9 +486,7 @@ namespace kickmsg
         auto* h = header();
         HealthReport report{};
 
-        // Schema slot wedged at Claiming: crashed claimant that CAS'd but
-        // never reached Set.  Mirrors the operator-surface pattern of
-        // retired_rings/locked_entries -- reset_schema_claim() recovers it.
+        // Claiming may be transient or left by a crashed schema writer.
         report.schema_stuck =
             (h->schema_state.load(std::memory_order_acquire) == schema::Claiming);
 
@@ -536,11 +533,7 @@ namespace kickmsg
                 ++report.draining_rings;
             }
 
-            // A Live/Draining/Reclaiming ring whose owner process is gone
-            // is an orphan no other count surfaces (a dead Live ring
-            // otherwise reads as healthy; Reclaiming is the residue of a
-            // reclaimer that crashed mid-pass). reclaim_dead_rings()
-            // recovers all three.
+            // Count dead ring owners separately from ring state.
             if ((state == ring::Live or state == ring::Draining
                  or state == ring::Reclaiming)
                 and ring_owner_dead(ring))
@@ -594,7 +587,7 @@ namespace kickmsg
                 {
                     // Case B: committed >1 wrap behind (claimant crashed
                     // before its lock CAS).
-                    if (entry_steal_and_clear(e, pos, seq))
+                    if (entry_steal_and_skip(e, pos, seq))
                     {
                         h->steal_count.fetch_add(1, std::memory_order_relaxed);
                         ++repaired;
@@ -618,7 +611,7 @@ namespace kickmsg
             {
                 continue;
             }
-            if (entry_steal_and_clear(*c.entry, c.pos, c.seq))
+            if (entry_steal_and_skip(*c.entry, c.pos, c.seq))
             {
                 h->steal_count.fetch_add(1, std::memory_order_relaxed);
                 ++repaired;
@@ -639,8 +632,8 @@ namespace kickmsg
             auto*    ring   = sub_ring_at(b, h, static_cast<uint32_t>(i));
             uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
 
-            if (ring::get_state(packed) == ring::Free
-                and ring::get_in_flight(packed) > 0)
+            if (ring::get_state(packed) == ring::Free and
+                ring::get_in_flight(packed) > 0)
             {
                 // Already Free but unclaimable while in_flight > 0: the store below is
                 // the hand-off, so the retraction still goes first.
@@ -668,8 +661,9 @@ namespace kickmsg
 
             // Reclaiming residue (reclaimer crashed mid-pass) is only
             // recoverable here.
-            if (state != ring::Live and state != ring::Draining
-                and state != ring::Reclaiming)
+            if (state != ring::Live and
+                state != ring::Draining and
+                state != ring::Reclaiming)
             {
                 continue;
             }
@@ -678,11 +672,8 @@ namespace kickmsg
                 continue;
             }
 
-            // Two-phase, mirroring Registry::sweep_stale: a naive CAS retry
-            // is value-ABA-prone (ring freed and re-claimed between checks
-            // would be stomped).  Single-shot CAS to Reclaiming, re-verify
-            // death under that exclusivity; in_flight churn just defers the
-            // ring to the next pass.
+            // Use one CAS attempt, then recheck owner death. A retry could acquire
+            // a replacement owner's ring; in_flight changes defer this pass.
             uint32_t fresh = ring->state_flight.load(std::memory_order_acquire);
             if (ring::get_state(fresh) != state)
             {
@@ -697,9 +688,7 @@ namespace kickmsg
 
             if (ring_owner_dead(ring))
             {
-                // Still held Reclaiming, so still ours. The CAS below PRESERVES
-                // in_flight: zeroing it underflows into the state bits on a late
-                // fetch_sub.
+                // Preserve in_flight so a late publisher decrement cannot underflow state.
                 clear_owner(ring);
 
                 uint32_t old = claim;
@@ -746,9 +735,7 @@ namespace kickmsg
         }
         SchemaInfo out;
         std::memcpy(&out, &h->schema_data, sizeof(SchemaInfo));
-        // name is a C string consumers stream with operator<<; a hostile or
-        // corrupt region may leave it unterminated. Force a terminator so a
-        // reader can't run off the array.
+        // Ensure the copied schema name is terminated before consumers read it.
         out.name[sizeof(out.name) - 1] = '\0';
         return out;
     }
@@ -758,15 +745,9 @@ namespace kickmsg
         auto*    h        = header();
         uint32_t expected = schema::Unset;
 
-        // Acq_rel on success: acquire so any prior claim's Set is visible on
-        // retry paths; release so our pre-CAS zeroing (none here) is ordered
-        // before subsequent writes to schema_data (still fine: Claiming is
-        // only visible once CAS wins, and the payload write happens-before
-        // the Set release-store below).
-        if (h->schema_state.compare_exchange_strong(
-                expected, schema::Claiming,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire))
+        // Acquire observes prior claims; the later Set release-store publishes data.
+        if (h->schema_state.compare_exchange_strong(expected, schema::Claiming,
+                std::memory_order_acq_rel, std::memory_order_acquire))
         {
             std::memcpy(&h->schema_data, &info, sizeof(SchemaInfo));
             // Release: pairs with the acquire in schema() so a reader that
@@ -775,18 +756,8 @@ namespace kickmsg
             return true;
         }
 
-        // Someone else won the claim.  If they're mid-write, wait briefly
-        // for the state to settle at Set so a follow-up schema() read is
-        // meaningful -- but bound the wait: a claimant that crashed between
-        // CAS->Claiming and store->Set leaves the slot wedged.  Operators
-        // recover such a wedge with reset_schema_claim(), and diagnose()
-        // surfaces it via HealthReport::schema_stuck.
-        //
-        // MAX_YIELDS is chosen empirically: a memcpy of SchemaInfo (512 B)
-        // plus a release-store completes in well under a microsecond on
-        // any target platform, so 1024 yields gives the legitimate winner
-        // several orders of magnitude more than it needs while keeping the
-        // worst-case wait on a crashed claimant imperceptible to callers.
+        // Wait briefly for an active schema writer, but bound the wait if it died.
+        // A confirmed dead claimant can be cleared with reset_schema_claim().
         constexpr int MAX_YIELDS = 1024;
         for (int i = 0; i < MAX_YIELDS and expected == schema::Claiming; ++i)
         {
@@ -798,18 +769,11 @@ namespace kickmsg
 
     bool SharedRegion::reset_schema_claim()
     {
-        // Force a wedged Claiming state back to Unset so a new claim can
-        // proceed.  Analogous to reset_retired_rings(): a deliberate
-        // post-crash action, NOT safe under live traffic.  Only call after
-        // confirming the original claimant is gone; otherwise a slow-but-
-        // alive writer could finish its memcpy into schema_data and then
-        // release-store Set, while a new claimant is concurrently using
-        // the slot -- producing torn bytes.
+        // Only reset after the original claimant has stopped; a live writer could
+        // otherwise publish data while a new claimant overwrites it.
         uint32_t expected = schema::Claiming;
-        return header()->schema_state.compare_exchange_strong(
-            expected, schema::Unset,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed);
+        return header()->schema_state.compare_exchange_strong(expected, schema::Unset,
+            std::memory_order_acq_rel, std::memory_order_relaxed);
     }
 
     RegionStats SharedRegion::stats() const
@@ -841,11 +805,8 @@ namespace kickmsg
             {
                 ++out.live_rings;
             }
-            // Max across ALL rings: a Free ring's write_pos is frozen at
-            // whatever value it had when its last subscriber left, so it's
-            // a valid past observation.  Using max (not sum) matches the
-            // "publish events observed by the channel" semantic and stays
-            // monotonic across subscriber churn.
+            // Include Free rings: their frozen write_pos is a valid past observation.
+            // The maximum stays monotonic across subscriber changes.
             if (rs.write_pos > out.total_writes)
             {
                 out.total_writes = rs.write_pos;
@@ -856,12 +817,8 @@ namespace kickmsg
             out.rings.push_back(rs);
         }
 
-        // Approximate free-slot count: walk the Treiber stack from the head,
-        // bounded by pool_size so a concurrent push/pop storm can't fool us
-        // into an unbounded loop.  Under churn we can undercount (a slot
-        // being popped mid-walk) or overcount (a slot's next_free pointing
-        // to a just-pushed node we've already counted) -- acceptable for a
-        // diagnostic view.
+        // Bound the free-stack walk by pool_size. Concurrent changes can cause
+        // an overcount or undercount.
         uint64_t top = h->free_top.load(std::memory_order_acquire);
         uint32_t idx = tagged_idx(top);
         uint64_t count = 0;
@@ -923,26 +880,19 @@ namespace kickmsg
             }
             for (uint64_t pos = start; pos < wp; ++pos)
             {
-                auto&    e   = entries[pos & h->sub_ring_mask];
-                uint64_t seq = e.sequence.load(std::memory_order_acquire);
+                auto& e = entries[pos & h->sub_ring_mask];
 
-                // Skip uncommitted, locked, and skip-marker entries (the
-                // latter carry untrustworthy metadata by design).
-                if (not seq_is_locked(seq) and not seq_is_skip(seq)
-                    and seq >= pos + 1)
+                // Locked and skip-marked entries still own the slots named by their claims.
+                uint32_t biased = meta_slot_biased(e.meta.load(std::memory_order_acquire));
+                if (biased != 0 and biased - 1 < h->pool_size)
                 {
-                    uint32_t idx = e.slot_idx.load(std::memory_order_acquire);
-                    if (idx < h->pool_size)
-                    {
-                        referenced[idx] = true;
-                    }
+                    referenced[biased - 1] = true;
                 }
             }
         }
 
-        // Free-stack membership (exact under the quiescence contract)
-        // recovers rc == 0 orphans a refcount-only scan never could;
-        // bounded against corrupt next_free cycles.
+        // Under quiescence, free-stack membership also identifies rc == 0 orphans.
+        // Bound the walk to handle corrupt cycles.
         std::vector<bool> on_stack(h->pool_size, false);
         uint64_t walked = 0;
         uint32_t idx32  = tagged_idx(h->free_top.load(std::memory_order_acquire));
