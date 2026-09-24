@@ -5,6 +5,13 @@
 
 using namespace std::chrono;
 
+// One reservation, one owner.
+static_assert(std::is_move_constructible_v<kickmsg::AllocatedSlot>);
+static_assert(std::is_move_assignable_v<kickmsg::AllocatedSlot>);
+static_assert(not std::is_copy_constructible_v<kickmsg::AllocatedSlot>,
+    "copying would give two objects the same slot to publish and release");
+static_assert(not std::is_copy_assignable_v<kickmsg::AllocatedSlot>);
+
 class PublisherTest : public ::testing::Test
 {
 public:
@@ -30,6 +37,84 @@ public:
         return cfg;
     }
 };
+
+// Moving a publisher invalidates its outstanding handle, and nothing else can
+// publish that reservation, so the slot must go back to the pool at once.
+TEST_F(PublisherTest, MovingAPublisherDetachesItsOutstandingSlot)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+
+    auto held = region.stats().pool_free;
+    {
+        kickmsg::Publisher first(region);
+        auto slot = first.allocate();
+        ASSERT_TRUE(slot.valid());
+        uint32_t val = 42;
+        slot.write(&val, sizeof(val));
+        held = region.stats().pool_free;
+
+        kickmsg::Publisher second(std::move(first));
+        EXPECT_FALSE(slot.valid()) << "handle still claims a reservation it lost";
+        EXPECT_EQ(slot.publish(sizeof(val)), 0u);
+        EXPECT_FALSE(sub.try_receive().has_value());
+
+        EXPECT_EQ(region.stats().pool_free, held + 1)
+            << "an unreachable reservation stayed pinned after the move";
+    }
+    EXPECT_EQ(region.stats().pool_free, cfg.pool_size);
+}
+
+// Move-assignment used to hand the destination the source's reservation
+// counter.  A handle issued earlier by the destination then matched again, so
+// two handles believed they owned one slot -- and the stale one's destructor
+// returned the live one's slot to the pool while it was still being written.
+TEST_F(PublisherTest, MoveAssignmentDoesNotRevalidateOlderHandles)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    kickmsg::Publisher first(region);
+    kickmsg::Publisher second(region);
+
+    // Both counters are at 1, which is what used to make these collide.
+    auto stale = first.allocate();
+    auto live  = second.allocate();
+    ASSERT_TRUE(stale.valid());
+    ASSERT_TRUE(live.valid());
+
+    first = std::move(second);
+    EXPECT_FALSE(stale.valid()) << "an older handle matched the inherited counter";
+    EXPECT_FALSE(live.valid());
+    EXPECT_EQ(region.stats().pool_free, cfg.pool_size)
+        << "a reservation no handle can publish stayed pinned after the move";
+
+    auto before = region.stats().pool_free;
+    {
+        auto sink = std::move(stale);   // destructor runs here
+    }
+    EXPECT_EQ(region.stats().pool_free, before)
+        << "a stale handle released a slot it did not own";
+}
+
+TEST_F(PublisherTest, ReusedMovedFromPublisherDoesNotRevalidateOlderHandles)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+
+    kickmsg::Publisher first(region);
+    auto stale = first.allocate();
+    ASSERT_TRUE(stale.valid());
+
+    kickmsg::Publisher second(std::move(first));
+    auto fresh = first.allocate();
+    ASSERT_TRUE(fresh.valid());
+    EXPECT_FALSE(stale.valid()) << "the moved-from publisher reissued an old id";
+    EXPECT_EQ(stale.publish(0), 0u);
+    EXPECT_FALSE(sub.try_receive().has_value());
+}
 
 TEST_F(PublisherTest, SendReceiveSingleMessage)
 {
@@ -59,14 +144,13 @@ TEST_F(PublisherTest, AllocatePublishSeparately)
     kickmsg::Subscriber sub(region);
     kickmsg::Publisher  pub(region);
 
-    auto a = pub.allocate();
-    ASSERT_NE(a.data, nullptr);
-    EXPECT_GE(a.max_size, sizeof(uint32_t));
+    auto slot = pub.allocate();
+    ASSERT_TRUE(slot.valid());
+    EXPECT_GE(slot.max_size(), sizeof(uint32_t));
 
     uint32_t val = 42;
-    std::memcpy(a.data, &val, sizeof(val));
-    std::size_t delivered = pub.publish(sizeof(val));
-    EXPECT_EQ(delivered, 1u);
+    EXPECT_EQ(slot.write(&val, sizeof(val)), sizeof(val));
+    EXPECT_EQ(slot.publish(sizeof(val)), 1u);
 
     auto sample = sub.try_receive();
     ASSERT_TRUE(sample.has_value());
@@ -82,9 +166,9 @@ TEST_F(PublisherTest, AllocateExposesMaxSize)
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
     kickmsg::Publisher pub(region);
 
-    auto a = pub.allocate();
-    ASSERT_NE(a.data, nullptr);
-    EXPECT_EQ(a.max_size, cfg.max_payload_size);
+    auto slot = pub.allocate();
+    ASSERT_TRUE(slot.valid());
+    EXPECT_EQ(slot.max_size(), cfg.max_payload_size);
 }
 
 TEST_F(PublisherTest, SendReturnsEmsgsize)
@@ -109,15 +193,17 @@ TEST_F(PublisherTest, PublishOversizedLenReturnsZeroAndRecyclesSlot)
     kickmsg::Subscriber sub(region);
     kickmsg::Publisher  pub(region);
 
-    auto a = pub.allocate();
-    ASSERT_NE(a.data, nullptr);
-    EXPECT_EQ(pub.publish(cfg.max_payload_size + 1), 0u);
+    auto slot = pub.allocate();
+    ASSERT_TRUE(slot.valid());
+    EXPECT_EQ(slot.publish(cfg.max_payload_size + 1), 0u);
 
     // The oversized publish must have recycled the pending slot: with
     // pool_size == 1, a leak would make this allocate() fail.
-    auto b = pub.allocate();
-    ASSERT_NE(b.data, nullptr);
-    EXPECT_EQ(pub.publish(sizeof(uint32_t)), 1u);
+    auto next = pub.allocate();
+    ASSERT_TRUE(next.valid());
+    uint32_t val = 42;
+    EXPECT_EQ(next.write(&val, sizeof(val)), sizeof(val));
+    EXPECT_EQ(next.publish(sizeof(val)), 1u);
 }
 
 // Pins the slot-recycling contract that caused a multi-hour soak hang: a slot
@@ -293,7 +379,7 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
 
     // Poison entry at idx=0: simulate a publisher that locked pos=4 then
     // crashed.  write_pos is already 4 (from the 4 publishes above).
-    auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* ring    = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
     auto* entries = kickmsg::ring_entries(ring);
 
     // Advance write_pos past pos=4 so the ring has wrapped.
@@ -381,7 +467,7 @@ TEST_F(PublisherTest, SelfRepairCaseB_StaleEntry)
     }
 
     // Entry at idx=0 has seq=1 (committed for pos=0).
-    auto* ring    = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* ring    = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
     auto* entries = kickmsg::ring_entries(ring);
 
     // Simulate: publisher claimed pos=4 (fetch_add) but crashed before

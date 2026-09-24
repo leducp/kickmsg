@@ -42,16 +42,17 @@ int main()
     // Publish a few "frames"
     for (uint32_t i = 0; i < 3; ++i)
     {
-        auto [ptr, max_size] = pub.allocate();
-        if (ptr == nullptr)
+        auto slot = pub.allocate();
+        if (not slot.valid())
         {
             std::cerr << "Pool exhausted at frame " << i << "\n";
             continue;
         }
 
-        ImageHeader hdr{640, 480, 3, i};
-        std::memcpy(ptr, &hdr, sizeof(hdr));
-        pub.publish(sizeof(hdr));
+        // Written straight into shared memory: no staging buffer, no copy.
+        ImageHeader header{640, 480, 3, i};
+        std::memcpy(slot.data(), &header, sizeof(header));
+        slot.publish(sizeof(header));
 
         std::cout << "Published frame " << i << " (640x480x3)\n";
     }
@@ -59,10 +60,10 @@ int main()
     // Zero-copy receive: view points directly into shared memory
     while (auto view = sub.try_receive_view())
     {
-        auto const* hdr = static_cast<ImageHeader const*>(view->data());
-        std::cout << "Received frame " << hdr->frame_id
-                  << " (" << hdr->width << "x" << hdr->height
-                  << "x" << hdr->channels << ")"
+        auto const* header = static_cast<ImageHeader const*>(view->data());
+        std::cout << "Received frame " << header->frame_id
+                  << " (" << header->width << "x" << header->height
+                  << "x" << header->channels << ")"
                   << " — zero-copy, " << view->len() << " bytes pinned\n";
 
         // The slot remains pinned while 'view' is alive.

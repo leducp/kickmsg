@@ -20,7 +20,9 @@ namespace kickmsg
 {
     namespace blackboard
     {
-        constexpr uint32_t    VERSION                = 1;
+        /// 2: payload and key bytes are accessed as relaxed atomics; a version-1 peer's
+        /// plain copies would race them again.
+        constexpr uint32_t    VERSION                = 2;
         constexpr uint64_t    MAGIC                  = 0x214B4C424B43494BULL; // "KICKBLK!"
         constexpr std::size_t KEY_MAX                = 128;
         constexpr std::size_t NODE_NAME_MAX          = 64;
@@ -86,6 +88,16 @@ namespace kickmsg
             std::string owner_node;
             bool        owner_alive;
         };
+
+        /// Validated local copy of the board geometry; offsets and bounds use only this.
+        /// The shared header stays peer-writable after open.
+        struct Geometry
+        {
+            uint32_t    capacity{0};
+            std::size_t max_value_size{0};  ///< Value limit; never the padded stride
+            std::size_t value_stride{0};
+            std::size_t values_offset{0};   ///< Byte offset of the first value cell
+        };
     }
 
     /// One value cell.  Written between the odd and even `publish` stores and
@@ -125,7 +137,9 @@ namespace kickmsg
         std::atomic<uint64_t> key_hash;         ///< resolve pre-filter only, never an identity proof
         std::atomic<uint64_t> declared_at_ns;
         uint8_t               _pad1[8];
-        char                  key[blackboard::KEY_MAX];              ///< may be unterminated
+        /// Key text as atomic words: read unlocked while a claim rewrites it.  Access only
+        /// through bb_store_key() / bb_load_key().  May be unterminated.
+        std::atomic<uint64_t> key[blackboard::KEY_MAX / sizeof(uint64_t)];
         char                  owner_node[blackboard::NODE_NAME_MAX]; ///< may be unterminated
         uint8_t               _padding[128];
     };
@@ -135,6 +149,8 @@ namespace kickmsg
         "entry stride must keep every entry cache-line aligned");
     static_assert(offsetof(BlackboardEntry, key) == 64,
         "the guard words must occupy exactly the first cache line");
+    static_assert(blackboard::KEY_MAX % sizeof(uint64_t) == 0,
+        "key storage is whole atomic words");
     static_assert(offsetof(BlackboardEntry, _padding) == 256,
         "BlackboardEntry field offsets must match the expected 256 B prefix");
     static_assert(std::is_standard_layout<BlackboardEntry>::value,
@@ -195,8 +211,15 @@ namespace kickmsg
         "BlackboardHeader is placed in shared memory via reinterpret_cast");
 
     BlackboardEntry* bb_entry_at(void* base, uint32_t idx);
-    BlackboardCell*  bb_cell_at(void* base, uint32_t idx, uint64_t parity);
-    uint8_t*         bb_cell_payload(BlackboardCell* cell);
+    BlackboardCell*  bb_cell_at(void* base, blackboard::Geometry const& geometry, uint32_t idx, uint64_t parity);
+    /// Payload words following the cell.  Accessed only as whole relaxed words, so a
+    /// reader overlapping a writer never mixes access sizes.
+    std::atomic<uint64_t>* bb_cell_words(BlackboardCell* cell);
+
+    /// Store `len` <= KEY_MAX key bytes, zero-padded to KEY_MAX, as relaxed words.
+    void        bb_store_key(BlackboardEntry* entry, char const* key, std::size_t len);
+    /// Relaxed word copy of the stored key, cut at the first NUL or KEY_MAX.
+    std::string bb_load_key(BlackboardEntry const* entry);
 
     uint64_t bb_config_hash(blackboard::Config const& cfg);
 
@@ -292,17 +315,18 @@ namespace kickmsg
 
         private:
             friend class Blackboard;
-            Writer(void* base, uint32_t entry_idx, uint64_t tenancy,
-                   uint64_t writes, uint64_t owner_pid, std::string key);
+            Writer(void* base, blackboard::Geometry const& geometry, uint32_t entry_idx,
+                   uint64_t tenancy, uint64_t writes, uint64_t owner_pid, std::string key);
 
-            void*       base_{nullptr};
-            uint32_t    entry_idx_{INVALID_SLOT};
-            uint64_t    tenancy_{0};
-            uint64_t    writes_{0};   ///< sole owner, so this counter lives in the handle
+            void*                base_{nullptr};
+            blackboard::Geometry geometry_{};
+            uint32_t             entry_idx_{INVALID_SLOT};
+            uint64_t             tenancy_{0};
+            uint64_t             writes_{0};   ///< sole owner, so this counter lives in the handle
             /// Declaring process.  A Writer inherited across fork() writes and
             /// releases nothing: the claim stays the parent's.
-            uint64_t    owner_pid_{0};
-            std::string key_;
+            uint64_t             owner_pid_{0};
+            std::string          key_;
         };
 
         /// Declared read interest in one key.  Copyable: it owns nothing.
@@ -359,19 +383,20 @@ namespace kickmsg
 
         private:
             friend class Blackboard;
-            Reader(void* base, std::string key);
+            Reader(void* base, blackboard::Geometry const& geometry, std::string key);
 
             /// Resolves entry_idx_ if it is unset or its tenancy moved.
             /// Returns false when no active entry holds this key.
             bool resolve() const;
 
-            void*            base_{nullptr};
+            void*                base_{nullptr};
+            blackboard::Geometry geometry_{};
             /// INVALID_SLOT until the key first materializes: observing a key
             /// before its writer exists is a supported use.
-            mutable uint32_t entry_idx_{INVALID_SLOT};
-            mutable uint64_t tenancy_{0};
-            uint64_t         key_hash_{0};
-            std::string      key_;
+            mutable uint32_t     entry_idx_{INVALID_SLOT};
+            mutable uint64_t     tenancy_{0};
+            uint64_t             key_hash_{0};
+            std::string          key_;
         };
 
         /// Claim exclusive ownership of `key`.
@@ -481,6 +506,7 @@ namespace kickmsg
         std::string const& name() const { return name_; }
         uint32_t           capacity() const;
         std::size_t        max_value_size() const;
+        blackboard::Geometry const& geometry() const { return geometry_; }
 
         BlackboardHeader*       header()       { return static_cast<BlackboardHeader*>(base_); }
         BlackboardHeader const* header() const { return static_cast<BlackboardHeader const*>(base_); }
@@ -492,7 +518,7 @@ namespace kickmsg
         void init_as_creator(blackboard::Config const& cfg);
 
         /// Sweep body, run by a caller that already holds the board lock.
-        uint32_t sweep_locked(BlackboardHeader* h);
+        uint32_t sweep_locked();
 
         struct EntryRead
         {
@@ -508,11 +534,12 @@ namespace kickmsg
         std::error_code read_entry(uint32_t i, EntryRead& out,
                                    std::vector<uint8_t>* value) const;
 
-        SharedMemory shm_;
-        std::string  name_;
-        std::string  owner_name_;
-        void*        base_{nullptr};
-        std::size_t  size_{0};
+        SharedMemory         shm_;
+        std::string          name_;
+        std::string          owner_name_;
+        void*                base_{nullptr};
+        std::size_t          size_{0};
+        blackboard::Geometry geometry_{};
     };
 }
 

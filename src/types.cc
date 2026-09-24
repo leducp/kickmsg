@@ -5,18 +5,17 @@ namespace kickmsg
 {
     void clear_owner(SubRingHeader* ring)
     {
-        // Relaxed: the release of Free that follows is what publishes these.
-        // has_waiter included, or a tenant killed mid-wait leaves its mode set and every
-        // later publish pays a wake for a waiter that no longer exists.
+        // Relaxed: the following Free release-store publishes these fields.
+        // Clear has_waiter so a replacement does not inherit a stale wake mode.
         ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
         ring->owner_pid.store(0, std::memory_order_relaxed);
         ring->owner_starttime.store(0, std::memory_order_relaxed);
     }
 
-    SubRingHeader* sub_ring_at(void* base, Header const* h, uint32_t idx)
+    SubRingHeader* sub_ring_at(void* base, Geometry const& geometry, uint32_t idx)
     {
-        auto* p = static_cast<uint8_t*>(base) + h->sub_rings_offset;
-        return reinterpret_cast<SubRingHeader*>(p + idx * h->sub_ring_stride);
+        auto* p = static_cast<uint8_t*>(base) + geometry.sub_rings_offset;
+        return reinterpret_cast<SubRingHeader*>(p + idx * geometry.sub_ring_stride);
     }
 
     Entry* ring_entries(SubRingHeader* ring)
@@ -25,10 +24,10 @@ namespace kickmsg
             reinterpret_cast<uint8_t*>(ring) + sizeof(SubRingHeader));
     }
 
-    SlotHeader* slot_at(void* base, Header const* h, uint32_t idx)
+    SlotHeader* slot_at(void* base, Geometry const& geometry, uint32_t idx)
     {
-        auto* p = static_cast<uint8_t*>(base) + h->pool_offset;
-        return reinterpret_cast<SlotHeader*>(p + idx * h->slot_stride);
+        auto* p = static_cast<uint8_t*>(base) + geometry.pool_offset;
+        return reinterpret_cast<SlotHeader*>(p + idx * geometry.slot_stride);
     }
 
     SlotHeader* slot_at(void* pool_base, std::size_t slot_stride, uint32_t idx)
@@ -47,9 +46,7 @@ namespace kickmsg
         return reinterpret_cast<char*>(h) + sizeof(Header);
     }
 
-    // FNV-1a over the config fields, detecting parameter mismatches at
-    // open time.  Field order is part of the on-disk hash -- do NOT
-    // reorder without bumping VERSION.
+    // Config hash field order is part of the ABI; changes require a VERSION bump.
     uint64_t compute_config_hash(channel::Type type, channel::Config const& cfg)
     {
         uint64_t h = hash::fnv1a_64(type);
@@ -69,22 +66,18 @@ namespace kickmsg
             if (a.identity      != b.identity)      d |= Identity;
             if (a.layout        != b.layout)        d |= Layout;
             if (a.version       != b.version)       d |= Version;
-            // Compare name up to the full 128-byte slot: strncmp stops at
-            // the first NUL so trailing zero padding doesn't register as a
-            // diff, but a non-terminated stray byte inside the slot still
-            // does (better to flag than to silently drop).
+            // Compare through NUL or the fixed field size.
             if (std::strncmp(a.name, b.name, sizeof(a.name)) != 0) d |= Name;
             if (a.identity_algo != b.identity_algo) d |= IdentityAlgo;
             if (a.layout_algo   != b.layout_algo)   d |= LayoutAlgo;
-            // Intentionally NOT compared: flags, reserved[] -- see Diff
-            // doc in types.h for rationale (forward compatibility).
+            // Ignore reserved fields for forward compatibility.
             return d;
         }
     }
 
-    bool entry_steal_and_clear(Entry& e, uint64_t pos, uint64_t observed)
+    bool entry_steal_and_skip(Entry& e, uint64_t pos, uint64_t observed)
     {
-        // CAS-own before touching metadata; a live writer that moves first wins.
+        // CAS-own the sequence; a live writer that moves first wins.
         uint64_t expected = observed;
         if (not e.sequence.compare_exchange_strong(expected, seq_repair(pos),
                 std::memory_order_acquire, std::memory_order_relaxed))
@@ -92,14 +85,7 @@ namespace kickmsg
             return false;
         }
 
-        // No slot release here: the holder may have batch-released this
-        // ring's ref already (excess path) -- releasing again could
-        // double-free.  The leak is bounded and GC-recoverable.
-        e.slot_idx.store(INVALID_SLOT, std::memory_order_relaxed);
-        e.payload_len.store(0, std::memory_order_relaxed);
-        // Skip tag, not a plain sequence: the holder's late metadata stores
-        // must never be trusted (see types.h).  The INVALID stores are
-        // diagnostics only.
+        // Keep the slot claim; the next publisher or drainer releases its reference.
         e.sequence.store(seq_skip(pos), std::memory_order_release);
         return true;
     }
@@ -117,9 +103,9 @@ namespace kickmsg
         while (not top.compare_exchange_weak(old_top, new_top, std::memory_order_release, std::memory_order_relaxed));
     }
 
-    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* base, Header const* h)
+    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* base, Geometry const& geometry)
     {
-        return treiber_pop(top, static_cast<uint8_t*>(base) + h->pool_offset, h->slot_stride);
+        return treiber_pop(top, static_cast<uint8_t*>(base) + geometry.pool_offset, geometry.slot_stride, geometry.pool_size);
     }
 
     void treiber_push(std::atomic<uint64_t>& top, void* pool_base, std::size_t slot_stride, uint32_t slot_idx)
@@ -127,22 +113,32 @@ namespace kickmsg
         treiber_push(top, slot_at(pool_base, slot_stride, slot_idx), slot_idx);
     }
 
-    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* pool_base, std::size_t slot_stride)
+    uint32_t treiber_pop(std::atomic<uint64_t>& top, void* pool_base, std::size_t slot_stride,
+                         uint64_t pool_size)
     {
         // Acquire: pairs with the release in push to see the pushed slot's next_free.
         uint64_t old_top = top.load(std::memory_order_acquire);
-        while (tagged_idx(old_top) != INVALID_SLOT)
+        while (true)
         {
-            auto*    slot = slot_at(pool_base, slot_stride, tagged_idx(old_top));
+            uint32_t idx = tagged_idx(old_top);
+            if (idx == INVALID_SLOT)
+            {
+                return INVALID_SLOT;
+            }
+            // Bounds-check each shared free-list index before dereferencing it.
+            if (idx >= pool_size)
+            {
+                return INVALID_SLOT;
+            }
+            auto*    slot = slot_at(pool_base, slot_stride, idx);
             uint32_t next = slot->next_free.load(std::memory_order_relaxed);
             uint64_t new_top = tagged_pack(tagged_gen(old_top) + 1, next);
             // Acq_rel: release publishes the new top, acquire synchronizes with the last push.
             // Failure is acquire: on retry we need to see the next_free written by whoever changed top.
             if (top.compare_exchange_weak(old_top, new_top, std::memory_order_acq_rel, std::memory_order_acquire))
             {
-                return tagged_idx(old_top);
+                return idx;
             }
         }
-        return INVALID_SLOT;
     }
 }

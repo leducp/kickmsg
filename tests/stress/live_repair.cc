@@ -18,7 +18,7 @@ bool run_live_repair()
         shm_name, kickmsg::channel::PubSub, cfg, "live_repair");
 
     auto* base = region.base();
-    auto* hdr  = region.header();
+    auto* header  = region.header();
 
     constexpr int NUM_PUBS = 4;
     constexpr int NUM_SUBS = 4;
@@ -119,14 +119,14 @@ bool run_live_repair()
         {
             kickmsg::sleep(10ms);
 
-            auto* ring    = kickmsg::sub_ring_at(base, hdr, 0);
+            auto* ring    = kickmsg::sub_ring_at(base, region.geometry(), 0);
             auto* entries = kickmsg::ring_entries(ring);
 
             // fetch_add, NOT load+store: real publishers fetch_add this
             // counter concurrently and a lost increment would hand two
             // publishers the same position (harness-induced corruption).
             uint64_t wp = ring->write_pos.fetch_add(1, std::memory_order_acq_rel);
-            auto&    e  = entries[(wp) & hdr->sub_ring_mask];
+            auto&    e  = entries[(wp) & header->sub_ring_mask];
 
             // CAS like a real publisher, never a blind store: a descheduled
             // injector's late store would land over an already-repaired
@@ -134,9 +134,9 @@ bool run_live_repair()
             // crash can produce.  If the entry moved on first, skip the
             // injection (the claimed position heals as Case-B residue).
             uint64_t prev = 0;
-            if (wp >= hdr->sub_ring_capacity)
+            if (wp >= header->sub_ring_capacity)
             {
-                prev = wp - hdr->sub_ring_capacity + 1;
+                prev = wp - header->sub_ring_capacity + 1;
             }
             uint64_t observed = e.sequence.load(std::memory_order_acquire);
             if (not kickmsg::seq_is_locked(observed)

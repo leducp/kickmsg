@@ -17,45 +17,35 @@ namespace kickmsg
     Subscriber::Subscriber(SharedRegion& region)
         : base_{region.base()}
         , header_{region.header()}
+        , geometry_{region.geometry()}
         , ring_idx_{UINT32_MAX}
         , start_pos_{0}
         , read_pos_{0}
         , lost_{0}
     {
-        recv_buf_.resize(header_->slot_data_size);
+        recv_buf_.resize(geometry_.slot_data_size);
 
-        for (uint32_t i = 0; i < header_->max_subs; ++i)
+        for (uint32_t i = 0; i < geometry_.max_subs; ++i)
         {
-            auto* ring = sub_ring_at(base_, header_, i);
-            // Requires Free | in_flight=0. A ring stuck at Free | in_flight>0
-            // (from a crashed publisher) stays retired until the operator
-            // calls reset_retired_rings(). We do NOT force-reset stale
-            // in_flight: the packed layout means a late fetch_sub from a
-            // slow publisher would underflow into the state bits.
+            auto* ring = sub_ring_at(base_, geometry_, i);
+            // Require Free with in_flight == 0. Resetting a live count could let
+            // a late decrement underflow into the state bits.
             uint32_t expected = ring::make_packed(ring::Free);
-            // Capture write_pos BEFORE setting Live. Once Live, publishers
-            // can immediately commit via fetch_add, racing with our read.
-            // Reading first ensures start_pos_ <= any position a publisher
-            // can claim after seeing Live.
+            // Read the drain floor before Live allows publishers to advance write_pos.
             uint64_t wp = ring->write_pos.load(std::memory_order_acquire);
             if (ring->state_flight.compare_exchange_strong(expected,
                     ring::make_packed(ring::Live),
                     std::memory_order_acq_rel))
             {
-                // Record owner liveness so reclaim_dead_rings() can recover
-                // this ring if we crash without releasing it. starttime
-                // first; owner_pid (release) last, so a sweeper that reads a
-                // non-zero pid also sees the matching starttime. owner_pid
-                // stays 0 until here, so a sweep racing the claim sees 0 and
-                // skips (treats it as a claim in progress).
+                // Store starttime before releasing owner_pid, so recovery sees a matching
+                // identity. Until then, pid == 0 prevents recovery.
                 uint64_t pid = current_pid();
                 ring->owner_starttime.store(process_starttime(pid),
                                             std::memory_order_relaxed);
                 ring->owner_pid.store(pid, std::memory_order_release);
                 ring_idx_  = i;
-                // Pre-CAS wp can be stale (no HB edge to the previous
-                // tenant): keep it as the drain floor, but consume from the
-                // freshest value or we'd replay the previous tenancy.
+                // Keep the earlier position as the drain floor; consume from the latest
+                // position to avoid replaying a previous subscriber's entries.
                 uint64_t wp2 = ring->write_pos.load(std::memory_order_acquire);
                 start_pos_ = wp;
                 read_pos_  = wp;
@@ -80,7 +70,7 @@ namespace kickmsg
             return;
         }
 
-        auto* ring = sub_ring_at(base_, header_, ring_idx_);
+        auto* ring = sub_ring_at(base_, geometry_, ring_idx_);
 
         // Transition Live -> Draining, preserving in_flight count.
         uint32_t old = ring->state_flight.load(std::memory_order_acquire);
@@ -96,17 +86,15 @@ namespace kickmsg
 
         // Wait for all admitted publishers to finish.
         bool quiesced = true;
-        microseconds deadline{header_->commit_timeout_us};
+        microseconds deadline{geometry_.commit_timeout_us};
         nanoseconds start = kickmsg::monotonic_ns();
         while (ring::get_in_flight(
                    ring->state_flight.load(std::memory_order_acquire)) > 0)
         {
             if (kickmsg::elapsed_time(start) >= deadline)
             {
-                // Publisher likely crashed. Do NOT force in_flight to 0:
-                // a slow-but-alive publisher may still be mid-commit.
-                // Skip drain to avoid racing with it. Leaked slot refs
-                // are recoverable by GC (reclaim_orphaned_slots).
+                // A live publisher may still be writing. Skip draining on timeout;
+                // orphan recovery can release the remaining references after quiescence.
                 quiesced = false;
                 ++drain_timeouts_;
                 break;
@@ -153,6 +141,7 @@ namespace kickmsg
     Subscriber::Subscriber(Subscriber&& other) noexcept
         : base_{other.base_}
         , header_{other.header_}
+        , geometry_{other.geometry_}
         , ring_idx_{other.ring_idx_}
         , start_pos_{other.start_pos_}
         , read_pos_{other.read_pos_}
@@ -173,6 +162,7 @@ namespace kickmsg
 
             base_            = other.base_;
             header_          = other.header_;
+            geometry_        = other.geometry_;
             ring_idx_        = other.ring_idx_;
             start_pos_       = other.start_pos_;
             read_pos_        = other.read_pos_;
@@ -204,12 +194,12 @@ namespace kickmsg
         {
             return Wait::Armed;
         }
-        if (wp - read_pos_ > header_->sub_ring_capacity)
+        if (wp - read_pos_ > geometry_.sub_ring_capacity)
         {
             // Overrun: try_receive resynchronises and returns a sample.
             return Wait::Ready;
         }
-        auto&    e   = ring_entries(ring)[read_pos_ & header_->sub_ring_mask];
+        auto&    e   = ring_entries(ring)[read_pos_ & geometry_.sub_ring_mask];
         uint64_t seq = e.sequence.load(std::memory_order_acquire);
         // Same test try_receive gives up on: a lock at this position, or an
         // entry still holding an older generation. Everything else (commit,
@@ -227,7 +217,7 @@ namespace kickmsg
         {
             return Wait::Armed;
         }
-        return head_state(sub_ring_at(base_, header_, ring_idx_));
+        return head_state(sub_ring_at(base_, geometry_, ring_idx_));
     }
 
     Subscriber::Wait Subscriber::arm_wait()
@@ -236,14 +226,10 @@ namespace kickmsg
         {
             return Wait::Armed;
         }
-        auto* ring = sub_ring_at(base_, header_, ring_idx_);
+        auto* ring = sub_ring_at(base_, geometry_, ring_idx_);
 
-        // Sampled BEFORE head_state decides the ring is empty. A publish landing between
-        // that decision and this load would otherwise already be in cur, the re-read below
-        // would match, and the ring would wait on a wake the publisher never sent: it read
-        // has_waiter before the store below and saw WaiterNone. receive() survives the same
-        // ordering only because futex_wait re-checks the word inside the kernel; poll on a
-        // descriptor has no such re-check, so this is the only guard.
+        // Sample before checking the head to detect a publish during waiter setup.
+        // Descriptor polling does not recheck write_pos as futex_wait does.
         uint64_t cur = ring->write_pos.load(std::memory_order_relaxed);
 
         Wait state = head_state(ring);
@@ -278,137 +264,20 @@ namespace kickmsg
         }
         // Relaxed: a publisher reading the mode just before this can still signal,
         // leaving one stale wake for the Waker's owner to drain.
-        auto* ring = sub_ring_at(base_, header_, ring_idx_);
+        auto* ring = sub_ring_at(base_, geometry_, ring_idx_);
         ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
     }
 
     std::optional<Subscriber::SampleRef> Subscriber::try_receive()
     {
-        // Moved-from Subscriber: ring_idx_ is the UINT32_MAX sentinel, so
-        // sub_ring_at would compute a wild pointer.
-        if (ring_idx_ == UINT32_MAX)
+        // Copy while the SampleView pins the slot.
+        auto view = try_receive_view();
+        if (not view)
         {
             return std::nullopt;
         }
-        auto* ring = sub_ring_at(base_, header_, ring_idx_);
-
-        for (int retries = 0; retries < 64; ++retries)
-        {
-            uint64_t wp = ring->write_pos.load(std::memory_order_acquire);
-            if (wp <= read_pos_)
-            {
-                return std::nullopt;
-            }
-
-            uint64_t capacity = header_->sub_ring_capacity;
-            if (wp - read_pos_ > capacity)
-            {
-                uint64_t skipped = (wp - read_pos_) - capacity;
-                lost_ += skipped;
-                ring->lost_count.fetch_add(skipped, std::memory_order_relaxed);
-                read_pos_ = wp - capacity;
-            }
-
-            uint64_t idx  = read_pos_ & header_->sub_ring_mask;
-            auto* entries = ring_entries(ring);
-            auto& e       = entries[idx];
-
-            // Acquire: ensures we see the slot_idx/payload_len written
-            // by the publisher before the sequence commit.
-            uint64_t seq1 = e.sequence.load(std::memory_order_acquire);
-            if (seq1 != read_pos_ + 1)
-            {
-                if (seq_is_skip(seq1) and seq_pos(seq1) == read_pos_ + 1)
-                {
-                    // Skip marker: metadata untrustworthy by design.
-                    ++lost_;
-                    ring->lost_count.fetch_add(1, std::memory_order_relaxed);
-                    ++read_pos_;
-                    continue;
-                }
-                if (seq_is_locked(seq1) or seq_pos(seq1) < read_pos_ + 1)
-                {
-                    // Publisher is mid-commit (position-tagged lock) or has
-                    // not committed yet. Come back later.
-                    return std::nullopt;
-                }
-                // Entry was overwritten (seq > expected): advance and retry.
-                ++lost_;
-                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
-                ++read_pos_;
-                continue;
-            }
-
-            uint32_t slot_idx    = e.slot_idx.load(std::memory_order_relaxed);
-            uint32_t payload_len = e.payload_len.load(std::memory_order_relaxed);
-
-            if (slot_idx >= header_->pool_size or payload_len > header_->slot_data_size)
-            {
-                ++lost_;
-                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
-                ++read_pos_;
-                continue;
-            }
-
-            // Pin the slot via refcount increment to prevent it from being
-            // freed while we memcpy. Without the pin, a publisher could evict
-            // the ring entry and push the slot back to the free stack, letting
-            // another publisher overwrite the data mid-copy.
-            auto* slot = slot_at(base_, header_, slot_idx);
-            uint32_t rc = slot->refcount.load(std::memory_order_acquire);
-            bool pinned = false;
-            // rc == UINT32_MAX is unreachable for a healthy slot (refcount is
-            // bounded by max_subs + live views); treat it as corrupt residue
-            // so rc + 1 can't wrap to 0 and make a pinned slot look freeable.
-            while (rc > 0 and rc != UINT32_MAX)
-            {
-                if (slot->refcount.compare_exchange_weak(rc, rc + 1,
-                        std::memory_order_acq_rel, std::memory_order_acquire))
-                {
-                    pinned = true;
-                    break;
-                }
-            }
-
-            if (not pinned)
-            {
-                // refcount == 0 (or corrupt): slot not pinnable, count as lost.
-                ++lost_;
-                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
-                ++read_pos_;
-                continue;
-            }
-
-            // Seqlock validation: re-read the sequence after pinning. If it
-            // changed, the entry was overwritten between our first read and
-            // the pin, so the slot_idx we pinned may be stale.
-            uint64_t seq2 = e.sequence.load(std::memory_order_acquire);
-            if (seq2 != seq1)
-            {
-                uint32_t prev = slot->refcount.fetch_sub(1, std::memory_order_acq_rel);
-                if (prev == 1)
-                {
-                    treiber_push(header_->free_top, slot, slot_idx);
-                }
-                ++lost_;
-                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
-                ++read_pos_;
-                continue;
-            }
-
-            std::memcpy(recv_buf_.data(), slot_data(slot), payload_len);
-
-            // Unpin: we have our copy, release the slot reference.
-            uint32_t prev = slot->refcount.fetch_sub(1, std::memory_order_acq_rel);
-            if (prev == 1)
-            {
-                treiber_push(header_->free_top, slot, slot_idx);
-            }
-
-            ++read_pos_;
-            return SampleRef{recv_buf_.data(), payload_len, read_pos_ - 1};
-        }
-        return std::nullopt;
+        std::memcpy(recv_buf_.data(), view->data(), view->len());
+        return SampleRef{recv_buf_.data(), view->len(), view->ring_pos()};
     }
 
     std::optional<Subscriber::SampleRef> Subscriber::receive(nanoseconds timeout)
@@ -419,7 +288,7 @@ namespace kickmsg
         {
             return std::nullopt;
         }
-        auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
+        auto*       ring  = sub_ring_at(base_, geometry_, ring_idx_);
         nanoseconds start = kickmsg::monotonic_ns();
 
         int idle_spins = 0;
@@ -481,7 +350,7 @@ namespace kickmsg
         {
             return std::nullopt;
         }
-        auto* ring = sub_ring_at(base_, header_, ring_idx_);
+        auto* ring = sub_ring_at(base_, geometry_, ring_idx_);
 
         for (int retries = 0; retries < 64; ++retries)
         {
@@ -491,7 +360,7 @@ namespace kickmsg
                 return std::nullopt;
             }
 
-            uint64_t capacity = header_->sub_ring_capacity;
+            uint64_t capacity = geometry_.sub_ring_capacity;
             if (wp - read_pos_ > capacity)
             {
                 uint64_t skipped = (wp - read_pos_) - capacity;
@@ -500,7 +369,7 @@ namespace kickmsg
                 read_pos_ = wp - capacity;
             }
 
-            uint64_t idx  = read_pos_ & header_->sub_ring_mask;
+            uint64_t idx  = read_pos_ & geometry_.sub_ring_mask;
             auto* entries = ring_entries(ring);
             auto& e       = entries[idx];
 
@@ -524,19 +393,22 @@ namespace kickmsg
                 continue;
             }
 
-            uint32_t slot_idx    = e.slot_idx.load(std::memory_order_relaxed);
-            uint32_t payload_len = e.payload_len.load(std::memory_order_relaxed);
-
-            if (slot_idx >= header_->pool_size or payload_len > header_->slot_data_size)
+            // Acquire orders a newer publisher's sequence lock before seq2 below; the tag
+            // rejects a claim that belongs to another position.
+            uint64_t meta   = e.meta.load(std::memory_order_acquire);
+            uint32_t biased = meta_slot_biased(meta);
+            if (meta_tag(meta) != ((read_pos_ + 1) & META_TAG_MASK)
+                or biased == 0 or biased - 1 >= geometry_.pool_size)
             {
                 ++lost_;
                 ring->lost_count.fetch_add(1, std::memory_order_relaxed);
                 ++read_pos_;
                 continue;
             }
+            uint32_t slot_idx = biased - 1;
 
             // Pin the slot so it survives until ~SampleView().
-            auto* slot = slot_at(base_, header_, slot_idx);
+            auto* slot = slot_at(base_, geometry_, slot_idx);
             uint32_t rc = slot->refcount.load(std::memory_order_acquire);
             bool pinned = false;
             // rc == UINT32_MAX is corrupt residue; skip so rc + 1 can't wrap.
@@ -574,8 +446,23 @@ namespace kickmsg
                 continue;
             }
 
+            // Read under the pin, after the seqlock: before that the slot may be recycled.
+            uint32_t payload_len = slot->payload_len.load(std::memory_order_relaxed);
+            if (payload_len > geometry_.slot_data_size)
+            {
+                uint32_t bad = slot->refcount.fetch_sub(1, std::memory_order_acq_rel);
+                if (bad == 1)
+                {
+                    treiber_push(header_->free_top, slot, slot_idx);
+                }
+                ++lost_;
+                ring->lost_count.fetch_add(1, std::memory_order_relaxed);
+                ++read_pos_;
+                continue;
+            }
+
             ++read_pos_;
-            return SampleView{base_, header_, slot_idx, payload_len, read_pos_ - 1};
+            return SampleView{header_, slot, slot_idx, payload_len, read_pos_ - 1};
         }
         return std::nullopt;
     }
@@ -588,7 +475,7 @@ namespace kickmsg
         {
             return std::nullopt;
         }
-        auto*       ring  = sub_ring_at(base_, header_, ring_idx_);
+        auto*       ring  = sub_ring_at(base_, geometry_, ring_idx_);
         nanoseconds start = kickmsg::monotonic_ns();
 
         int idle_spins = 0;
@@ -645,7 +532,7 @@ namespace kickmsg
     void Subscriber::drain_unconsumed(SubRingHeader* ring)
     {
         auto*    entries  = ring_entries(ring);
-        uint64_t capacity = header_->sub_ring_capacity;
+        uint64_t capacity = geometry_.sub_ring_capacity;
 
         // write_pos is final: the in_flight spin in the destructor guarantees
         // no publisher is mid-commit on this ring.
@@ -669,34 +556,33 @@ namespace kickmsg
             oldest = start_pos_;
         }
 
-        // Release this ring's reference for ALL committed entries in the live window:
-        // - [oldest, read_pos_): consumed by try_receive (pin/unpin is net-zero,
-        //   so the ring's original rc=1 reference still needs releasing).
-        //   For try_receive_view, rc=2 (ring ref + SampleView pin); we release
-        //   the ring ref here, ~SampleView releases the pin later.
-        // - [read_pos_, wp): unconsumed entries, also need their ring ref released.
-        // Evicted entries have seq != pos+1, so the check safely skips them.
+        // Release each remaining claim, including consumed and skip-marked entries.
+        // SampleView pins are separate references and survive this drain.
         for (uint64_t pos = oldest; pos < wp; ++pos)
         {
-            auto&    e   = entries[pos & header_->sub_ring_mask];
-            uint64_t seq = e.sequence.load(std::memory_order_acquire);
+            auto&    e    = entries[pos & geometry_.sub_ring_mask];
+            uint64_t meta = e.meta.load(std::memory_order_acquire);
 
-            if (seq != pos + 1)
+            uint32_t biased = meta_slot_biased(meta);
+            if (biased == 0 or biased - 1 >= geometry_.pool_size)
+            {
+                continue;
+            }
+            uint32_t slot_idx = biased - 1;
+
+            // Clear the claim before releasing its reference to prevent a second release.
+            if (not e.meta.compare_exchange_strong(meta, meta & ~META_SLOT_MASK,
+                    std::memory_order_acq_rel, std::memory_order_relaxed))
             {
                 continue;
             }
 
-            uint32_t slot_idx = e.slot_idx.load(std::memory_order_relaxed);
-            if (slot_idx < header_->pool_size)
+            auto*    slot = slot_at(base_, geometry_, slot_idx);
+            uint32_t prev = slot->refcount.fetch_sub(1,
+                                std::memory_order_acq_rel);
+            if (prev == 1)
             {
-                auto*    slot = slot_at(base_, header_, slot_idx);
-                uint32_t prev = slot->refcount.fetch_sub(1,
-                                    std::memory_order_acq_rel);
-                if (prev == 1)
-                {
-                    treiber_push(header_->free_top, slot, slot_idx);
-                }
-                e.slot_idx.store(INVALID_SLOT, std::memory_order_seq_cst);
+                treiber_push(header_->free_top, slot, slot_idx);
             }
         }
 

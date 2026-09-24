@@ -123,20 +123,26 @@ the user's responsibility.
 
 The region header is self-describing and forward-compatible.
 
-`version` is 8, and no struct changed to earn it: `Header` and
-`SubRingHeader` are byte-identical to version 7. What changed is the
-*meaning* of `has_waiter`, which gained `WaiterCarrier(2)` (see Waking on
-a descriptor). A version-7 publisher reads any non-zero `has_waiter` as
-"parked on a futex", so it would send `futex_wake_all` to a subscriber
-waiting on a descriptor and the wake would be lost until its deadline.
-The bump exists purely to keep the two interpretations apart, and the
-version check is what enforces it.
+`version` is 9. `Header` and `SubRingHeader` are unchanged from 8; the
+bump covers the entry and slot layouts. `Entry` replaced its
+`slot_idx` + `payload_len` pair with the single 64-bit `meta` claim word
+(see Entry meta-word encoding), and `SlotHeader` grew from 8 to 16 bytes
+to carry `payload_len`. Both drive ring-stride and slot-stride math, so
+a version-8 peer would misread every entry and slot. Version 8 itself
+changed no struct: it gave `has_waiter` the `WaiterCarrier(2)` value,
+which a version-7 publisher would misread as a futex waiter.
+
+A version mismatch is fatal, never negotiated: `open()`,
+`attach_open()` and `create_or_open()` throw `VersionMismatch` at once
+(`create_or_open()` does not wait for the region to become "ready").
+One namespace cannot mix kickmsg builds. Upgrading means stopping the
+old processes and unlinking their regions and registry.
 
 ```
 Header (at offset 0)
 ┌───────────────────────────────────────────────────────────┐
 │  magic (atomic)     0x4B49434B4D534721 ("KICKMSG!")       │
-│  version            8                                     │
+│  version            9                                     │
 │  channel_type       PubSub | Broadcast                    │
 │  total_size         total mmap size in bytes              │
 │  sub_rings_offset   byte offset to first subscriber ring  │
@@ -322,27 +328,26 @@ pointer (a `VERSION` bump).
 ## Subscriber Ring
 
 Each ring is a fixed-size circular buffer of `Entry` records. An entry
-contains a sequence number, slot index, and payload length -- all atomic.
+is two atomic 64-bit words: a `sequence` (commit barrier and seqlock)
+and a `meta` word carrying the entry's claim on a pool slot, tagged
+with the position that wrote it. The payload length lives in the slot
+itself, not the entry -- see the meta-word encoding below.
 
 ```
-Ring[0]
-┌──────────────────────────────────────────────────────────┐
-│  state: Live   in_flight: 0   write_pos: AtomicU64 = 42  │
-│                                                          │
-│  entries[0..7]:                                          │
-│  ┌─────┬───────────┬──────────┬─────────────┐            │
-│  │ idx │ sequence  │ slot_idx │ payload_len │            │
-│  ├─────┼───────────┼──────────┼─────────────┤            │
-│  │  0  │    37     │    5     │    128      │            │
-│  │  1  │    38     │   12     │    256      │            │
-│  │  2  │    39     │    0     │     64      │            │
-│  │  3  │    40     │    7     │    512      │            │
-│  │  4  │    41     │    2     │   1024      │ ◄── latest │
-│  │  5  │    42     │   11     │    128      │ ◄── newest │
-│  │  6  │    35     │    9     │    256      │ ◄── stale  │
-│  │  7  │    36     │    1     │     64      │ ◄── stale  │
-│  └─────┴───────────┴──────────┴─────────────┘            │
-└──────────────────────────────────────────────────────────┘
++----------------------------------------------------------------+
+| Ring[0]: state=Live, in_flight=0, write_pos=42                 |
+|                                                                |
+|   idx   sequence   meta (tag:40 | slot+1:24)                   |
+|   ---   --------   -----------------------                     |
+|     0         37        37 |  6                                |
+|     1         38        38 | 13                                |
+|     2         39        39 |  1                                |
+|     3         40        40 |  8                                |
+|     4         41        41 |  3                                |
+|     5         42        42 | 12       <-- newest               |
+|     6         35        35 | 10       <-- stale                |
+|     7         36        36 |  2       <-- stale                |
++----------------------------------------------------------------+
 ```
 
 - **Capacity** must be a power of 2 (index masking: `pos & (cap - 1)`).
@@ -491,9 +496,9 @@ bit 62 = repair bit) and a 62-bit value:
 
 ```
 [tag:2 | value:62]
-  00  committed       word is pos + 1; slot_idx / payload_len valid
+  00  committed       word is pos + 1; the meta word names the payload
   01  skip marker     word carries pos + 1; committed but EMPTY --
-                      metadata untrustworthy by design
+                      no payload ever arrived at this position
   10  locked          a publisher is mid-commit at pos
                       (position-tagged lock, unique per position)
   11  repair-locked   a repairer owns the entry mid-steal
@@ -505,12 +510,45 @@ across a full timeout window proves a single holder spanned it: the
 staleness proof every steal relies on.
 
 Stolen entries are committed as **skip markers**, not plain
-sequences. The stolen-from publisher's late metadata stores can land
-at any time after the steal, so nothing may ever trust `slot_idx` /
-`payload_len` under tag 01: subscribers count a skip-marked position
-as one lost message without reading its metadata, and the eviction
-path never releases a slot through a skip-tagged entry. The victim's
-stores are harmless by construction, not by timing.
+sequences: no payload was ever committed at that position, so a
+subscriber counts a skip-marked position as one lost message. A steal
+leaves the meta word alone; the victim cannot damage it, because the
+victim's own write is a compare-exchange guarded by the ordering rule
+below.
+
+### Entry meta-word encoding
+
+`Entry::meta` stores the position tag and slot claim in one atomic word:
+
+```
+[tag:40 | slot + 1:24]
+  tag   low 40 bits of pos + 1
+  slot  pool index + 1; zero means no claim
+```
+
+Each claim owns one slot reference. Replacing or clearing the claim transfers
+the duty to release that reference. A publisher may replace only an older
+position's claim, using CAS. A delayed publisher therefore cannot overwrite
+a newer entry. Tag comparisons require positions less than 2^39 apart.
+
+Repair keeps the claim even when it changes the sequence to a skip marker.
+The next publisher or drainer releases it. A zeroed entry has no claim, and
+the 24-bit slot field limits `pool_size` to `MAX_POOL_SIZE`.
+
+### Validated geometry snapshot
+
+After creation or validation, each handle copies the header's offsets,
+strides, counts, and size limits into local `Geometry`. Pointer arithmetic
+uses this copy because peers can still modify the shared header. This
+covers `SharedRegion`'s own diagnostic and recovery walks (`diagnose`,
+`stats`, `info`, the repair and reclaim primitives) as well as publishers
+and subscribers. `info()` re-bounds the live `creator_name_len` against
+the validated tail. `sub_ring_at`, `slot_at` and `treiber_pop` take a
+`Geometry` (or an explicit pool base and stride), never a `Header`, so the
+shared fields have no path into pointer arithmetic. `SampleView` stores
+the slot pointer already resolved by its subscriber.
+
+Counters, `free_top`, and ring/entry atomics remain shared.
 
 ### Subscriber join and visibility window
 
@@ -574,8 +612,17 @@ instant it attaches.
 
 ## Publish Flow
 
-Any publisher can call `send()` or `allocate()` + `publish()`. Multiple
-publishers may race concurrently on the same channel.
+Any publisher can call `send()`, or reserve a slot with `allocate()`,
+write the payload into it, and `publish(len)`. Multiple publishers may race
+concurrently on the same channel.
+
+`allocate()` returns an `AllocatedSlot` that owns the reservation:
+destroying it unpublished returns the slot to the pool, and it refuses
+to publish once a later `allocate()` has superseded it. Moving the
+`Publisher` invalidates its handles too, and returns the reservation to
+the pool at once, since no handle can publish it any more. A caller fills
+the slot in place through `data()` (up to `max_size()` bytes), or copies
+bytes it already has with `write()`, then commits with `publish(len)`.
 
 ```
 Publisher
@@ -618,8 +665,8 @@ Publisher
    |     |                         (default 10 ms).
    |     |-- Committed:            Proceed to the lock CAS. The previous
    |     |                         occupant's slot is released AFTER the
-   |     |                         lock succeeds, from a post-lock read
-   |     |                         of slot_idx (see below).
+   |     |                         claim take-over succeeds, from the
+   |     |                         word it replaced (see below).
    |     '-- Timeout (crash or     Records whether ONE position-tagged
    |          stall):               lock value spanned the whole wait —
    |                                the proof self-repair needs before
@@ -658,9 +705,8 @@ Publisher
    |   |                             succeeds without timeout. The CAS
    |   |                             backs off if a live writer wins.
    |   |                             Do NOT release any slot -- the entry
-   |   |                             was never ours. The stale occupant's
-   |   |                             unreleased ref is a bounded leak
-   |   |                             (1 per steal), recoverable by GC.
+   |   |                             was never ours, and its claim word
+   |   |                             still names whatever it referenced.
    |   |   abandon_delivery():      Count the drop, then release
    |   |     dropped_count++         admission -- this ring's in_flight
    |   |     state_flight.fetch_sub  was incremented at CAS admission and
@@ -675,43 +721,36 @@ Publisher
    |   |                             full timeout.
    |   |   excess++, continue
    |   |
-   |   | Lock success -- release previous occupant:
-   |   |   If NOT prev_was_skip     After locking, we own the entry; the
-   |   |     and pos >= capacity:   lock-CAS acquire pairs with the
-   |   |       read e.slot_idx       previous committer's release, so even
-   |   |       if in bounds:         a commit that landed after our wait
-   |   |         release_slot(it)    timed out is seen and released here.
-   |   |                             INVALID (drain marker) fails the
-   |   |                             bound check: drain_unconsumed already
-   |   |                             released this ring's reference --
-   |   |                             releasing again would double-
-   |   |                             decrement. A SKIP predecessor is
-   |   |                             never released: its metadata is
-   |   |                             untrustworthy by design; the stolen
-   |   |                             entry's ref is left for GC. Below
-   |   |                             one wrap there is no predecessor
-   |   |                             (a zero-initialized slot_idx would
-   |   |                             read as valid slot 0).
+   |   | Early-out:
+   |   |   reload entry.sequence    Avoid work if the lock was stolen.
+   |   |   if not ours: drop        The metadata CAS below guards late writes.
    |   |
-   |   | Theft guard:               If sequence != seq_lock(pos), a
-   |   |   reload entry.sequence    repairer proved our lock stale (we
-   |   |   if not ours: drop        stalled past commit_timeout) and owns
-   |   |                             the entry. Storing data now would
-   |   |                             tear the repaired entry.
+   |   | Take the claim over:
+   |   |   my = meta_pack(pos, 3)   Compare-exchange, looping while the
+   |   |   while meta_precedes      observed word precedes our position.
+   |   |     (old, pos):            Failure means a newer publisher owns
+   |   |     CAS meta old -> my     the entry: our slot ref is still ours,
+   |   |   if not taken: drop,      so we count it in `excess` and drop.
+   |   |     excess++, continue     Only older position tags may be replaced.
    |   |
-   |   | Write entry fields (relaxed, safe because we hold the lock):
-   |   |   entry.slot_idx    = 3
-   |   |   entry.payload_len = 128
+   |   | Release the previous occupant:
+   |   |   biased = slot of old     The word we replaced hands us the
+   |   |   if biased != 0:          previous occupant's reference. A
+   |   |     release_slot(biased-1) drained entry and a never-written one
+   |   |                             both read as "no slot", so neither
+   |   |                             needs a special case, and a skip
+   |   |                             predecessor needs none either: the
+   |   |                             tag says whose metadata it is.
    |   |
    |   | Phase 2 - CAS commit:
    |   '   CAS entry.sequence       CAS, not a blind store: fails only if
-   |         seq_lock(pos) -> 43     a repairer stole the lock after the
-   |                                 theft guard -- the entry is then a
-   |                                 committed skip marker, and our late
-   |                                 slot_idx/payload_len stores landed
-   |                                 under tag 01, which nothing ever
-   |                                 trusts: permanently harmless. We
-   |                                 record a drop (abandon_delivery).
+   |         seq_lock(pos) -> 43     a repairer stole the lock after we
+   |                                 took the claim over. No `excess` on
+   |                                 that path -- the entry now holds our
+   |                                 reference and the next publisher here
+   |                                 releases it; counting it would
+   |                                 double-free. We record a drop
+   |                                 (abandon_delivery).
    |                                 Release on success: subscribers and
    |                                 future publishers at this position
    |                                 see all preceding stores.
@@ -747,11 +786,17 @@ Publisher
 ### Why a two-phase commit?
 
 Without the lock, two publishers that CAS `write_pos` to adjacent
-positions could interleave their `slot_idx` and `sequence` stores on
+positions could interleave their claim and `sequence` stores on
 overlapping entries (after a ring wrap). The position-tagged lock
-prevents this: only one publisher at a time can write an entry's data
-fields, and the final CAS commit of the real sequence makes the entry
+prevents this: only one publisher at a time drives an entry to a
+commit, and the final CAS commit of the real sequence makes the entry
 visible atomically — or fails, detectably, if the lock was stolen.
+
+The lock alone is not enough, because a publisher can stall while
+holding it and have it stolen. That is why the claim word is taken
+over by compare-exchange under the position-ordering rule rather than
+stored: the lock orders the common case, the claim protocol is what
+holds when the lock has been taken away.
 
 Subscribers treat any locked value the same as "not yet committed"
 and return `nullopt`, so the lock is invisible to them except as a
@@ -834,51 +879,63 @@ Subscriber X (read_pos_ = 41, local)
                                       above consumes.
    |
    v
-3. Read slot_idx and payload_len from the entry.
+3. Read the entry's claim word (acquire). Its tag must name this
+   position, else count the entry as lost; then take the slot index.
+   The acquire orders a newer publisher's sequence lock before the
+   seq2 recheck below, and the tag rejects a claim left by any other
+   position or by corrupt peer bytes.
    |
-   |---- Both modes: refcount pin --------------------------------|
-   |                                                              |
-   |  Both try_receive() and try_receive_view() pin the slot      |
-   |  via CAS before reading data. This prevents the publisher    |
-   |  from freeing the slot while the subscriber reads it.        |
-   |                                                              |
-   |  CAS Slot.refcount: rc -> rc+1   Pin the slot (only if       |
-   |    (retry while rc > 0)          rc > 0, i.e. slot alive)    |
-   |    (if rc == 0: slot freed       between seq1 read and       |
-   |     between seq1 and now,        now. Count as lost.)        |
-   |     skip as lost message)                                    |
-   |                                                              |
-   |  seq2 = entry.sequence (acquire)  Seqlock validation: if     |
-   |  seq2 == seq1?                    the entry was overwritten  |
-   |    -> yes: pin valid              after we pinned, the       |
-   |    -> no:  undo pin, count lost   slot_idx may be stale.     |
-   |                                                              |
-   |---- Copy mode: try_receive() --------------------------------|
-   |                                                              |
-   |  memcpy Slot[slot_idx].data -> local recv_buf_               |
-   |  Unpin: refcount.fetch_sub(1)                                |
-   |    If refcount -> 0: treiber_push(slot)                      |
-   |  read_pos_++                                                 |
-   |  return SampleRef { recv_buf_, payload_len }                 |
-   |                                                              |
-   |  Note: SampleRef points into recv_buf_ (subscriber-local     |
-   |  buffer). Calling try_receive() again overwrites it.         |
-   |  Copy data from SampleRef before the next call.              |
-   |                                                              |
-   |---- Zero-copy mode: try_receive_view() ----------------------|
-   |                                                              |
-   |  read_pos_++                                                 |
-   |  return SampleView { Slot, payload_len }                     |
-   |    |                                                         |
-   |    '--> ~SampleView():                                       |
-   |         refcount.fetch_sub(1)                                |
-   |         if refcount -> 0: treiber_push(slot)                 |
-   |                                                              |
-   |  SampleView holds a direct pointer into shared memory.       |
-   |  The refcount pin keeps the slot alive until the view        |
-   |  is destroyed. Best for large payloads where memcpy          |
-   |  would dominate latency.                                     |
-   '--------------------------------------------------------------'
+   |---- Both modes: refcount pin-----------------------------------|
+   |                                                                |
+   |  Both try_receive() and try_receive_view() pin the slot        |
+   |  via CAS before reading data. This prevents the publisher      |
+   |  from freeing the slot while the subscriber reads it.          |
+   |                                                                |
+   |  CAS Slot.refcount: rc -> rc+1   Pin the slot (only if         |
+   |    (retry while rc > 0)          rc > 0, i.e. slot alive)      |
+   |    (if rc == 0: slot freed       between seq1 read and         |
+   |     between seq1 and now,        now. Count as lost.)          |
+   |     skip as lost message)                                      |
+   |                                                                |
+   |  seq2 = entry.sequence (acquire)  Seqlock validation: if       |
+   |  seq2 == seq1?                    the entry was overwritten    |
+   |    -> yes: pin valid              after we pinned, the         |
+   |    -> no:  undo pin, count lost   claim may be stale.          |
+   |                                                                |
+   |  payload_len = Slot.payload_len   Read only once the seqlock   |
+   |  bounds-check it, else lost       has confirmed the entry      |
+   |                                   still names this slot: the   |
+   |                                   length lives in the slot,    |
+   |                                   so before that point it      |
+   |                                   could belong to whoever      |
+   |                                   recycled it.                 |
+   |                                                                |
+   |---- Copy mode: try_receive()-----------------------------------|
+   |                                                                |
+   |  memcpy Slot[slot_idx].data -> local recv_buf_                 |
+   |  Unpin: refcount.fetch_sub(1)                                  |
+   |    If refcount -> 0: treiber_push(slot)                        |
+   |  read_pos_++                                                   |
+   |  return SampleRef { recv_buf_, payload_len }                   |
+   |                                                                |
+   |  Note: SampleRef points into recv_buf_ (subscriber-local       |
+   |  buffer). Calling try_receive() again overwrites it.           |
+   |  Copy data from SampleRef before the next call.                |
+   |                                                                |
+   |---- Zero-copy mode: try_receive_view()-------------------------|
+   |                                                                |
+   |  read_pos_++                                                   |
+   |  return SampleView { Slot, payload_len }                       |
+   |    |                                                           |
+   |    '--> ~SampleView():                                         |
+   |         refcount.fetch_sub(1)                                  |
+   |         if refcount -> 0: treiber_push(slot)                   |
+   |                                                                |
+   |  SampleView holds a direct pointer into shared memory.         |
+   |  The refcount pin keeps the slot alive until the view          |
+   |  is destroyed. Best for large payloads where memcpy            |
+   |  would dominate latency.                                       |
+   '----------------------------------------------------------------'
 ```
 
 
@@ -1024,14 +1081,10 @@ On timeout, the publisher:
    marker (`seq_skip(pos)`: tag 01, word carrying pos + 1) so the next
    publisher at this position succeeds without paying the timeout. The
    CAS backs off if a live writer commits first. A stolen-from
-   publisher that was merely slow detects the theft at its own theft
-   guard or CAS commit and records a drop instead of corrupting the
-   entry. Its late metadata stores -- landing at any point after the
-   steal -- fall under the skip tag, which nothing ever trusts:
-   subscribers count the position lost without reading
-   slot_idx/payload_len, and the eviction path never releases a slot
-   through a skip-tagged entry. The victim's stores are permanently
-   harmless by construction, not by timing.
+   publisher that was merely slow records a drop instead of corrupting
+   the entry: its claim take-over is refused by the position-ordering
+   rule no matter how late it resumes, and its CAS commit then fails.
+   The victim's write is harmless by construction, not by timing.
 2. Drops delivery for this ring and moves to the next subscriber ring.
    Every drop path ends in `abandon_delivery()`, which mirrors the
    success path's Dekker wake (seq_cst fence, `has_waiter` check,
@@ -1101,12 +1154,13 @@ and full-window drain:
          wp = ring.write_pos            — now guaranteed final
          oldest = max(0, wp - capacity)
          for each entry in [max(oldest, start_pos), wp):
-           if sequence == pos + 1:      — committed and not evicted
+           if the claim word names a slot:
+             CAS the claim to "no slot" -- makes this idempotent; a
+                                           second pass finds nothing
              slot.refcount--
              if refcount == 0: treiber_push(slot)
-             entry.slot_idx = INVALID_SLOT (seq_cst)
            else:
-             skip (evicted, uncommitted, or locked — falls into Class B)
+             skip (already drained, or never claimed anything)
     4. state = Free (release)           — ring available for a new subscriber
                                           (timeout path: CAS that preserves
                                           the crashed publisher's in_flight)
@@ -1134,9 +1188,11 @@ must also be released. `start_pos` is the `write_pos` captured at
 subscriber construction, ensuring a reused ring slot doesn't
 double-release entries from a previous subscriber.
 
-After releasing each entry's slot, drain sets `entry.slot_idx` to
-`INVALID_SLOT` to prevent a future publisher's eviction from
-double-decrementing the refcount.
+Drain keys off the **claim word, not the sequence**: the claim is what
+owns a reference, and an entry a repairer turned into a skip marker
+still holds one. Keying off `sequence == pos + 1` would strand those.
+Clearing the claim as part of the release prevents a future
+publisher's eviction from double-decrementing the refcount.
 
 For `try_receive_view()`, a live `SampleView` holds an extra pin
 (rc=2: ring ref + view pin). The drain releases the ring ref (rc→1);
@@ -1150,11 +1206,14 @@ Only Class B can leak slots. Each publisher crash leaks at most
 - The slot the crashed publisher allocated (refcount stuck > 0 because
   the remaining rings were never visited for inline release; or
   refcount 0 and off the free stack, for a crash before the pre-set)
-- The slot referenced by the stolen ring entry, if one existed at the
-  wrapped position: the steal deliberately never releases it (the
-  stalled holder may already have batch-released this ring's ref, and
-  metadata under a skip tag is untrustworthy), so its ring ref leaks
-  until GC -- at most one per steal
+
+A steal does **not** add to this budget. It leaves the entry's claim
+word intact, so the slot it names stays reachable: the next publisher
+at that index releases it on the normal take-over path, and a drain
+releases it otherwise. This matters beyond the budget -- a steal can
+happen without any process crashing (a publisher merely descheduled
+past `commit_timeout`), and clearing the claim there would leak a slot
+in an otherwise healthy system.
 
 With a typical pool of 256+ slots, the system can tolerate dozens of
 crashes before running low. Class B leaks can be recovered by the
@@ -1193,23 +1252,22 @@ sleep -- the same position-tagged lock value at both instants proves
 its unique holder exceeded the commit budget. Every steal takes
 ownership with a CAS to `seq_repair(pos)` before touching the entry,
 then commits the entry as a skip marker (`seq_skip(pos)`: tag 01,
-word carrying pos + 1). The `INVALID_SLOT` / zero-length stores made
-under the repair lock are diagnostics only -- nothing ever trusts
-metadata under a skip tag. A live publisher that commits first wins
-the CAS race and the repairer backs off; a stolen-from publisher that
-was merely slow detects the theft (theft guard / CAS commit) and
-records a drop. Subscribers count a skip-marked position as one lost
-message without reading its metadata; evictions never release a slot
-through one.
+word carrying pos + 1). The claim word is left exactly as it was: it
+is the only record of which slot the entry still references. A live
+publisher that commits first wins the CAS race and the repairer backs
+off; a stolen-from publisher that was merely slow records a drop.
+Subscribers count a skip-marked position as one lost message: no
+payload was ever committed there.
 
-Residuals, both bounded:
-- The victim's late metadata stores -- landing at any point after the
-  steal -- fall under the skip tag and are ignored by construction,
-  so they are harmless; there is no torn-read window.
-- The stolen entry's previous slot reference is never released by the
-  repair (the stalled holder may already have batch-released this
-  ring's ref; releasing again could double-free). At most one slot
-  ref leaks per steal, recovered by `reclaim_orphaned_slots()`.
+Residuals:
+- The victim's late write is refused, whenever it resumes: taking the
+  claim over requires replacing metadata from an older position, and
+  by then the entry carries its successor's. There is no window in
+  which a resumed publisher can reach a newer entry.
+- No slot reference leaks. The stolen entry keeps its claim, so the
+  next publisher at that index releases it on the normal take-over
+  path -- which matters because a steal needs no crash, only a
+  publisher descheduled past `commit_timeout`.
 
 ```
 repair_locked_entries(region):
@@ -1226,25 +1284,31 @@ repair_locked_entries(region):
         if entry.sequence == seq:                      // same holder spanned it
             steal(entry, pos, seq)
 
-steal(entry, pos, observed):                           // entry_steal_and_clear
+steal(entry, pos, observed):                           // entry_steal_and_skip
     CAS entry.sequence: observed -> seq_repair(pos)    // live writer wins: back off
-    entry.slot_idx    = INVALID_SLOT                   // diagnostics only
-    entry.payload_len = 0
+    // entry.meta is deliberately untouched: it is the only record of
+    // which slot this entry still references, and the victim cannot
+    // damage it (its own write is a guarded compare-exchange).
     entry.sequence    = seq_skip(pos)                  // release: committed, empty
 ```
 
 **`reclaim_orphaned_slots()`** -- requires full quiescence.
 
-Builds the set of slot indices referenced by plain-committed ring
-entries (locked and skip-marked entries are excluded -- skip metadata
-is untrustworthy by design), walks the free stack to record
-membership (exact under the quiescence contract, bounded by
-`pool_size` against corrupt `next_free` cycles), then reclaims every
-slot that is neither referenced nor on the stack -- regardless of
-refcount. The membership walk is what recovers rc == 0 orphans (a
-publisher crash between `treiber_pop` and the refcount pre-set, or a
-reclaimer killed between its refcount store and its push) that a
-refcount-only scan never could.
+Counts, per slot, the ring entries whose claim names it -- over every
+entry of every ring, whatever the sequence word or write_pos says, since
+a locked or skip-marked entry still owns the slot its claim names and a
+claim can outlive the tenancy that wrote it. It then walks the free
+stack to record membership (exact under the quiescence contract, bounded
+by `pool_size` against corrupt `next_free` cycles). Every off-stack slot
+with no claim is reclaimed regardless of refcount; every off-stack slot
+with claims gets its refcount reset to its claim count. Each claim owns
+exactly one reference, so under quiescence that count is the correct
+refcount: a leaked extra reference would otherwise pin the slot forever,
+and a missing one would free it while an entry still names it. The
+membership walk is what recovers rc == 0 orphans (a publisher crash
+between `treiber_pop` and the refcount pre-set, or a reclaimer killed
+between its refcount store and its push) that a refcount-only scan
+never could.
 NOT safe under live traffic. Requires:
 - All publishers quiesced (a publisher between refcount pre-set and
   ring push has rc > 0 but no ring entry yet; one between treiber_pop
@@ -1255,19 +1319,22 @@ NOT safe under live traffic. Requires:
 
 ```
 reclaim_orphaned_slots(region):
-    referenced = {}
+    claims[0..pool_size) = 0
     for each ring i in [0, max_subs):
-        for pos in [oldest_live, write_pos):
-            seq = entries[pos].sequence
-            if seq is plain-committed (tag 00) and seq >= pos + 1:
-                referenced.insert(entries[pos].slot_idx)
+        for idx in [0, sub_ring_capacity):
+            claim = entries[idx].meta
+            if claim names a slot:
+                claims[slot named by claim] += 1
 
     on_stack = {}                            // exact under quiescence
     for idx in chain from free_top, bounded by pool_size:
         on_stack.insert(idx)
 
     for idx in [0, pool_size):
-        if idx not in referenced and idx not in on_stack:
+        if idx in on_stack: continue
+        if claims[idx] > 0:
+            slot[idx].refcount = claims[idx]
+        else:
             slot[idx].refcount = 0
             treiber_push(free_top, slot[idx], idx)
 ```
@@ -1369,10 +1436,10 @@ deliberate post-crash action. For a dead *subscriber* prefer
 `reclaim_dead_rings()`, which is liveness-checked and cannot underflow
 `in_flight` against a slow publisher.
 
-**`reclaim_orphaned_slots()`** -- walks all rings to build a
-referenced-slot set and the free stack for membership, then frees any
-slot that is neither referenced nor on the stack, regardless of
-refcount. NOT safe under live traffic -- requires all publishers
+**`reclaim_orphaned_slots()`** -- counts ring-entry claims per slot and
+walks the free stack for membership, then frees any off-stack slot with
+no claim and resets every other off-stack slot's refcount to its claim
+count. NOT safe under live traffic -- requires all publishers
 quiesced and no outstanding `SampleView` objects.
 
 ### Recommended recovery sequence
@@ -1520,6 +1587,13 @@ Time             kickmsg/os/           clock_nanosleep    nanosleep          Que
 The ABI has been stable since macOS 10.12 and is used internally by libc++
 and libdispatch, but Apple has not published a formal stability guarantee.
 
+**Windows limitation.** `WakeByAddressAll` wakes only the calling process.
+A blocking `receive()` or Blackboard wait may sleep until timeout when the
+writer is in another process. Unread messages can overflow the ring during
+that wait. Use a timeout within the ring's buffering budget, or poll.
+Cross-process notification requires a different primitive and Windows
+multi-process testing.
+
 The core engine (`types.h`, `Region.h`, `Publisher.h`, `Subscriber.h`,
 `Node.h`) uses only `std::atomic` and these three abstractions -- no platform
 `#ifdef` leaks into the messaging logic.
@@ -1631,7 +1705,8 @@ between the writer and a concurrent new-tenant claim never involves
 plain non-atomic accesses on the same bytes:
 
 - `state` — atomic `Free` / `Claiming` / `Active` / `Reclaiming`
-- `generation` — atomic counter bumped on every claim and release (seqlock)
+- `generation` -- atomic version; even means settled, odd means a writer
+  or sweeper holds the row
 - `pid` — atomic; OS process id of the owner
 - `pid_starttime` — atomic; opaque OS-specific process start time
 - `channel_type` — atomic; PubSub / Broadcast
@@ -1648,6 +1723,26 @@ A `Node` lazily opens-or-creates the registry on its first
 (`Free → Claiming`), writes the fields, then release-stores
 `Active`.  The `Node`'s destructor deregisters every slot it claimed.
 
+### Seqlock parity
+
+Even generations are settled; odd generations mark a write or recovery hold.
+Registration makes the generation odd before writing fields, publishes
+`Active`, then settles the generation. Snapshots accept a row only if it is
+Active and its generation stays even and unchanged across the copy.
+
+Retirement blocks readers and new registrants before clearing identity:
+
+```
+CAS Active -> Reclaiming
+set generation odd
+clear pid and pid_starttime
+settle generation to even
+CAS Reclaiming -> Free
+```
+
+`Free` is published last so the next registrant cannot overlap these writes.
+Sweeps skip Reclaiming and odd generations, even after a crash.
+
 The key property is **cross-platform parity**: Linux `/dev/shm` is
 filesystem-visible, but macOS and Windows are not — we can't use
 `readdir` to list topics there.  Routing discovery through a regular
@@ -1657,29 +1752,43 @@ all three targets.
 ### State machine
 
 ```
-Free (0) ── CAS ──► Claiming (1) ── release-store ──► Active (2)
-   ▲                                                    │
-   │                                                    │
-   ├────────── deregister: store-release ◄──────────────┤
-   │                                                    │
-   │            sweep_stale:                            │
-   └── CAS(Reclaiming → Free) ◄── CAS(Active | Claiming → Reclaiming)
+Registration:
+  +------+         +----------+             +--------+
+  | Free | --CAS-> | Claiming | --release-> | Active |
+  +------+         +----------+             +--------+
+
+Retirement:
+  +--------+         +------------+             +------+
+  | Active | --CAS-> | Reclaiming | --CAS-----> | Free |
+  +--------+         +------------+             +------+
+
+Recovery (dead owner, stable even generation):
+  +--------------------+
+  | Active or Claiming |
+  +--------------------+
+            |
+            | CAS generation: even -> odd
+            v
+  +--------------------+
+  | Exclusive hold     |
+  +--------------------+
+            |
+            | store state = Reclaiming
+            v
+  +------------+             +------+
+  | Reclaiming | --CAS-----> | Free |
+  +------------+             +------+
 ```
 
-Snapshots acquire-load `state` per slot; only `Active` entries are
-returned.  The `Claiming` state is the publication fence for the
-field bytes — a reader observing `Active` is guaranteed to see all
-the field writes that happened-before the release-store.
+Snapshots acquire-load Active and check for a stable even generation.
+Registration's release-store of Active publishes the preceding field writes.
 
-`Reclaiming` is the exclusive lock held by `sweep_stale` while it
-verifies the dead-pid condition and finalizes the slot to `Free`.
-It blocks concurrent registrants (they need `Free → Claiming`) and
-prevents ABA on the state CAS: without it, a full `dereg + register`
-cycle on another CPU could restore the slot to `Active` between the
-sweeper's pid check and its CAS, causing the sweeper to stomp a live
-tenant's registration.  `sweep_stale` releases `Reclaiming` back to
-the pre-CAS value if the re-verified pid differs from what it
-observed (ABA detected), so the live tenant is restored.
+`sweep_stale` validates the dead owner's identity under a settled
+generation, then acquires that exact generation with an even-to-odd CAS.
+A changed generation makes acquisition fail without modifying the row.
+The odd generation excludes other sweepers before `Reclaiming` is
+stored. Reclamation clears the identity, settles the generation, and
+publishes `Free` last; there is no rollback to `Active`.
 
 ### Role upgrade
 
@@ -1691,26 +1800,14 @@ connect time only — zero hot-path cost.
 
 ### Liveness
 
-The registry does not track heartbeats.  A crashed process that
-never ran its `Node` destructor leaves its entries stuck at
-`Active` (or `Claiming`, if it died mid-register) until reclaimed.
-Two recovery paths:
+The registry does not track heartbeats. Diagnostic tools can filter dead
+PIDs without changing shared memory. `Registry::sweep_stale()` reclaims dead
+owners only when their row has a settled even generation. Registration calls
+it when the registry is full.
 
-- **Query-time filter**: diagnostic tools probe each entry's pid via
-  `process_exists()` and hide dead entries from the user without
-  touching the registry.  Non-invasive; safe under live traffic.
-- **`Registry::sweep_stale()`**: CAS-resets any `Active` or `Claiming`
-  slot whose `pid` is dead.  Opt-in cleanup for an operator or
-  supervisor sweep; also called opportunistically from
-  `register_participant` when the registry is full, so long-running
-  deployments don't silently drop new registrations as crashed-process
-  residue accumulates.
-
-The `Claiming` reclaim branch skips slots where `pid == 0`: that state
-is the brief window between the `Free→Claiming` CAS and the
-registrant's first field store.  Claiming the slot in that window
-would stomp a live registrant.  Cost: an early crash (before the pid
-store) leaks one slot until the region is unlinked.
+Rows with PID zero, odd generations, or Reclaiming state are skipped: their
+holder may still be writing. A crash in these states can strand a slot until
+the registry is replaced.
 
 **PID-reuse mitigation.**  `pid_starttime` is captured at register
 time: `/proc/<pid>/stat` on Linux, `sysctl(KERN_PROC_PID)` on Darwin,
@@ -1731,26 +1828,44 @@ diagnostic nicety, not a correctness dependency.
 
 ### Implicit invariants
 
-Load-bearing assumptions for anyone editing the registry:
+Registry invariants:
 
 - **Field order is ABI.**  `sizeof(ParticipantEntry) == 512` and
   `offsetof(…, _padding) == 368` are statically asserted; any field
   reorder or resize must update the padding and bump `registry::VERSION`.
+  So must a protocol change on an unchanged layout: version 4 kept every
+  offset but made the generation parity-based (odd = held), which a
+  version-3 writer would violate.
+- **A version mismatch is fatal.**  Opening a registry stamped with
+  another `registry::VERSION` throws `VersionMismatch`; there is no
+  migration and no fallback. The shm name is unversioned on purpose, so
+  a stale registry left by an older build fails loudly instead of
+  splitting discovery. Recovery: stop the old processes, then
+  `Registry::unlink(namespace)`.
 - **State publication fence.**  `state.store(Active, release)` in
   `register_participant` is the one fence that publishes all field
   writes that preceded it.  `pid` has its own earlier release-store so
   `sweep_stale` can acquire-load it while state is still `Claiming`
   (before the Active fence).  Any new field that needs to be visible
   during `Claiming` must use its own release/acquire pair.
-- **Generation bump on every mutation.**  `generation` is bumped by
-  `register_participant` *and* by `deregister` *and* by
-  `sweep_stale`'s reclaim path.  A snapshot's seqlock recheck detects
-  only mutations that bump gen — adding a future write-path that
-  modifies fields without bumping gen will cause torn reads.
-- **`touch_registry` must never throw.**  `Node::advertise` and friends
-  treat registration as best-effort.  A failure is logged once per
-  `Node` (latched via `registry_disabled_`) and subsequent calls
-  become no-ops.  Don't change this contract without also changing
+- **Bracket metadata writes with generation changes.** Set an odd generation
+  before changing fields and settle it to even after writing them. Publish
+  Active before settling; publish Free after settling.
+- **Clear identity before reuse.** Zero pid and start time before publishing
+  Free, so a new claim cannot be mistaken for its previous owner.
+- **Acquire the validated generation.** Read PID and start time under one
+  stable even generation, check owner death, then CAS that generation to odd.
+  A stale version fails without touching state; an odd version is already held.
+- **Leave held rows alone.** Sweeps skip odd generations and Reclaiming rows.
+  Their holders may still write metadata, even after clearing PID. A crash
+  during such a hold can strand one slot. Recovering it requires a separate
+  ownership protocol or confirmed quiescence.
+- **`touch_registry` throws only `VersionMismatch`.**  `Node::advertise`
+  and friends treat registration as best-effort: any other failure is
+  logged once per `Node` (latched via `registry_disabled_`) and
+  subsequent calls become no-ops. A version mismatch propagates out of
+  `advertise` / `subscribe` / etc., because the namespace mixes builds
+  and cannot work. Don't change this contract without also changing
   `Node::advertise`'s error handling.
 - **Role upgrade has a brief visibility gap.**  `touch_registry`
   upgrades Publisher/Subscriber → Both via `deregister` + re-register
@@ -1798,6 +1913,13 @@ It is a separate shared-memory object with its own `MAGIC` and its own
 `blackboard::VERSION`, independent of the channel ABI in `types.h`.
 Like the registry, it persists beyond any single process.
 
+`blackboard::VERSION` is 2. The layout is unchanged from 1, but the
+access protocol is not: payload and key bytes are now accessed as
+relaxed atomics (see Read protocol). The race fix only holds
+if every peer follows it, and a version-1 peer's plain `memcpy` would
+race it again. A mismatch throws `VersionMismatch`, the same fatal
+policy as channels and the registry.
+
 ### Layout
 
 One region per board at `/{namespace}_bb_{name}`, composed through
@@ -1815,10 +1937,10 @@ BlackboardHeader     192 B -- magic, version, capacity, max_value_size,
 BlackboardEntry[capacity]  384 B each
                               line 0: state, publish, tenancy, owner_pid,
                                       owner_starttime, key_hash, declared_at_ns
-                              then:   key[128], owner_node[64], padding
+                              then:   key (16 atomic u64 = 128 B), owner_node[64], padding
 value cells          capacity * CELLS_PER_KEY cells of value_stride bytes
                               each: BlackboardCell{updated_at_ns, value_len}
-                              followed by the payload
+                              followed by the payload as atomic u64 words
 ```
 
 `entries_offset`, `values_offset` and the cell stride are **derived,
@@ -1828,6 +1950,15 @@ carries only what cannot be computed. The stride is
 `align_up(sizeof(BlackboardCell) + max_value_size, CACHE_LINE)`, which
 makes every cell cache-line aligned and guarantees no two keys share a
 line.
+
+The two stored fields, `capacity` and `max_value_size`, are read **once**
+at open into a local `blackboard::Geometry` (capacity, value limit,
+stride, `values_offset`), and only that copy is validated and kept. The
+board and every `Writer` and `Reader` it hands out carry the copy; walks,
+`bb_cell_at`, value-size limits and the lock-recovery sweep never
+re-read the header, which a peer can rewrite at any time after open.
+The creator builds its copy from its own config. This mirrors the
+channel's `Geometry` snapshot.
 
 Storing the *configured* `max_value_size` rather than the padded stride
 matters twice over. It keeps the alignment slack from being handed out
@@ -1973,14 +2104,40 @@ refcount-pinned slot there is nothing safe to point at. Pinning would
 reintroduce the failure mode this design exists to remove -- a crashed
 reader blocking a writer.
 
-The overtake window is a genuine data race on the payload bytes in the
-C11 model: the reader's re-check *detects and discards* the copy, but the
-bytes really are touched concurrently. ThreadSanitizer is right to see
-it, and `tests/tsan.supp` carries a narrow, documented suppression scoped
-to `bb_copy_payload()` -- a `noinline` helper that exists so the
-suppression names one frame and leaves `write()` and `read()` themselves
-checked. The blackboard stress scenario asserts
-that no torn value ever escapes, over hundreds of thousands of reads.
+In the overtake window a reader's copy really does overlap a writer's.
+Discarding the copy afterwards is not enough in the C++ model: plain
+overlapping accesses are a data race, undefined behavior even if the
+result is thrown away. So a payload is stored as an array of
+`std::atomic<uint64_t>` words following its `BlackboardCell`
+(`bb_cell_words()`), and both sides move it only as **whole relaxed
+words** (`store_words()` / `load_words()`). The writer zero-pads a
+partial last word. The cell always has room for it, because the stride
+rounds `sizeof(BlackboardCell) + max_value_size` up to a cache line.
+The reader copies only `len` bytes out of its last word. Every
+concurrent access to a payload word is therefore an atomic access of
+the same object type and size. Plain `memcpy` would race, byte atomics
+mixed with word atomics would be undefined, and `atomic_ref` over byte
+storage would not name a real `uint64_t` object. Being plain
+`std::atomic`, this needs no toolchain-specific code.
+
+Ordering is unchanged, and this is what makes it sound. The writer does:
+odd `publish` store, release fence, relaxed payload stores, release fence,
+even `publish` store. The reader does: acquire load of `publish`, relaxed
+payload loads, acquire fence, reload of `publish`. If any payload load
+observes a store from an overtaking write, the reader's acquire fence
+synchronizes with that write's first release fence. Its later reload of
+`publish` then sees at least that write's odd value, and the overtake
+check discards the copy. ThreadSanitizer confirms the accesses are
+race-free, with no suppressions left. It does not model
+`atomic_thread_fence`, so the ordering argument above is what covers the
+fences. The blackboard stress scenario asserts that no torn value ever
+escapes, over hundreds of thousands of reads.
+
+The price is copy bandwidth, because relaxed atomics do not vectorize:
+on x86-64, a 1008 B read went from about 13 ns to 33 ns, and 1 MiB
+values copy about 1.8x slower. Values of a few words are unaffected. A
+true atomic `memcpy` (WG21 P1478) would remove that cost, but it is not
+available in C++20.
 
 ### Listing the board
 
@@ -2001,10 +2158,14 @@ declared-but-never-written key; `read_all()` has no value to return for
 one.
 
 The unlocked walk copies key bytes that `claim_free_slot()` may be
-writing -- the race `bb_key_equals` already carries for
-`Reader::resolve()`. `bb_read_key()` is the `noinline` helper that names
-that one frame for `tests/tsan.supp`; the tenancy re-check after the copy
-discards a torn key.
+rewriting under the board lock, and so does `Reader::resolve()`'s key
+compare. Keys are stored the same way as payloads: `BlackboardEntry::key`
+is `std::atomic<uint64_t>[KEY_MAX / 8]`, with the same offset and size as
+the old `char[KEY_MAX]`. `bb_store_key()` writes the zero-padded
+`KEY_MAX` bytes as whole words, and `bb_load_key()` / `key_equals()`
+take a whole-word copy before comparing it or returning it. The tenancy
+re-check after the copy discards a torn key. `owner_node` stays plain bytes: it is only written and read
+under the board lock.
 
 Neither call is atomic across the board: a key claimed or written during
 the walk may or may not appear. `change_seq()` tells a caller whether the
@@ -2326,8 +2487,8 @@ The `lost()` counter lets the application detect overflow and act on it
 
 ### Pool exhaustion
 
-When the slot pool is empty, `allocate()` returns `nullptr` and
-`send()` returns `-EAGAIN`. If the payload exceeds `max_payload_size`,
+When the slot pool is empty, `allocate()` returns an `AllocatedSlot`
+whose `valid()` is false, and `send()` returns `-EAGAIN`. If the payload exceeds `max_payload_size`,
 `send()` returns `-EMSGSIZE`. On success, `send()` returns the number
 of bytes written. The publisher must handle errors — typically by
 yielding and retrying on `-EAGAIN`, or failing on `-EMSGSIZE`.
@@ -2382,7 +2543,7 @@ The `pool_size` and `sub_ring_capacity` parameters interact:
   At a publish rate of R Hz, a ring of capacity C gives C/R seconds of
   tolerance before loss.
 
-- **`pool_size`** must be at least `sub_ring_capacity * max_subscribers`.
+- **`pool_size`** must be **more than** `sub_ring_capacity * max_subscribers`.
   Each active subscriber can hold up to `sub_ring_capacity` slot
   references (its entire ring window). Pool slots are only freed when
   **all** subscribers have consumed or evicted them (refcount reaches 0).
@@ -2391,8 +2552,15 @@ The `pool_size` and `sub_ring_capacity` parameters interact:
   the publisher exhausts it and `allocate()` fails even when individual
   subscribers have room.
 
-**Sizing rule:** `pool_size >= sub_ring_capacity * max_subscribers`
-(hard minimum). In practice, add 2x headroom for bursty traffic:
+  Allocation happens before ring eviction. If every slot is held by a ring,
+  the next allocation fails and cannot trigger eviction. Receiving does not
+  help: the ring keeps its reference until overwrite or teardown. For one
+  subscriber with capacity 4 and a pool of 4, four sends exhaust the pool
+  even if every message was received.
+
+**Sizing rule:** `pool_size > sub_ring_capacity * max_subscribers`
+(hard minimum: at least one slot must stay allocatable so eviction can
+start). In practice, add 2x headroom for bursty traffic:
 `pool_size = sub_ring_capacity * max_subscribers * 2`.
 
 The `sub_ring_capacity` is the primary tuning knob:

@@ -67,6 +67,26 @@ namespace kickmsg
             h = hash::fnv1a_64(s, h);
             return hash::fnv1a_64(s.size(), h);
         }
+
+        /// Cache hits must validate identity and config because sanitized names can collide.
+        void check_cached_identity(SharedRegion const& r, std::string const& shm_name,
+                                   uint64_t expected_identity)
+        {
+            uint64_t stamped = r.header()->identity_hash;
+            if (expected_identity != 0 and stamped != 0 and stamped != expected_identity)
+            {
+                throw std::runtime_error(std::string{"Identity mismatch on existing region (shm name collision): "} + shm_name);
+            }
+        }
+
+        void check_cached_config(SharedRegion const& r, std::string const& shm_name,
+                                 channel::Type type, channel::Config const& cfg)
+        {
+            if (r.header()->config_hash != compute_config_hash(type, cfg))
+            {
+                throw std::runtime_error(std::string{"Config mismatch on existing region: "} + shm_name);
+            }
+        }
     }
 
     void Node::touch_registry(std::string const& shm_name,
@@ -100,11 +120,8 @@ namespace kickmsg
             {
                 if (it->second.role != role and it->second.role != registry::Both)
                 {
-                    // Upgrade to Both via dereg + re-register; brief
-                    // visibility gap during the swap is acceptable since
-                    // the registry is diagnostic-only.  On fill-failure
-                    // of the Both re-register, fall back to re-registering
-                    // the original role to keep at least partial discovery.
+                    // Role changes use deregister/register. If the registry fills,
+                    // try to restore the previous role.
                     reg.deregister(it->second.slot_index);
                     uint32_t slot = reg.register_participant(
                         shm_name, topic_name, channel_type, kind,
@@ -138,6 +155,11 @@ namespace kickmsg
             }
             registry_slots_[shm_name] = RegistrySlot{slot, role};
         }
+        catch (VersionMismatch const&)
+        {
+            // Not best-effort: a namespace mixing kickmsg versions cannot work.
+            throw;
+        }
         catch (std::exception const& e)
         {
             // Latch to avoid stderr spam on a Node that brings up many topics.
@@ -154,11 +176,11 @@ namespace kickmsg
     {
         auto shm_name   = make_topic_name(topic);
         auto topic_path = with_leading_slash(topic);
-        // Guard the create: a second advertise() would re-run create()
-        // (unlink + fresh object), orphaning the live segment for existing
-        // Publishers and remote peers.
+        // Reuse cached regions; create() would replace the shared object.
         if (auto* r = find_region(shm_name))
         {
+            check_cached_identity(*r, shm_name, make_topic_identity(topic));
+            check_cached_config(*r, shm_name, channel::PubSub, cfg);
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Pubsub, registry::Publisher);
             return Publisher(*r, backend);
@@ -179,6 +201,7 @@ namespace kickmsg
         auto topic_path = with_leading_slash(topic);
         if (auto* r = find_region(shm_name))
         {
+            check_cached_identity(*r, shm_name, make_topic_identity(topic));
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Pubsub, registry::Subscriber);
             return Subscriber(*r);
@@ -202,6 +225,8 @@ namespace kickmsg
     {
         if (auto* r = find_region(shm_name))
         {
+            check_cached_identity(*r, shm_name, cfg.identity);
+            check_cached_config(*r, shm_name, channel_type, cfg);
             touch_registry(shm_name, topic_path, channel_type, kind, role);
             return Handle(*r, std::forward<Args>(args)...);
         }
@@ -239,6 +264,8 @@ namespace kickmsg
         auto topic_path = with_leading_slash(channel);
         if (auto* r = find_region(shm_name))
         {
+            check_cached_identity(*r, shm_name, make_broadcast_identity(channel));
+            check_cached_config(*r, shm_name, channel::Broadcast, cfg);
             touch_registry(shm_name, topic_path, channel::Broadcast,
                            registry::Broadcast, registry::Both);
             return BroadcastHandle{Publisher{*r, backend}, Subscriber{*r}};
@@ -261,10 +288,11 @@ namespace kickmsg
         mbx_cfg.identity        = make_mailbox_identity(name_.c_str(), tag);
         auto shm_name   = make_mailbox_name(name_.c_str(), tag);
         auto topic_path = mailbox_topic(name_.c_str(), tag);
-        // Guard the create (see advertise); the duplicate claim then fails
-        // loudly in the Subscriber ctor instead of splitting the mailbox.
+        // Reuse the region so a duplicate subscriber fails without replacing it.
         if (auto* r = find_region(shm_name))
         {
+            check_cached_identity(*r, shm_name, mbx_cfg.identity);
+            check_cached_config(*r, shm_name, channel::PubSub, mbx_cfg);
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Mailbox, registry::Subscriber);
             return Subscriber(*r);
@@ -285,6 +313,7 @@ namespace kickmsg
         auto topic_path = mailbox_topic(owner_node, tag);
         if (auto* r = find_region(shm_name))
         {
+            check_cached_identity(*r, shm_name, make_mailbox_identity(owner_node, tag));
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Mailbox, registry::Publisher);
             return Publisher(*r, backend);
@@ -326,9 +355,7 @@ namespace kickmsg
 
     Blackboard& Node::blackboard(char const* name, blackboard::Config const& cfg)
     {
-        // Keyed by the LOGICAL name: "a:b" and "a b" sanitize to one shm
-        // path, so keying by that path would let the second call hit the
-        // cache and bypass the identity check.
+        // Use the logical name as the key; distinct names can sanitize to one path.
         std::string logical = name;
         auto        path    = with_leading_slash(name);
 
@@ -413,10 +440,8 @@ namespace kickmsg
 
     std::string Node::make_topic_name(char const* topic) const
     {
-        // namespace_ is pre-sanitized in the ctor; topic is user-supplied on
-        // each call and may be a ROS-style "/a/b/c" path.  compose_shm_name
-        // handles the platform shm-name limit (hash on macOS, readable on
-        // Linux, throw on overflow).
+        // namespace_ is already sanitized; topic may contain path separators.
+        // compose_shm_name applies platform name limits.
         return compose_shm_name(namespace_,
                                 sanitize_shm_component(topic, "topic"));
     }

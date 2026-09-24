@@ -17,7 +17,7 @@ bool run_gc_recovery()
         shm_name, kickmsg::channel::PubSub, cfg, "gc_test");
 
     auto* base = region.base();
-    auto* h    = region.header();
+    auto* header    = region.header();
 
     bool ok = true;
 
@@ -33,12 +33,12 @@ bool run_gc_recovery()
 
     // Now poison the committed entry
     {
-        auto* ring    = kickmsg::sub_ring_at(base, h, 0);
+        auto* ring    = kickmsg::sub_ring_at(base, region.geometry(), 0);
         auto* entries = kickmsg::ring_entries(ring);
         uint64_t wp   = ring->write_pos.load(std::memory_order_acquire);
         if (wp > 0)
         {
-            entries[(wp - 1) & h->sub_ring_mask].sequence = kickmsg::seq_lock(wp - 1);
+            entries[(wp - 1) & header->sub_ring_mask].sequence = kickmsg::seq_lock(wp - 1);
         }
     }
 
@@ -52,8 +52,8 @@ bool run_gc_recovery()
     // Simulate an orphaned slot: pop one from the free stack (no ring references it)
     // and set its refcount > 0 as if a publisher crashed after refcount pre-set.
     {
-        uint32_t idx = kickmsg::treiber_pop(h->free_top, base, h);
-        auto* slot = kickmsg::slot_at(base, h, idx);
+        uint32_t idx = kickmsg::treiber_pop(header->free_top, base, region.geometry());
+        auto* slot = kickmsg::slot_at(base, region.geometry(), idx);
         slot->refcount = 3;
     }
 

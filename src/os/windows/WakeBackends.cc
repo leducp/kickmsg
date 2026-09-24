@@ -21,8 +21,7 @@ namespace kickmsg
         /// Descriptors gathered on the stack before WaitSet::wait allocates.
         constexpr std::size_t STACK_FDS = 64;
 
-        /// Winsock needs a process-wide init before any socket call. Function-local static,
-        /// so it happens once and only if a wake backend is actually used.
+        /// Initialize Winsock once per process, when first used.
         bool winsock_ready()
         {
             static bool const ready = []
@@ -33,9 +32,7 @@ namespace kickmsg
             return ready;
         }
 
-        /// SOCKET is a UINT_PTR. Windows keeps handle values small for interop, but that
-        /// is convention, not contract: a value past INT_MAX would wrap negative and read
-        /// back as a failed bind, so it fails closed instead.
+        /// SOCKET is pointer-sized; reject values that cannot fit this API's int.
         int to_fd(SOCKET socket)
         {
             if (socket == INVALID_SOCKET)
@@ -55,9 +52,8 @@ namespace kickmsg
             return static_cast<SOCKET>(fd);
         }
 
-        /// Every option matters. Non-blocking keeps signal() off the publish path. TTL 0
-        /// and the loopback interface keep the wake on this host, and LOOP is what still
-        /// delivers it. A socket missing any of them is thrown away.
+        /// Non-blocking sockets keep signal() from waiting. TTL 0, loopback
+        /// interface, and multicast loopback restrict delivery to this host.
         bool configure_sender(SOCKET socket)
         {
             u_long non_blocking = 1;
@@ -132,8 +128,7 @@ namespace kickmsg
             return -1;
         }
 
-        // Every subscriber of this channel binds the same port, which SO_REUSEADDR is
-        // what permits. Without it this socket blocks every later joiner.
+        // SO_REUSEADDR allows all channel subscribers to bind the same port.
         BOOL on = TRUE;
         if (::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR,
                          reinterpret_cast<char const*>(&on), sizeof(on)) == SOCKET_ERROR)
@@ -173,8 +168,7 @@ namespace kickmsg
 
     void UdpMulticastBackend::drain(int fd)
     {
-        // Bounded, as on POSIX: the group is joinable by any local process, which could
-        // otherwise feed this loop indefinitely. What is left reads as a spurious wake.
+        // Bound draining so incoming traffic cannot keep the caller here forever.
         char buffer[64];
         for (int i = 0; i < DRAIN_MAX; ++i)
         {
@@ -216,12 +210,11 @@ namespace kickmsg
         }
         auto const count = fds_.size();
 
-        // WSAPoll, not select: fd_set is a fixed array of FD_SETSIZE sockets, which
-        // would cap this API at a compile-time constant. WSAPoll's documented defect is
-        // POLLOUT on a failed connect; this only ever asks to read.
-        WSAPOLLFD              stack[STACK_FDS] = {};
-        std::vector<WSAPOLLFD> heap;
-        WSAPOLLFD*             entries = stack;
+        // WSAPoll avoids select's FD_SETSIZE limit; only readability is requested.
+        // Reuse per-thread storage beyond the stack buffer.
+        WSAPOLLFD  stack[STACK_FDS] = {};
+        WSAPOLLFD* entries = stack;
+        static thread_local std::vector<WSAPOLLFD> heap;
         if (count > STACK_FDS)
         {
             heap.resize(count);
@@ -243,8 +236,7 @@ namespace kickmsg
         {
             return false;
         }
-        // A count alone is not readability: POLLERR, POLLHUP and POLLNVAL also raise it,
-        // and a closed socket would then report ready forever and spin the caller.
+        // Only readability counts: poll also returns errors and closed descriptors.
         for (std::size_t i = 0; i < count; ++i)
         {
             if ((entries[i].revents & POLLRDNORM) != 0)

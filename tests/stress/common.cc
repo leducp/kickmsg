@@ -300,7 +300,7 @@ bool verify_gc_zero(kickmsg::SharedRegion& region, kickmsg::channel::Config cons
     uint64_t dropped = 0;
     for (uint32_t i = 0; i < cfg.max_subscribers; ++i)
     {
-        auto* ring = kickmsg::sub_ring_at(region.base(), region.header(), i);
+        auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), i);
         dropped += ring->dropped_count.load(std::memory_order_acquire);
     }
 
@@ -333,11 +333,11 @@ bool verify_gc_zero(kickmsg::SharedRegion& region, kickmsg::channel::Config cons
 bool verify_pool_free(kickmsg::SharedRegion& region, kickmsg::channel::Config const& cfg)
 {
     auto* base = region.base();
-    auto* hdr  = region.header();
+    auto* header  = region.header();
 
     std::vector<bool> seen(cfg.pool_size, false);
     uint32_t count  = 0;
-    uint32_t top    = kickmsg::tagged_idx(hdr->free_top.load(std::memory_order_acquire));
+    uint32_t top    = kickmsg::tagged_idx(header->free_top.load(std::memory_order_acquire));
 
     while (top != kickmsg::INVALID_SLOT)
     {
@@ -354,7 +354,7 @@ bool verify_pool_free(kickmsg::SharedRegion& region, kickmsg::channel::Config co
         seen[top] = true;
         ++count;
 
-        auto* slot = kickmsg::slot_at(base, hdr, top);
+        auto* slot = kickmsg::slot_at(base, region.geometry(), top);
         top = slot->next_free;
     }
 
@@ -370,11 +370,10 @@ bool verify_pool_free(kickmsg::SharedRegion& region, kickmsg::channel::Config co
 bool verify_rings_inactive(kickmsg::SharedRegion& region, kickmsg::channel::Config const& cfg)
 {
     auto* base = region.base();
-    auto* hdr  = region.header();
 
     for (uint32_t i = 0; i < cfg.max_subscribers; ++i)
     {
-        auto* ring = kickmsg::sub_ring_at(base, hdr, i);
+        auto* ring = kickmsg::sub_ring_at(base, region.geometry(), i);
         uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
         if (kickmsg::ring::get_state(packed) != kickmsg::ring::Free)
         {
@@ -394,11 +393,10 @@ bool verify_rings_inactive(kickmsg::SharedRegion& region, kickmsg::channel::Conf
 bool verify_refcounts_zero(kickmsg::SharedRegion& region, kickmsg::channel::Config const& cfg)
 {
     auto* base = region.base();
-    auto* hdr  = region.header();
 
     for (uint32_t i = 0; i < cfg.pool_size; ++i)
     {
-        auto* slot = kickmsg::slot_at(base, hdr, i);
+        auto* slot = kickmsg::slot_at(base, region.geometry(), i);
         uint32_t rc = slot->refcount;
         if (rc != 0)
         {

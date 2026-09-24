@@ -1,17 +1,6 @@
 /// @file stall_repair_test.cc
-/// @brief False-positive-death fuzz test for the theft-safe commit protocol.
-///
-/// A child publisher is SIGSTOPped at random instants, so it sometimes
-/// freezes while holding a position-tagged entry lock.  With a tight
-/// commit_timeout the stall makes the lock "provably stale": an external
-/// repairer (the parent) runs repair_locked_entries() during the stall and
-/// steals the entry.  The publisher is then SIGCONTed and resumes.
-///
-/// The theft guard + CAS commit in Publisher::publish() must turn every
-/// such steal into a clean publisher drop:
-///   - never a torn payload (magic/checksum validated on every sample),
-///   - never a per-publisher sequence rewind (seq strictly increasing),
-///   - never refcount corruption (structural pool checks at the end).
+/// Pause child publishers with SIGSTOP, repair their locks, then resume them.
+/// Check payloads, sequence order, and pool references after lock theft.
 
 #include <atomic>
 #include <cerrno>
@@ -50,10 +39,7 @@ static uint32_t compute_checksum(StallPayload const& p)
     return p.magic ^ p.pub_id ^ p.seq ^ 0xDEADBEEF;
 }
 
-// --- Seeded stall-timing fuzzer ---------------------------------------------
-// Each SIGSTOP fires at a random instant so a long soak explores new stall
-// windows instead of re-hitting a fixed schedule.  The seed is logged at
-// startup; set KICKMSG_STALL_SEED to replay a specific run.
+// Randomize stall timing. Set KICKMSG_STALL_SEED to replay a logged seed.
 namespace
 {
     uint64_t g_rng_state = 0;
@@ -116,9 +102,7 @@ static pid_t checked_fork(char const* site)
 /// increasing seq in a tight loop until SIGTERM flips the stop flag.
 static void child_publisher_main()
 {
-    // Replace the inherited shm-cleanup SIGTERM handler: the parent still
-    // uses the segment, so the child must convert SIGTERM into a clean loop
-    // exit instead of unlinking the region out from under it.
+    // The child must not unlink shared memory still used by the parent.
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = child_stop_handler;
@@ -132,8 +116,8 @@ static void child_publisher_main()
     uint32_t seq = 0;
     while (g_child_stop == 0)
     {
-        auto a = pub.allocate();
-        if (a.data == nullptr)
+        auto slot = pub.allocate();
+        if (not slot.valid())
         {
             kickmsg::yield();
             continue;
@@ -144,9 +128,9 @@ static void child_publisher_main()
         msg.pub_id   = 1;
         msg.seq      = seq;
         msg.checksum = compute_checksum(msg);
-        std::memcpy(a.data, &msg, sizeof(msg));
+        slot.write(&msg, sizeof(msg));
 
-        pub.publish(sizeof(msg));
+        slot.publish(sizeof(msg));
         // A dropped publish (theft detected) leaves a gap -- gaps are
         // legitimate; the subscriber only rejects a seq going backward.
         ++seq;
@@ -237,11 +221,11 @@ static void subscriber_main(kickmsg::SharedRegion& region, SubStats& stats)
 
 static bool verify_rings_free(kickmsg::SharedRegion& region)
 {
-    auto* hdr = region.header();
+    auto* header = region.header();
     bool  ok  = true;
-    for (uint32_t i = 0; i < hdr->max_subs; ++i)
+    for (uint32_t i = 0; i < header->max_subs; ++i)
     {
-        auto*    ring   = kickmsg::sub_ring_at(region.base(), hdr, i);
+        auto*    ring   = kickmsg::sub_ring_at(region.base(), region.geometry(), i);
         uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
         if (kickmsg::ring::get_state(packed) != kickmsg::ring::Free)
         {
@@ -265,14 +249,14 @@ static bool verify_rings_free(kickmsg::SharedRegion& region)
 static bool verify_slots(kickmsg::SharedRegion& region)
 {
     auto* base = region.base();
-    auto* hdr  = region.header();
+    auto* header  = region.header();
 
-    std::vector<bool> in_free(hdr->pool_size, false);
-    uint32_t top = kickmsg::tagged_idx(hdr->free_top.load(std::memory_order_acquire));
+    std::vector<bool> in_free(header->pool_size, false);
+    uint32_t top = kickmsg::tagged_idx(header->free_top.load(std::memory_order_acquire));
 
     while (top != kickmsg::INVALID_SLOT)
     {
-        if (top >= hdr->pool_size)
+        if (top >= header->pool_size)
         {
             std::fprintf(stderr, "  [FAIL] free stack contains out-of-range index %u\n", top);
             return false;
@@ -285,18 +269,18 @@ static bool verify_slots(kickmsg::SharedRegion& region)
         }
         in_free[top] = true;
 
-        auto* slot = kickmsg::slot_at(base, hdr, top);
+        auto* slot = kickmsg::slot_at(base, region.geometry(), top);
         top = slot->next_free;
     }
 
     bool ok = true;
-    for (uint32_t i = 0; i < hdr->pool_size; ++i)
+    for (uint32_t i = 0; i < header->pool_size; ++i)
     {
         if (in_free[i])
         {
             continue;
         }
-        auto*    slot = kickmsg::slot_at(base, hdr, i);
+        auto*    slot = kickmsg::slot_at(base, region.geometry(), i);
         uint32_t rc   = slot->refcount;
         if (rc != 0)
         {
@@ -439,9 +423,8 @@ int main(int argc, char** argv)
     steals += region.repair_locked_entries();
     std::size_t const reclaimed = region.reclaim_orphaned_slots();
 
-    // Each steal can orphan at most one slot ref (entry_steal_and_clear
-    // deliberately leaks the displaced reference); more reclaims than
-    // steals means the normal path leaked.
+    // Repair preserves slot claims. Only terminated publishers can orphan
+    // references; more reclaims than steals indicates a normal-path leak.
     std::printf("  Reclaimed slots: %zu (steal budget %" PRIu64 ")\n", reclaimed, steals);
     if (reclaimed > steals)
     {

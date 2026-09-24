@@ -148,12 +148,12 @@ TEST_F(SubscriberTest, DrainReleasesSlots)
     auto count_free = [&]()
     {
         uint32_t count = 0;
-        auto*    hdr = region.header();
-        uint64_t top = hdr->free_top.load(std::memory_order_acquire);
+        auto*    header = region.header();
+        uint64_t top = header->free_top.load(std::memory_order_acquire);
         uint32_t idx = kickmsg::tagged_idx(top);
         while (idx != kickmsg::INVALID_SLOT)
         {
-            auto* slot = kickmsg::slot_at(region.base(), hdr, idx);
+            auto* slot = kickmsg::slot_at(region.base(), region.geometry(), idx);
             idx = slot->next_free;
             ++count;
         }
@@ -259,10 +259,9 @@ TEST_F(SubscriberTest, DrainDoesNotDoubleDecrementOnChurn)
 
     // All slots should have refcount 0
     auto* base = region.base();
-    auto* h    = region.header();
     for (uint32_t i = 0; i < cfg.pool_size; ++i)
     {
-        auto* slot = kickmsg::slot_at(base, h, i);
+        auto* slot = kickmsg::slot_at(base, region.geometry(), i);
         uint32_t rc = slot->refcount;
         EXPECT_EQ(rc, 0u) << "slot " << i << " has refcount " << rc;
     }
@@ -314,7 +313,7 @@ TEST_F(SubscriberTest, StuckPublisherCausesDrainTimeout)
         EXPECT_EQ(sub.drain_timeouts(), 0u);
 
         // Simulate a stuck publisher: inflate in_flight on ring 0
-        auto* ring = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+        auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
         ring->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
                                      std::memory_order_acq_rel);
 
@@ -322,7 +321,7 @@ TEST_F(SubscriberTest, StuckPublisherCausesDrainTimeout)
     }
 
     // The ring should be Free with stale in_flight preserved
-    auto* ring = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
     uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
     EXPECT_EQ(kickmsg::ring::get_state(packed), kickmsg::ring::Free);
     EXPECT_GT(kickmsg::ring::get_in_flight(packed), 0u);
@@ -358,7 +357,7 @@ TEST_F(SubscriberTest, DrainTimeoutsCounterIncrementsOnTimeout)
     EXPECT_EQ(sub.drain_timeouts(), 0u);
 
     // Inflate in_flight on ring 0 to simulate a crashed publisher.
-    auto* ring0 = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+    auto* ring0 = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
     ring0->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
                                   std::memory_order_acq_rel);
 
@@ -404,7 +403,7 @@ TEST_F(SubscriberTest, RejoinAfterDrainTimeout)
         uint32_t val = 1;
         ASSERT_GE(pub.send(&val, sizeof(val)), 0);
 
-        auto* ring = kickmsg::sub_ring_at(region.base(), region.header(), 0);
+        auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
         ring->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
                                      std::memory_order_acq_rel);
         // sub destructs — timeout, drain skipped, stale in_flight preserved
@@ -550,10 +549,9 @@ TEST_F(SubscriberTest, ConcurrentChurnRefcountIntegrity)
 
     // Verify all refcounts are zero
     auto* base = region.base();
-    auto* h    = region.header();
     for (uint32_t i = 0; i < cfg.pool_size; ++i)
     {
-        auto* slot = kickmsg::slot_at(base, h, i);
+        auto* slot = kickmsg::slot_at(base, region.geometry(), i);
         uint32_t rc = slot->refcount;
         EXPECT_EQ(rc, 0u) << "slot " << i << " has refcount " << rc
                           << " (round completed, all should be 0)";

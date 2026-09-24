@@ -1,5 +1,6 @@
 #include "kickmsg/Blackboard.h"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -8,9 +9,6 @@
 #include "kickmsg/os/Futex.h"
 #include "kickmsg/os/Process.h"
 #include "kickmsg/os/Time.h"
-
-
-#define KICKMSG_BB_NOINLINE __attribute__((noinline))
 
 
 namespace kickmsg
@@ -33,30 +31,58 @@ namespace kickmsg
             }
         }
 
-        /// Copy a value payload.  A reader overtaken by CELLS_PER_KEY writes
-        /// races the writer's copy here and discards the result; the payload
-        /// race lives in this function alone, and tests/tsan.supp names it.
-        KICKMSG_BB_NOINLINE void bb_copy_payload(void* dst, void const* src, std::size_t len)
+        // Payload and key bytes are read without the board lock while a writer may be
+        // rewriting them, so both live in std::atomic<uint64_t> words and are only ever
+        // moved as whole relaxed words: an overlap the publish/tenancy re-check later
+        // discards is then not a data race, and no two accesses differ in size.  The
+        // fences around each copy are what order it.
+        static_assert(sizeof(BlackboardCell) % sizeof(uint64_t) == 0 and CACHE_LINE % sizeof(uint64_t) == 0,
+            "a zero-padded last payload word must stay inside its cell");
+
+        void store_words(std::atomic<uint64_t>* shared, void const* src, std::size_t len)
         {
-            std::memcpy(dst, src, len);
+            auto const* in   = static_cast<uint8_t const*>(src);
+            std::size_t full = len / sizeof(uint64_t);
+            for (std::size_t w = 0; w < full; ++w)
+            {
+                uint64_t word;
+                std::memcpy(&word, in + w * sizeof(uint64_t), sizeof(word));
+                shared[w].store(word, std::memory_order_relaxed);
+            }
+            std::size_t rest = len % sizeof(uint64_t);
+            if (rest != 0)
+            {
+                uint64_t word = 0;
+                std::memcpy(&word, in + full * sizeof(uint64_t), rest);
+                shared[full].store(word, std::memory_order_relaxed);
+            }
         }
 
-        /// Compare a stored key against \p key.  Reader::resolve() runs this
-        /// unlocked against claim_free_slot()'s copy_field, the board's second
-        /// suppressed race; declare() runs it under the board lock.
-        KICKMSG_BB_NOINLINE bool bb_key_equals(char const* stored, char const* key,
-                                               std::size_t key_len)
+        void load_words(void* dst, std::atomic<uint64_t> const* shared, std::size_t len)
         {
-            return ::strnlen(stored, blackboard::KEY_MAX) == key_len
-               and std::memcmp(stored, key, key_len) == 0;
+            auto*       out  = static_cast<uint8_t*>(dst);
+            std::size_t full = len / sizeof(uint64_t);
+            for (std::size_t w = 0; w < full; ++w)
+            {
+                uint64_t word = shared[w].load(std::memory_order_relaxed);
+                std::memcpy(out + w * sizeof(uint64_t), &word, sizeof(word));
+            }
+            std::size_t rest = len % sizeof(uint64_t);
+            if (rest != 0)
+            {
+                uint64_t word = shared[full].load(std::memory_order_relaxed);
+                std::memcpy(out + full * sizeof(uint64_t), &word, rest);
+            }
         }
 
-        /// Runs unlocked against claim_free_slot()'s copy_field, the race
-        /// bb_key_equals also carries; the caller's tenancy re-check discards a
-        /// torn copy.
-        KICKMSG_BB_NOINLINE std::string bb_read_key(char const* stored, std::size_t size)
+        /// Compare a stored key against \p key.  Runs unlocked in Reader::resolve();
+        /// a torn copy costs a retry once the tenancy re-check sees the entry move.
+        bool key_equals(BlackboardEntry const* entry, char const* key, std::size_t key_len)
         {
-            return std::string(stored, ::strnlen(stored, size));
+            char copy[blackboard::KEY_MAX];
+            load_words(copy, entry->key, sizeof(copy));
+            return ::strnlen(copy, sizeof(copy)) == key_len
+               and std::memcmp(copy, key, key_len) == 0;
         }
 
         std::size_t stride_for(std::size_t max_value_size)
@@ -75,14 +101,15 @@ namespace kickmsg
         /// The value limit is the creator's configured size, never the padded
         /// stride: handing out the alignment slack would let one peer write
         /// more than its correctly-sized readers can hold.
-        std::size_t value_capacity(BlackboardHeader const* header)
+        blackboard::Geometry make_geometry(uint32_t capacity, std::size_t max_value_size)
         {
-            return static_cast<std::size_t>(header->max_value_size);
-        }
-
-        std::size_t value_stride(BlackboardHeader const* header)
-        {
-            return stride_for(static_cast<std::size_t>(header->max_value_size));
+            blackboard::Geometry geometry;
+            geometry.capacity       = capacity;
+            geometry.max_value_size = max_value_size;
+            geometry.value_stride   = stride_for(max_value_size);
+            geometry.values_offset  = sizeof(BlackboardHeader)
+                             + static_cast<std::size_t>(capacity) * sizeof(BlackboardEntry);
+            return geometry;
         }
 
         void copy_field(char* dst, std::size_t dst_size, char const* src)
@@ -156,7 +183,7 @@ namespace kickmsg
             return make_token(pid, live.starttime) != token;
         }
 
-        void repair_board(void* base, BlackboardHeader* header);
+        void repair_board(void* base, uint32_t capacity);
 
         /// Returns false if the wait ran out, which means a live holder.
         /// `budget` bounds yields and `limit` bounds wall clock; zero disables
@@ -164,8 +191,8 @@ namespace kickmsg
         ///
         /// An abandoned lock transfers directly from the dead holder's token
         /// to ours, never through zero, so nothing can slip in mid-repair.
-        bool board_lock(void* base, BlackboardHeader* header, uint64_t my_token,
-                        int budget, nanoseconds limit)
+        bool board_lock(void* base, BlackboardHeader* header, uint32_t capacity,
+                        uint64_t my_token, int budget, nanoseconds limit)
         {
             nanoseconds start = monotonic_ns();
             for (int attempt = 0; budget == 0 or attempt < budget; ++attempt)
@@ -202,7 +229,7 @@ namespace kickmsg
                         expected, my_token,
                         std::memory_order_acq_rel, std::memory_order_relaxed))
                 {
-                    repair_board(base, header);
+                    repair_board(base, capacity);
                     return true;
                 }
             }
@@ -226,15 +253,15 @@ namespace kickmsg
             /// The token is always the caller's own, so the guard derives it
             /// rather than taking one -- a parameter that can only be passed
             /// one way is a hazard, not a knob.
-            BoardGuard(void* base, BlackboardHeader* header, int budget)
-                : h_{header}
-                , held_{board_lock(base, header, self_token(), budget, nanoseconds::zero())}
+            BoardGuard(void* base, uint32_t capacity, int budget)
+                : h_{static_cast<BlackboardHeader*>(base)}
+                , held_{board_lock(base, h_, capacity, self_token(), budget, nanoseconds::zero())}
             {
             }
 
-            BoardGuard(void* base, BlackboardHeader* header, nanoseconds limit)
-                : h_{header}
-                , held_{board_lock(base, header, self_token(), 0, limit)}
+            BoardGuard(void* base, uint32_t capacity, nanoseconds limit)
+                : h_{static_cast<BlackboardHeader*>(base)}
+                , held_{board_lock(base, h_, capacity, self_token(), 0, limit)}
             {
             }
 
@@ -298,9 +325,9 @@ namespace kickmsg
             return false;
         }
 
-        void repair_board(void* base, BlackboardHeader* header)
+        void repair_board(void* base, uint32_t capacity)
         {
-            for (uint32_t i = 0; i < header->capacity; ++i)
+            for (uint32_t i = 0; i < capacity; ++i)
             {
                 normalize_entry(bb_entry_at(base, i));
             }
@@ -325,7 +352,7 @@ namespace kickmsg
 
         bool key_matches(BlackboardEntry const* entry, char const* key, std::size_t key_len)
         {
-            return bb_key_equals(entry->key, key, key_len);
+            return key_equals(entry, key, key_len);
         }
 
         /// Fingerprint of the RAW (namespace, name) pair, each component
@@ -381,20 +408,31 @@ namespace kickmsg
         return reinterpret_cast<BlackboardEntry*>(bytes + static_cast<std::size_t>(idx) * sizeof(BlackboardEntry));
     }
 
-    BlackboardCell* bb_cell_at(void* base, uint32_t idx, uint64_t parity)
+    BlackboardCell* bb_cell_at(void* base, blackboard::Geometry const& geometry, uint32_t idx, uint64_t parity)
     {
-        auto const* header = static_cast<BlackboardHeader const*>(base);
-        std::size_t values = sizeof(BlackboardHeader)
-                           + static_cast<std::size_t>(header->capacity) * sizeof(BlackboardEntry);
         std::size_t cell = (static_cast<std::size_t>(idx) * blackboard::CELLS_PER_KEY
                             + static_cast<std::size_t>(parity & CELL_MASK))
-                         * value_stride(header);
-        return reinterpret_cast<BlackboardCell*>(static_cast<uint8_t*>(base) + values + cell);
+                         * geometry.value_stride;
+        return reinterpret_cast<BlackboardCell*>(static_cast<uint8_t*>(base) + geometry.values_offset + cell);
     }
 
-    uint8_t* bb_cell_payload(BlackboardCell* cell)
+    std::atomic<uint64_t>* bb_cell_words(BlackboardCell* cell)
     {
-        return reinterpret_cast<uint8_t*>(cell) + sizeof(BlackboardCell);
+        return reinterpret_cast<std::atomic<uint64_t>*>(reinterpret_cast<uint8_t*>(cell) + sizeof(BlackboardCell));
+    }
+
+    void bb_store_key(BlackboardEntry* entry, char const* key, std::size_t len)
+    {
+        char copy[blackboard::KEY_MAX] = {};
+        std::memcpy(copy, key, std::min(len, sizeof(copy)));
+        store_words(entry->key, copy, sizeof(copy));
+    }
+
+    std::string bb_load_key(BlackboardEntry const* entry)
+    {
+        char copy[blackboard::KEY_MAX];
+        load_words(copy, entry->key, sizeof(copy));
+        return std::string(copy, ::strnlen(copy, sizeof(copy)));
     }
 
     uint64_t bb_config_hash(blackboard::Config const& cfg)
@@ -412,9 +450,11 @@ namespace kickmsg
         , owner_name_{std::move(other.owner_name_)}
         , base_{other.base_}
         , size_{other.size_}
+        , geometry_{other.geometry_}
     {
-        other.base_ = nullptr;
-        other.size_ = 0;
+        other.base_     = nullptr;
+        other.size_     = 0;
+        other.geometry_ = blackboard::Geometry{};
     }
 
     Blackboard& Blackboard::operator=(Blackboard&& other) noexcept
@@ -426,8 +466,10 @@ namespace kickmsg
             owner_name_ = std::move(other.owner_name_);
             base_       = other.base_;
             size_       = other.size_;
-            other.base_ = nullptr;
-            other.size_ = 0;
+            geometry_   = other.geometry_;
+            other.base_     = nullptr;
+            other.size_     = 0;
+            other.geometry_ = blackboard::Geometry{};
         }
         return *this;
     }
@@ -453,6 +495,7 @@ namespace kickmsg
         header()->identity_hash  = cfg.identity;
         header()->creator_pid    = current_pid();
         header()->created_at_ns  = static_cast<uint64_t>(since_epoch().count());
+        geometry_ = make_geometry(cfg.capacity, cfg.max_value_size);
 
         // MAGIC published last -- openers spin on it with acquire.
         header()->magic.store(blackboard::MAGIC, std::memory_order_release);
@@ -476,10 +519,15 @@ namespace kickmsg
                 {
                     if (header->version != blackboard::VERSION)
                     {
-                        throw std::runtime_error("Blackboard version mismatch on " + shm);
+                        throw VersionMismatch("Blackboard version mismatch on " + shm +
+                            ": stamped by an incompatible kickmsg build; stop its users and unlink it");
                     }
-                    if (header->total_size < sizeof(BlackboardHeader)
-                        or header->total_size > mapping.size())
+                    // Each field is read once and only the copies are checked and kept:
+                    // a peer can rewrite the header during or after validation.
+                    uint64_t const total_size     = header->total_size;
+                    uint32_t const capacity       = header->capacity;
+                    uint64_t const max_value_size = header->max_value_size;
+                    if (total_size < sizeof(BlackboardHeader) or total_size > mapping.size())
                     {
                         throw std::runtime_error("Blackboard total_size invalid on " + shm);
                     }
@@ -487,26 +535,25 @@ namespace kickmsg
                     // pointer computation; a corrupt value would send
                     // snapshot()/read() off the mapping.  Bound both
                     // (division-based, so no intermediate can overflow).
-                    std::size_t after_header = static_cast<std::size_t>(header->total_size)
+                    std::size_t after_header = static_cast<std::size_t>(total_size)
                                              - sizeof(BlackboardHeader);
-                    if (header->capacity == 0 or header->capacity > blackboard::MAX_CAPACITY
-                        or header->capacity > after_header / sizeof(BlackboardEntry))
+                    if (capacity == 0 or capacity > blackboard::MAX_CAPACITY
+                        or capacity > after_header / sizeof(BlackboardEntry))
                     {
                         throw std::runtime_error("Blackboard capacity exceeds segment on " + shm);
                     }
                     // Bounding max_value_size (not the derived stride) is what
                     // keeps the accepted range identical on both sides: a board
                     // created at exactly MAX_VALUE_SIZE must stay openable.
-                    if (header->max_value_size == 0
-                        or header->max_value_size > blackboard::MAX_VALUE_SIZE)
+                    if (max_value_size == 0 or max_value_size > blackboard::MAX_VALUE_SIZE)
                     {
                         throw std::runtime_error("Blackboard max_value_size invalid on " + shm);
                     }
-                    std::size_t entries_bytes = static_cast<std::size_t>(header->capacity)
-                                              * sizeof(BlackboardEntry);
-                    std::size_t after_entries = after_header - entries_bytes;
-                    if (header->capacity > after_entries
-                            / (blackboard::CELLS_PER_KEY * value_stride(header)))
+                    blackboard::Geometry const geometry =
+                        make_geometry(capacity, static_cast<std::size_t>(max_value_size));
+                    std::size_t after_entries = static_cast<std::size_t>(total_size) - geometry.values_offset;
+                    if (capacity > after_entries
+                            / (blackboard::CELLS_PER_KEY * geometry.value_stride))
                     {
                         throw std::runtime_error("Blackboard value area exceeds segment on " + shm);
                     }
@@ -523,8 +570,9 @@ namespace kickmsg
                     Blackboard out;
                     out.name_ = shm;
                     out.base_ = mapping.address();
-                    out.size_ = mapping.size();
-                    out.shm_  = std::move(mapping);
+                    out.size_     = mapping.size();
+                    out.geometry_ = geometry;
+                    out.shm_      = std::move(mapping);
                     return out;
                 }
             }
@@ -612,13 +660,13 @@ namespace kickmsg
     uint32_t Blackboard::capacity() const
     {
         require_open(base_);
-        return header()->capacity;
+        return geometry_.capacity;
     }
 
     std::size_t Blackboard::max_value_size() const
     {
         require_open(base_);
-        return value_capacity(header());
+        return geometry_.max_value_size;
     }
 
     uint64_t Blackboard::change_seq() const
@@ -646,7 +694,7 @@ namespace kickmsg
             throw std::invalid_argument("Blackboard key exceeds KEY_MAX");
         }
 
-        uint32_t capacity = header()->capacity;
+        uint32_t capacity = geometry_.capacity;
         uint64_t key_hash = key_fingerprint(key, key_len);
 
         SelfIdentity self     = self_identity();
@@ -657,7 +705,7 @@ namespace kickmsg
         // key" spans the whole board, so scanning for the key and claiming a
         // slot must be one indivisible step -- otherwise two claimants can each
         // scan, each see nothing, and each commit.
-        BoardGuard guard{base_, header(), 4096};
+        BoardGuard guard{base_, geometry_.capacity, 4096};
         if (not guard)
         {
             throw std::runtime_error("Blackboard is busy: could not take the board lock");
@@ -697,7 +745,7 @@ namespace kickmsg
             uint64_t writes  = entry->publish.load(std::memory_order_acquire) >> 1;
 
             notify_change(header());
-            return Writer(base_, i, tenancy, writes, my_pid, std::string(key, key_len));
+            return Writer(base_, geometry_, i, tenancy, writes, my_pid, std::string(key, key_len));
         }
 
         // Pass 2: under the board lock, pass 1 finding nothing is a proof.
@@ -717,7 +765,7 @@ namespace kickmsg
                 // holder returns the entry to Free.
                 entry->state.store(blackboard::Claiming, std::memory_order_release);
                 entry->publish.store(0, std::memory_order_relaxed);
-                copy_field(entry->key, sizeof(entry->key), key);
+                bb_store_key(entry, key, key_len);
                 copy_field(entry->owner_node, sizeof(entry->owner_node), owner_node);
                 entry->declared_at_ns.store(
                     static_cast<uint64_t>(monotonic_ns().count()),
@@ -735,7 +783,7 @@ namespace kickmsg
         };
 
         uint32_t claimed = claim_free_slot();
-        if (claimed == INVALID_SLOT and sweep_locked(header()) > 0)
+        if (claimed == INVALID_SLOT and sweep_locked() > 0)
         {
             // Crash residue can be sitting on the last free slots.
             claimed = claim_free_slot();
@@ -745,7 +793,7 @@ namespace kickmsg
             auto* entry = bb_entry_at(base_, claimed);
             uint64_t tenancy = entry->tenancy.load(std::memory_order_acquire);
             notify_change(header());
-            return Writer(base_, claimed, tenancy, 0, my_pid, std::string(key, key_len));
+            return Writer(base_, geometry_, claimed, tenancy, 0, my_pid, std::string(key, key_len));
         }
 
         throw std::runtime_error("Blackboard is at capacity");
@@ -763,14 +811,15 @@ namespace kickmsg
         {
             throw std::invalid_argument("Blackboard key exceeds KEY_MAX");
         }
-        return Reader(base_, std::string(key, key_len));
+        return Reader(base_, geometry_, std::string(key, key_len));
     }
 
     // ---- Writer ----------------------------------------------------------
 
-    Blackboard::Writer::Writer(void* base, uint32_t entry_idx, uint64_t tenancy,
-                               uint64_t writes, uint64_t owner_pid, std::string key)
+    Blackboard::Writer::Writer(void* base, blackboard::Geometry const& geometry, uint32_t entry_idx,
+                               uint64_t tenancy, uint64_t writes, uint64_t owner_pid, std::string key)
         : base_{base}
+        , geometry_{geometry}
         , entry_idx_{entry_idx}
         , tenancy_{tenancy}
         , writes_{writes}
@@ -786,6 +835,7 @@ namespace kickmsg
 
     Blackboard::Writer::Writer(Writer&& other) noexcept
         : base_{other.base_}
+        , geometry_{other.geometry_}
         , entry_idx_{other.entry_idx_}
         , tenancy_{other.tenancy_}
         , writes_{other.writes_}
@@ -802,6 +852,7 @@ namespace kickmsg
         {
             release();
             base_      = other.base_;
+            geometry_  = other.geometry_;
             entry_idx_ = other.entry_idx_;
             tenancy_   = other.tenancy_;
             writes_    = other.writes_;
@@ -826,11 +877,11 @@ namespace kickmsg
             return std::make_error_code(std::errc::operation_not_permitted);
         }
         auto* header = static_cast<BlackboardHeader*>(base_);
-        if (entry_idx_ >= header->capacity)
+        if (entry_idx_ >= geometry_.capacity)
         {
             return std::make_error_code(std::errc::bad_file_descriptor);
         }
-        if (len > value_capacity(header))
+        if (len > geometry_.max_value_size)
         {
             return std::make_error_code(std::errc::message_size);
         }
@@ -847,7 +898,7 @@ namespace kickmsg
         }
 
         uint64_t writes = writes_ + 1;
-        auto*    cell   = bb_cell_at(base_, entry_idx_, writes);
+        auto*    cell   = bb_cell_at(base_, geometry_, entry_idx_, writes);
 
         entry->publish.store(2 * writes - 1, std::memory_order_relaxed);
         // Keeps the write-in-progress store above the payload stores.  A
@@ -856,7 +907,7 @@ namespace kickmsg
 
         if (len > 0)
         {
-            bb_copy_payload(bb_cell_payload(cell), data, len);
+            store_words(bb_cell_words(cell), data, len);
         }
         // relaxed: covered by the release fence below and validated by the
         // reader's publish re-check.
@@ -889,10 +940,10 @@ namespace kickmsg
 
         std::error_code ec = std::make_error_code(std::errc::bad_file_descriptor);
         auto*           header  = static_cast<BlackboardHeader*>(base_);
-        if (entry_idx_ < header->capacity)
+        if (entry_idx_ < geometry_.capacity)
         {
             ec = std::make_error_code(std::errc::device_or_resource_busy);
-            BoardGuard guard{base_, header, RELEASE_LOCK_WAIT};
+            BoardGuard guard{base_, geometry_.capacity, RELEASE_LOCK_WAIT};
             if (guard)
             {
                 ec        = std::make_error_code(std::errc::state_not_recoverable);
@@ -920,8 +971,9 @@ namespace kickmsg
 
     // ---- Reader ----------------------------------------------------------
 
-    Blackboard::Reader::Reader(void* base, std::string key)
+    Blackboard::Reader::Reader(void* base, blackboard::Geometry const& geometry, std::string key)
         : base_{base}
+        , geometry_{geometry}
         , key_hash_{key_fingerprint(key.data(), key.size())}
         , key_{std::move(key)}
     {
@@ -933,9 +985,7 @@ namespace kickmsg
         {
             return false;
         }
-        auto const* header = static_cast<BlackboardHeader const*>(base_);
-
-        if (entry_idx_ < header->capacity)
+        if (entry_idx_ < geometry_.capacity)
         {
             auto* entry = bb_entry_at(base_, entry_idx_);
             if (entry->state.load(std::memory_order_acquire) == blackboard::Active
@@ -945,7 +995,7 @@ namespace kickmsg
             }
         }
 
-        for (uint32_t i = 0; i < header->capacity; ++i)
+        for (uint32_t i = 0; i < geometry_.capacity; ++i)
         {
             auto* entry = bb_entry_at(base_, i);
             if (entry->state.load(std::memory_order_acquire) != blackboard::Active)
@@ -961,7 +1011,7 @@ namespace kickmsg
             uint64_t tenancy = entry->tenancy.load(std::memory_order_acquire);
             // key_hash is only a pre-filter: it cannot survive a collision,
             // so the bytes must actually match.
-            if (not bb_key_equals(entry->key, key_.data(), key_.size()))
+            if (not key_equals(entry, key_.data(), key_.size()))
             {
                 continue;
             }
@@ -982,8 +1032,7 @@ namespace kickmsg
         {
             return result;
         }
-        auto*       header     = static_cast<BlackboardHeader*>(base_);
-        std::size_t limit = value_capacity(header);
+        std::size_t limit = geometry_.max_value_size;
 
         for (int retry = 0; retry < blackboard::READ_RETRY_BUDGET; ++retry)
         {
@@ -1006,7 +1055,7 @@ namespace kickmsg
                 return result;
             }
 
-            auto*    cell = bb_cell_at(base_, entry_idx_, writes);
+            auto*    cell = bb_cell_at(base_, geometry_, entry_idx_, writes);
             // relaxed: ordered by the acquire load of publish above and
             // validated by the re-check below.
             std::size_t len = cell->value_len.load(std::memory_order_relaxed);
@@ -1018,7 +1067,7 @@ namespace kickmsg
             bool fits = len <= capacity;
             if (fits and len > 0)
             {
-                bb_copy_payload(out, bb_cell_payload(cell), len);
+                load_words(out, bb_cell_words(cell), len);
             }
             uint64_t stamp = cell->updated_at_ns.load(std::memory_order_relaxed);
 
@@ -1133,7 +1182,7 @@ namespace kickmsg
     std::vector<blackboard::KeyStatus> Blackboard::snapshot() const
     {
         require_open(base_);
-        uint32_t capacity = header()->capacity;
+        uint32_t capacity = geometry_.capacity;
 
         std::vector<blackboard::KeyStatus> out;
         std::vector<uint64_t>              starttimes;
@@ -1145,8 +1194,7 @@ namespace kickmsg
         // Serialized: a takeover rewrites owner_node with no seqlock over
         // those bytes, so an unlocked listing can return torn text.
         {
-            BoardGuard guard{const_cast<void*>(base_),
-                             const_cast<BlackboardHeader*>(header()), 1024};
+            BoardGuard guard{const_cast<void*>(base_), capacity, 1024};
             if (not guard)
             {
                 throw std::runtime_error("Blackboard is busy: could not take the board lock");
@@ -1195,7 +1243,7 @@ namespace kickmsg
                                            std::vector<uint8_t>* value) const
     {
         BlackboardEntry*  entry  = bb_entry_at(base_, i);
-        std::size_t const limit  = value_capacity(header());
+        std::size_t const limit  = geometry_.max_value_size;
 
         for (int retry = 0; retry < blackboard::READ_RETRY_BUDGET; ++retry)
         {
@@ -1205,14 +1253,14 @@ namespace kickmsg
             }
             uint64_t tenancy_before = entry->tenancy.load(std::memory_order_acquire);
 
-            out = EntryRead{bb_read_key(entry->key, sizeof(entry->key)), 0, 0, 0};
+            out = EntryRead{bb_load_key(entry), 0, 0, 0};
 
             uint64_t publish_before = entry->publish.load(std::memory_order_acquire);
             uint64_t writes  = publish_before >> 1;
             out.update_count = writes;
             if (writes > 0)
             {
-                auto* cell = bb_cell_at(base_, i, writes);
+                auto* cell = bb_cell_at(base_, geometry_, i, writes);
                 // relaxed: ordered by the acquire load of publish above and
                 // validated by the re-check below.
                 std::size_t len = cell->value_len.load(std::memory_order_relaxed);
@@ -1228,7 +1276,7 @@ namespace kickmsg
                     value->resize(len);
                     if (len > 0)
                     {
-                        bb_copy_payload(value->data(), bb_cell_payload(cell), len);
+                        load_words(value->data(), bb_cell_words(cell), len);
                     }
                 }
             }
@@ -1262,7 +1310,7 @@ namespace kickmsg
     std::vector<std::string> Blackboard::keys(std::string_view prefix) const
     {
         require_open(base_);
-        uint32_t const capacity = header()->capacity;
+        uint32_t const capacity = geometry_.capacity;
 
         std::vector<std::string> out;
         EntryRead                entry;
@@ -1286,7 +1334,7 @@ namespace kickmsg
     Blackboard::read_all(std::string_view prefix) const
     {
         require_open(base_);
-        uint32_t const capacity = header()->capacity;
+        uint32_t const capacity = geometry_.capacity;
 
         std::unordered_map<std::string, std::vector<uint8_t>> out;
         EntryRead            entry;
@@ -1306,10 +1354,10 @@ namespace kickmsg
         return out;
     }
 
-    uint32_t Blackboard::sweep_locked(BlackboardHeader* header)
+    uint32_t Blackboard::sweep_locked()
     {
         uint32_t reclaimed = 0;
-        for (uint32_t i = 0; i < header->capacity; ++i)
+        for (uint32_t i = 0; i < geometry_.capacity; ++i)
         {
             auto* entry = bb_entry_at(base_, i);
             if (normalize_entry(entry))
@@ -1340,13 +1388,13 @@ namespace kickmsg
     {
         require_open(base_);
 
-        BoardGuard guard{base_, header(), 4096};
+        BoardGuard guard{base_, geometry_.capacity, 4096};
         if (not guard)
         {
             return 0;
         }
 
-        uint32_t reclaimed = sweep_locked(header());
+        uint32_t reclaimed = sweep_locked();
         if (reclaimed > 0)
         {
             notify_change(header());

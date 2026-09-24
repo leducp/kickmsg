@@ -11,9 +11,7 @@ namespace kickmsg
     class Subscriber
     {
     public:
-        // Copy-based sample: data is copied into subscriber-local memory.
-        // Move-only: the internal buffer is reused across try_receive()
-        // calls, so copies would alias the same memory.
+        // Sample in a reusable subscriber-local buffer; valid until the next receive.
         class SampleRef
         {
         public:
@@ -68,8 +66,8 @@ namespace kickmsg
         {
         public:
             SampleView()
-                : base_{nullptr}
-                , header_{nullptr}
+                : header_{nullptr}
+                , slot_{nullptr}
                 , slot_idx_{INVALID_SLOT}
                 , len_{0}
                 , ring_pos_{0}
@@ -82,8 +80,8 @@ namespace kickmsg
             SampleView& operator=(SampleView const&) = delete;
 
             SampleView(SampleView&& other) noexcept
-                : base_{other.base_}
-                , header_{other.header_}
+                : header_{other.header_}
+                , slot_{other.slot_}
                 , slot_idx_{other.slot_idx_}
                 , len_{other.len_}
                 , ring_pos_{other.ring_pos_}
@@ -96,8 +94,8 @@ namespace kickmsg
                 if (this != &other)
                 {
                     release();
-                    base_     = other.base_;
                     header_   = other.header_;
+                    slot_     = other.slot_;
                     slot_idx_ = other.slot_idx_;
                     len_      = other.len_;
                     ring_pos_ = other.ring_pos_;
@@ -112,7 +110,7 @@ namespace kickmsg
                 {
                     return nullptr;
                 }
-                return slot_data(slot_at(base_, header_, slot_idx_));
+                return slot_data(slot_);
             }
 
             std::size_t len()      const { return len_; }
@@ -122,9 +120,11 @@ namespace kickmsg
         private:
             friend class Subscriber;
 
-            SampleView(void* base, Header* hdr, uint32_t slot_idx, uint32_t len, uint64_t ring_pos)
-                : base_{base}
-                , header_{hdr}
+            // Use the slot pointer resolved from the subscriber's validated geometry.
+            SampleView(Header* header, SlotHeader* slot, uint32_t slot_idx, uint32_t len,
+                       uint64_t ring_pos)
+                : header_{header}
+                , slot_{slot}
                 , slot_idx_{slot_idx}
                 , len_{len}
                 , ring_pos_{ring_pos}
@@ -135,19 +135,18 @@ namespace kickmsg
             {
                 if (slot_idx_ != INVALID_SLOT)
                 {
-                    auto* slot = slot_at(base_, header_, slot_idx_);
-                    auto  prev = slot->refcount.fetch_sub(1,
-                                     std::memory_order_acq_rel);
+                    auto prev = slot_->refcount.fetch_sub(1,
+                                    std::memory_order_acq_rel);
                     if (prev == 1)
                     {
-                        treiber_push(header_->free_top, slot, slot_idx_);
+                        treiber_push(header_->free_top, slot_, slot_idx_);
                     }
                     slot_idx_ = INVALID_SLOT;
                 }
             }
 
-            void*    base_;
-            Header*  header_;
+            Header*     header_;   ///< free_top only
+            SlotHeader* slot_;
             uint32_t slot_idx_;
             uint32_t len_;
             uint64_t ring_pos_;
@@ -223,7 +222,9 @@ namespace kickmsg
         Wait head_state(SubRingHeader* ring) const;
 
         void*                base_;
+        /// Shared mutable state only; pointer math uses geometry_.
         Header*              header_;
+        Geometry             geometry_;
         uint32_t             ring_idx_;
         uint64_t             start_pos_;
         uint64_t             read_pos_;

@@ -1,70 +1,9 @@
 /// @file kickmsg_py.cc
-/// @brief Python bindings for Kickmsg (nanobind-based).
+/// Python bindings using nanobind.
 ///
-/// Layout:
-///   kickmsg                  — module
-///     ChannelType            — enum
-///     Config                 — channel::Config
-///     SchemaInfo             — payload schema descriptor
-///     HealthReport           — SharedRegion::diagnose() result
-///     RingStats / RegionStats — SharedRegion::stats() result
-///     SharedRegion           — factory methods + schema/health/repair/stats
-///     Publisher              — send(bytes) + allocate() → AllocatedSlot
-///     AllocatedSlot          — writable zero-copy handle + .publish()
-///     Subscriber             — try_receive / receive (GIL release) / *_view
-///     SampleView             — read-only zero-copy sample (buffer protocol)
-///     BroadcastHandle        — NamedTuple-like (pub, sub)
-///     Role                   — registry::Role enum (Publisher/Subscriber/Both)
-///     Participant            — registry snapshot entry
-///     Registry               — per-namespace participant discovery
-///     Node                   — high-level topic / broadcast / mailbox
-///     BlackboardConfig       — blackboard::Config
-///     KeyStatus              — Blackboard.snapshot() entry
-///     ReadOutcome            — Blackboard reader result (errno + bytes)
-///     BlackboardWriter       — declared key owner: .write(bytes) / .release()
-///     BlackboardReader       — declared read interest: .read() / .owner_alive()
-///     Blackboard             — key/value state; late readers see current values
-///     schema (submodule)
-///       Diff                 — enum (bitmask)
-///       diff(a, b)           — pure diff function
-///     hash (submodule)
-///       fnv1a_64(data[, seed])
-///       identity_from_fnv1a(descriptor)
-///
-/// Zero-copy contract (lifetime-safe via the Python buffer protocol):
-///
-///   slot = pub.allocate()       → AllocatedSlot sized to max_payload_size.
-///                                 memoryview(slot) is a writable view into
-///                                 the SHM slot.  The memoryview pins the
-///                                 slot, which pins the Publisher, which
-///                                 pins the mmap — so retained memoryviews
-///                                 stay valid (at the mmap level) as long
-///                                 as Python holds them.
-///   slot.publish(n)             → commits, recording `n` bytes as the
-///                                 payload size.  NEW memoryview(slot)
-///                                 after this raises BufferError.
-///                                 Memoryviews obtained BEFORE publish
-///                                 remain pointer-valid but writing
-///                                 through them after publish would
-///                                 corrupt in-flight subscribers — user
-///                                 contract: don't.
-///
-///   view = sub.try_receive_view() → SampleView.  memoryview(view) is a
-///                                 read-only view into the SHM slot.  The
-///                                 memoryview pins the SampleView, which
-///                                 pins the slot's refcount and the mmap.
-///   view.release()              → drops the pin.  NEW memoryview(view)
-///                                 after this raises BufferError.
-///
-///   Equivalent context-manager form (preferred for short scopes):
-///       with sub.try_receive_view() as view:
-///           mv = memoryview(view)
-///           ... use mv ...
-///       # pin released on block exit, even on exception
-///
-/// The pinning is enforced by Py_buffer::obj = self + Py_INCREF inside
-/// the buffer-protocol getbuffer slot, so it works with numpy.asarray(),
-/// torch.frombuffer(), and any other consumer that respects the protocol.
+/// Exported buffers keep wrappers and mappings alive. They do not extend
+/// reservation validity: stop using writable views before publish() or the
+/// next allocate(). Do not use SampleView buffers after release().
 
 #include <cerrno>
 #include <cstring>
@@ -94,23 +33,7 @@ using namespace nb::literals;
 
 namespace kickmsg
 {
-    // Python-only wrapper around a Publisher reservation.  Holds the slot
-    // pointer and max payload size returned by Publisher::allocate(),
-    // exposes the writable buffer protocol so `memoryview(slot)` points
-    // directly into the shared-memory slot (zero-copy), and has a
-    // .publish(n) method that commits `n` bytes via the Publisher.
-    //
-    // Lifetime: the Py_buffer obtained through buffer protocol pins this
-    // AllocatedSlot alive (view->obj = self; Py_INCREF), which in turn
-    // pins the Publisher (via nb::keep_alive<1, 2> on the constructor),
-    // which pins the SharedRegion mmap.  A memoryview retained past
-    // `.publish()` stays technically valid as a pointer — but any NEW
-    // memoryview(slot) after publish is refused with BufferError so
-    // accidental reuse is caught.
-    // A blackboard read result plus its bytes.  The C++ ReadOutcome carries
-    // only the length: values are always copied at the Python boundary
-    // because a writer may overwrite the cell mid-read, so unlike SampleView
-    // there is nothing safe to expose through the buffer protocol.
+    // Copy Blackboard values into Python bytes; cells cannot be safely exported.
     struct PyReadOutcome
     {
         std::error_code ec;
@@ -119,10 +42,7 @@ namespace kickmsg
         uint64_t        update_count;
     };
 
-    /// The blackboard reports std::error_code; Python's standard for the same
-    /// thing is OSError carrying an errno, so failures are raised, not returned.
-    /// Built by hand because nanobind's builtin_exception set has no OSError,
-    /// and the (errno, strerror) pair is what populates e.errno for the caller.
+    /// Build OSError with (errno, message); nanobind has no OSError helper.
     void raise_if(std::error_code ec, char const* what)
     {
         if (ec)
@@ -135,26 +55,11 @@ namespace kickmsg
         }
     }
 
-    struct PyAllocatedSlot
-    {
-        Publisher*  publisher;
-        void*       ptr;
-        std::size_t max_size;
-        bool        published;
-
-        PyAllocatedSlot(Publisher& p, void* data, std::size_t cap)
-            : publisher{&p}, ptr{data}, max_size{cap}, published{false}
-        {
-        }
-    };
 }
 
 namespace
 {
-    // Buffer protocol for Subscriber::SampleView (read-only zero-copy).
-    // Sets view->obj = self + Py_INCREF so the resulting memoryview pins
-    // the SampleView alive, which transitively pins the slot refcount
-    // and the mmap.
+    // Py_buffer::obj keeps the SampleView and its mapping alive.
     int sv_getbuffer(PyObject* self, Py_buffer* view, int /*flags*/) noexcept
     {
         using SV = kickmsg::Subscriber::SampleView;
@@ -185,8 +90,7 @@ namespace
 
     void sv_releasebuffer(PyObject* /*self*/, Py_buffer* /*view*/) noexcept
     {
-        // Nothing to free: shape/strides borrow from the Py_buffer itself,
-        // and Py_DECREF(view->obj) is handled by CPython's memoryview.
+        // CPython decrefs view->obj; shape and strides use the Py_buffer storage.
     }
 
     PyType_Slot sv_slots[] = {
@@ -195,14 +99,12 @@ namespace
         { 0, nullptr }
     };
 
-    // Buffer protocol for PyAllocatedSlot (writable zero-copy).  Refuses
-    // new buffer requests once .publish() has been called so stale writes
-    // don't corrupt messages that are already in flight to subscribers.
+    // Reject new buffer requests after publication or reservation replacement.
     int as_getbuffer(PyObject* self, Py_buffer* view, int /*flags*/) noexcept
     {
-        auto* slot = nb::inst_ptr<kickmsg::PyAllocatedSlot>(nb::handle(self));
+        auto* slot = nb::inst_ptr<kickmsg::AllocatedSlot>(nb::handle(self));
 
-        if (slot->published)
+        if (slot->published())
         {
             PyErr_SetString(PyExc_BufferError,
                 "AllocatedSlot has already been published; its buffer is "
@@ -211,10 +113,20 @@ namespace
             return -1;
         }
 
-        view->buf        = slot->ptr;
+        if (not slot->valid())
+        {
+            PyErr_SetString(PyExc_BufferError,
+                "AllocatedSlot was superseded by a later Publisher.allocate(); "
+                "its slot is back in the pool and writing through it would "
+                "corrupt another reservation");
+            view->obj = nullptr;
+            return -1;
+        }
+
+        view->buf        = slot->data();
         view->obj        = self;
         Py_INCREF(self);
-        view->len        = static_cast<Py_ssize_t>(slot->max_size);
+        view->len        = static_cast<Py_ssize_t>(slot->max_size());
         view->itemsize   = 1;
         view->readonly   = 0;                // writable
         view->ndim       = 1;
@@ -253,16 +165,11 @@ namespace
 
 namespace kickmsg
 {
-    // Native module name is `_native`; the outer `kickmsg/__init__.py` does
-    // `from ._native import *` so user-visible import paths (kickmsg.Publisher,
-    // kickmsg.Node, …) are unchanged.
     NB_MODULE(_native, m)
     {
         m.doc() = "Kickmsg — lock-free shared-memory IPC (native bindings)";
 
-        // -------------------------------------------------------------------
         // Enums & simple types
-        // -------------------------------------------------------------------
 
         // channel::None is exposed as NoChannel: `ChannelType.None` would be
         // a syntax error in Python.
@@ -296,9 +203,7 @@ namespace kickmsg
                        ", max_payload_size=" + std::to_string(c.max_payload_size) + ")";
             });
 
-        // -------------------------------------------------------------------
         // SchemaInfo + schema submodule (Diff / diff)
-        // -------------------------------------------------------------------
 
         nb::class_<SchemaInfo>(m, "SchemaInfo")
             .def(nb::init<>())
@@ -353,9 +258,7 @@ namespace kickmsg
         schema_mod.def("diff", &schema::diff, "a"_a, "b"_a,
             "Return a schema.Diff bitmask of the fields that differ.");
 
-        // -------------------------------------------------------------------
         // hash submodule
-        // -------------------------------------------------------------------
 
         auto hash_mod = m.def_submodule("hash", "Optional FNV-1a hash helpers");
         hash_mod.attr("FNV1A_64_OFFSET_BASIS") =
@@ -375,9 +278,7 @@ namespace kickmsg
             "Pack a 64-bit FNV-1a of `descriptor` into the leading 8 bytes "
             "of a 64-byte identity slot, zero-padding the rest.");
 
-        // -------------------------------------------------------------------
         // HealthReport
-        // -------------------------------------------------------------------
 
         nb::class_<SharedRegion::HealthReport>(m, "HealthReport")
             .def_ro("locked_entries", &SharedRegion::HealthReport::locked_entries)
@@ -394,9 +295,7 @@ namespace kickmsg
                        ", schema_stuck=" + (r.schema_stuck ? "True" : "False") + ")";
             });
 
-        // -------------------------------------------------------------------
-        // RingStats / RegionStats — runtime counter snapshot via stats()
-        // -------------------------------------------------------------------
+        // RingStats / RegionStats
 
         nb::class_<RingStats>(m, "RingStats")
             .def_ro("state",         &RingStats::state)
@@ -464,9 +363,7 @@ namespace kickmsg
                        ", creator='" + i.creator_name + "')";
             });
 
-        // -------------------------------------------------------------------
         // SharedRegion
-        // -------------------------------------------------------------------
 
         nb::class_<SharedRegion>(m, "SharedRegion")
             .def_static("create",
@@ -510,9 +407,7 @@ namespace kickmsg
         m.def("unlink_shm", [](std::string const& name) { SharedMemory::unlink(name); },
               "name"_a, "Unlink a shared-memory entry by name (no-op if absent).");
 
-        // -------------------------------------------------------------------
-        // Registry — per-namespace participant directory
-        // -------------------------------------------------------------------
+        // Registry
 
         nb::enum_<registry::Role>(m, "Role")
             .value("Publisher",  registry::Publisher)
@@ -601,27 +496,13 @@ namespace kickmsg
         m.def("current_pid", &current_pid,
               "Return the PID of the current process.");
 
-        // SampleRef (the C++ byte-copy sample) is not bound directly —
-        // try_receive() / receive() auto-convert it to `bytes` at the
-        // Python boundary.  Users who want ring-position information
-        // can use try_receive_view() / receive_view() which return
-        // SampleView (bound below).
+        // Copy samples become bytes; SampleView also exposes ring position.
 
-        // -------------------------------------------------------------------
-        // SampleView — zero-copy, pins the slot.
-        //
-        // Supports the Python buffer protocol: `memoryview(view)` returns
-        // a read-only memoryview pointing directly at shared memory (no
-        // copy).  The memoryview pins the SampleView alive — so retaining
-        // a memoryview beyond the SampleView's Python reference keeps the
-        // slot pinned and the mmap valid until the memoryview is released.
-        // That makes the zero-copy path lifetime-safe by construction.
-        // -------------------------------------------------------------------
+        // SampleView
+        // Read-only exported buffers keep the wrapper alive. release() drops its pin.
 
         nb::class_<Subscriber::SampleView>(m, "SampleView",
             nb::type_slots(sv_slots))
-            // __len__ so `len(view)` works; ring_pos / valid as properties
-            // (no-arg accessors, Pythonic).
             .def("__len__",
                 [](Subscriber::SampleView const& v) -> std::size_t
                 { return v.len(); })
@@ -630,29 +511,15 @@ namespace kickmsg
             .def("release",
                 [](Subscriber::SampleView& v)
                 {
-                    // Move-assign a default-constructed view: the old
-                    // state's release() fires via the move-assignment,
-                    // dropping the pin.  Subsequent memoryview(view)
-                    // calls fail with BufferError (see sv_getbuffer).
+                    // Release the pin and make future buffer requests fail.
                     v = Subscriber::SampleView{};
                 },
                 "Release the slot pin early.  Idempotent; after this, any "
                 "NEW memoryview(view) call raises BufferError.  Memoryviews "
                 "obtained before .release() remain valid as pointers but "
                 "should not be used (the pin is gone).")
-            // Context-manager support: `with view:` releases the pin on
-            // block exit.
-            //
-            // __enter__ returns self with reference_internal rv_policy so
-            // nanobind resolves to the existing Python wrapper rather
-            // than constructing a second one around the same C++ object
-            // (which would double-release on exit).
-            //
-            // __exit__ uses nb::args to accept the three positional
-            // arguments Python's `with` statement passes (exc_type,
-            // exc_value, traceback) — explicit `(nb::object, nb::object,
-            // nb::object)` triggers a dispatch error in nanobind's
-            // multi-arg resolution (nb::args sidesteps it).
+            // Return the existing wrapper from __enter__ to avoid a second owner.
+            // nb::args accepts the three exception arguments passed to __exit__.
             .def("__enter__",
                 [](Subscriber::SampleView& v) -> Subscriber::SampleView&
                 { return v; },
@@ -666,64 +533,62 @@ namespace kickmsg
                        ", valid=" + (v.valid() ? "True" : "False") + ")";
             });
 
-        // -------------------------------------------------------------------
-        // AllocatedSlot — handle returned by Publisher.allocate().
-        //
-        // Supports the writable buffer protocol: `memoryview(slot)` or
-        // `numpy.asarray(slot)` gets you a zero-copy writable view of the
-        // reserved shared-memory slot.  Fill it in place, then call
-        // `slot.publish()` to commit.  After publish, any NEW
-        // memoryview(slot) call raises BufferError.
-        //
-        // keep_alive<1, 2>: keep the Publisher (arg 2) alive while this
-        // slot (self, arg 1) is alive — the slot points into the
-        // Publisher's mmap and must not outlive it.
-        // -------------------------------------------------------------------
+        // AllocatedSlot
+        // The token rejects stale handles; existing writable buffers cannot be revoked.
+        // Stop using them before publish() or another allocate().
+        // keep_alive keeps the publisher mapped while the handle exists.
 
-        nb::class_<PyAllocatedSlot>(m, "AllocatedSlot",
+        nb::class_<AllocatedSlot>(m, "AllocatedSlot",
             nb::type_slots(as_slots))
             .def("publish",
-                [](PyAllocatedSlot& s, std::size_t len) -> std::size_t
+                [](AllocatedSlot& s, std::size_t len) -> std::size_t
                 {
-                    if (s.published)
+                    if (s.published())
                     {
                         throw nb::value_error(
                             "AllocatedSlot.publish() called more than once");
                     }
-                    if (len > s.max_size)
+                    if (not s.valid())
+                    {
+                        throw nb::value_error(
+                            "AllocatedSlot was superseded by a later "
+                            "Publisher.allocate(); publishing it would commit "
+                            "the newer reservation");
+                    }
+                    if (len > s.max_size())
                     {
                         throw nb::value_error(
                             "publish(len) exceeds slot max_size");
                     }
-                    s.published = true;
-                    return s.publisher->publish(len);
+                    return s.publish(len);
                 },
                 "len"_a,
-                "Commit the reserved slot, recording `len` bytes as the "
-                "payload size.  Returns the number of rings the sample was "
-                "delivered to.  After this call, any NEW memoryview(slot) "
-                "fails with BufferError.")
+                "Publish len bytes. Returns the number of rings delivered to. "
+                "Further memoryview(slot) requests raise BufferError.")
             .def("__len__",
-                [](PyAllocatedSlot const& s) -> std::size_t { return s.max_size; })
+                [](AllocatedSlot const& s) -> std::size_t { return s.max_size(); })
             .def_prop_ro("max_size",
-                [](PyAllocatedSlot const& s) -> std::size_t { return s.max_size; })
-            .def_prop_ro("published",
-                [](PyAllocatedSlot const& s) -> bool { return s.published; })
-            .def("__repr__", [](PyAllocatedSlot const& s)
+                [](AllocatedSlot const& s) -> std::size_t { return s.max_size(); })
+            .def_prop_ro("published", &AllocatedSlot::published)
+            .def_prop_ro("valid", &AllocatedSlot::valid,
+                "False after publish() or another Publisher.allocate(). "
+                "Existing buffers cannot be revoked; stop using them before "
+                "either call.")
+            .def("__repr__", [](AllocatedSlot const& s)
             {
+                char const* published = "False";
+                if (s.published())
+                {
+                    published = "True";
+                }
                 return std::string{"AllocatedSlot(max_size="} +
-                       std::to_string(s.max_size) +
-                       ", published=" + (s.published ? "True" : "False") + ")";
+                       std::to_string(s.max_size()) +
+                       ", published=" + published + ")";
             });
 
-        // -------------------------------------------------------------------
         // Publisher
-        // -------------------------------------------------------------------
 
-        // Publisher holds raw pointers into the SharedRegion's mmap.
-        // keep_alive<1, 2>: arg 2 (region) must stay alive while arg 1
-        // (self) is alive — otherwise the mmap could be unmapped before
-        // the Publisher's destructor runs, producing a segfault.
+        // keep_alive<1, 2> keeps the region mapped until the publisher is destroyed.
         nb::class_<Publisher>(m, "Publisher")
             .def(nb::init<SharedRegion&>(), "region"_a,
                  nb::keep_alive<1, 2>())
@@ -735,9 +600,7 @@ namespace kickmsg
                     {
                         return static_cast<std::size_t>(rc);
                     }
-                    // C++ returns negative errno-style codes; translate to
-                    // Python exceptions so callers don't silently drop
-                    // messages by ignoring a "falsy" negative return.
+                    // Translate negative errno returns into Python exceptions.
                     int err = -rc;
                     if (err == EMSGSIZE)
                     {
@@ -761,26 +624,27 @@ namespace kickmsg
                 "the message exceeds max_payload_size, BlockingIOError if "
                 "the slot pool is exhausted, OSError on other failures.")
             .def("allocate",
-                [](Publisher& p) -> std::optional<PyAllocatedSlot>
+                [](Publisher& p) -> std::optional<AllocatedSlot>
                 {
-                    auto a = p.allocate();
-                    if (a.data == nullptr)
+                    auto slot = p.allocate();
+                    if (not slot.valid())
                     {
                         return std::nullopt;
                     }
-                    return PyAllocatedSlot{p, a.data, a.max_size};
+                    return slot;
                 },
-                // keep_alive<0, 1>: the returned AllocatedSlot (arg 0)
-                // must pin the Publisher (arg 1 = self).  Memoryviews
-                // obtained from the slot in turn pin the AllocatedSlot
-                // (via Py_buffer::obj), so the full chain is
-                // memoryview → AllocatedSlot → Publisher → SharedRegion.
+                // Keep the publisher alive while the reservation handle exists.
                 nb::keep_alive<0, 1>(),
                 "Reserve a slot sized to max_payload_size and return an "
                 "AllocatedSlot.  Use memoryview(slot) or numpy.asarray(slot) "
                 "to write up to slot.max_size bytes in place (zero-copy), "
                 "then call slot.publish(n) with the actual number of bytes "
-                "written.  Returns None if the pool is exhausted.")
+                "written.  Returns None if the pool is exhausted.  Supersedes "
+                "any previous reservation: an earlier AllocatedSlot becomes "
+                "invalid and refuses publish() and new memoryview() requests.  "
+                "Buffers already exported from it cannot be revoked: writing "
+                "through one after this call corrupts whichever reservation "
+                "now holds the slot.")
             .def_prop_ro("dropped", &Publisher::dropped,
                 "Per-ring delivery drops (CAS contention or pool exhaustion).")
             .def("__repr__", [](Publisher const& p)
@@ -789,12 +653,9 @@ namespace kickmsg
                        std::to_string(p.dropped()) + ")";
             });
 
-        // -------------------------------------------------------------------
         // Subscriber
-        // -------------------------------------------------------------------
 
-        // Same lifetime rule as Publisher — region's mmap must outlive
-        // the Subscriber.
+        // Keep the region alive while the subscriber exists.
         nb::class_<Subscriber>(m, "Subscriber")
             .def(nb::init<SharedRegion&>(), "region"_a,
                  nb::keep_alive<1, 2>())
@@ -831,9 +692,7 @@ namespace kickmsg
                 "timeout"_a,
                 "Blocking receive with timeout (timedelta).  Releases the GIL while "
                 "waiting.  Returns bytes on success, None on timeout.")
-            // keep_alive<0, 1>: the returned SampleView (arg 0) must keep
-            // the Subscriber (arg 1 = self) alive — the view dereferences
-            // mmap pointers owned transitively by self on destruction.
+            // Keep the subscriber and its mapping alive while the view exists.
             .def("try_receive_view",
                 [](Subscriber& s) -> std::optional<Subscriber::SampleView>
                 { return s.try_receive_view(); },
@@ -845,13 +704,7 @@ namespace kickmsg
                 [](Subscriber& s, nanoseconds timeout)
                     -> std::optional<Subscriber::SampleView>
                 {
-                    // Scope the GIL release tightly around the blocking
-                    // wait, matching receive() above.  The C++ return value
-                    // is pure C++ (no Python state), so strictly speaking
-                    // the GIL only needs to be released for the futex
-                    // wait itself — but keeping the scope explicit avoids
-                    // any future-footgun if the Python-conversion path
-                    // ever touches CPython state before reacquisition.
+                    // Reacquire the GIL before converting the C++ result to Python.
                     std::optional<Subscriber::SampleView> result;
                     {
                         nb::gil_scoped_release release;
@@ -887,13 +740,9 @@ namespace kickmsg
                 return nb::bytes(reinterpret_cast<char const*>(sample->data()), sample->len());
             });
 
-        // -------------------------------------------------------------------
         // BroadcastHandle
-        // -------------------------------------------------------------------
 
-        // BroadcastHandle — Publisher/Subscriber are move-only, so the
-        // fields are exposed read-only.  The handle itself is the owner;
-        // callers use .pub / .sub as references.
+        // Move-only fields are exposed by reference; the handle owns them.
         nb::class_<BroadcastHandle>(m, "BroadcastHandle")
             .def_prop_ro("pub",
                 [](BroadcastHandle& h) -> Publisher& { return h.pub; },
@@ -906,16 +755,9 @@ namespace kickmsg
                 return std::string{"BroadcastHandle(pub=Publisher, sub=Subscriber)"};
             });
 
-        // -------------------------------------------------------------------
         // Node
-        // -------------------------------------------------------------------
 
-        // Node-returned Publisher/Subscriber/BroadcastHandle all point
-        // into SharedRegion objects stored inside the Node itself.
-        // keep_alive<0, 1>: the return value (0) pins the Node (1 = self).
-        // -------------------------------------------------------------------
-        // Blackboard
-        // -------------------------------------------------------------------
+        // Returned handles keep the Node and its regions alive.
 
         nb::class_<blackboard::Config>(m, "BlackboardConfig")
             .def(nb::init<>())
