@@ -8,6 +8,8 @@
 
 namespace kickmsg
 {
+    class Node;
+
     /// A pollable cross-process wake: the subscriber gets a descriptor for its own
     /// poll/epoll/kqueue loop, and the publisher makes it readable.
     ///
@@ -55,10 +57,8 @@ namespace kickmsg
     /// datagram to every joined socket. Use it when the descriptor has to sit in an event
     /// loop next to other sources. For a single channel, receive() is faster.
     ///
-    /// Give each channel its own instance. The port is what keeps channels apart: a
-    /// socket bound to INADDR_ANY gets every datagram on its port, even for groups it
-    /// never joined, because the membership only decides whether the host accepts the
-    /// packet. The group is what delivers one wake to every subscriber.
+    /// Give each channel its own instance. POSIX receivers filter by group; Windows
+    /// receivers may wake spuriously when channels share a port.
     ///
     /// This is a hint that something arrived, not an authenticated channel. Any local
     /// process can join the group and send to it, which keeps descriptors readable and
@@ -72,10 +72,16 @@ namespace kickmsg
         static constexpr uint16_t DEFAULT_PORT_BASE = 27182;
         static constexpr uint16_t PORT_SPAN         = 512;
 
-        /// Derives a group in 239.255.0.0/16 and a port in [port_base, +PORT_SPAN) from
-        /// `name`, so both ends agree without coordinating. Two names colliding onto one
-        /// port wake each other spuriously but stay correct.
+        /// Maps `name` to a group in 239.255.0.0/16 and a port in
+        /// [port_base, port_base + PORT_SPAN). Collisions cause spurious wakes.
         UdpMulticastBackend(char const* name, uint16_t port_base = DEFAULT_PORT_BASE);
+
+        /// Derive the address from the Node's channel identity. Pass the same raw name
+        /// used for the channel: "/fault" and "fault" differ.
+        static UdpMulticastBackend for_topic(Node const& node, char const* topic, uint16_t port_base = DEFAULT_PORT_BASE);
+        static UdpMulticastBackend for_broadcast(Node const& node, char const* channel, uint16_t port_base = DEFAULT_PORT_BASE);
+        /// `owner_node` defaults to `node`, the side that created the mailbox.
+        static UdpMulticastBackend for_mailbox(Node const& node, char const* tag, char const* owner_node = nullptr, uint16_t port_base = DEFAULT_PORT_BASE);
 
         /// Exact group and port, for a caller that would rather pin them than derive them.
         UdpMulticastBackend(uint32_t group, uint16_t port);
@@ -94,6 +100,17 @@ namespace kickmsg
         uint16_t port() const { return port_; }
 
     private:
+        struct Address
+        {
+            uint32_t group;
+            uint16_t port;
+        };
+
+        /// Throws std::invalid_argument when port_base leaves no room for PORT_SPAN.
+        static Address derive(uint64_t hash, uint16_t port_base);
+
+        UdpMulticastBackend(Address address);
+
         /// Throws std::runtime_error when the host cannot carry multicast.
         void open_sender();
 

@@ -455,14 +455,14 @@ is that a descriptor **composes** -- with a socket, a timer, another
 channel -- which a futex word cannot.  On a single channel with nothing
 else to watch, `receive()` is both simpler and faster.
 
-Give each channel its own instance.  The **port** is what separates them:
-a socket bound to `INADDR_ANY` receives every datagram arriving on its
-port, including groups it never joined, because the membership decides
-whether the *host* accepts the packet rather than which socket gets it.
-The **group** is what fans one channel's wake out to all its subscribers.
-Constructed from a channel name, both ends derive the same group and port
-without coordinating; a constructor taking an explicit group and port is
-there for a caller that would rather pin them.
+Give each channel its own instance. POSIX receivers bind to the multicast
+group, so unrelated traffic on the same port does not wake them. Windows
+receivers bind to `INADDR_ANY` and may wake spuriously on a port collision.
+
+Both ends derive the group and port from the same name, or from the channel
+identity stamped by `Node` via `for_topic`, `for_broadcast`, or `for_mailbox`.
+That identity includes the channel kind and namespace; mailboxes also include
+the owner. Different identities can still hash to the same UDP address.
 
 The park protocol is the same Dekker pair as the futex path, with one
 extra constraint.  `arm_wait()` samples `write_pos` **before** deciding the

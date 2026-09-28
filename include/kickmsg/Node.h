@@ -157,16 +157,17 @@ namespace kickmsg
         std::string const& name()           const { return name_; }
         std::string const& kmsg_namespace() const { return namespace_; }
 
+        /// Identity a channel's region is stamped with. Hashes raw channel names,
+        /// but sanitizes mailbox owners like Node names. The same hashes detect
+        /// shm-name collisions and select wake addresses.
+        uint64_t topic_identity(char const* topic) const;
+        uint64_t broadcast_identity(char const* channel) const;
+        uint64_t mailbox_identity(char const* owner, char const* tag) const;
+
     private:
         std::string make_topic_name(char const* topic) const;
         std::string make_broadcast_name(char const* channel) const;
         std::string make_mailbox_name(char const* owner, char const* tag) const;
-
-        // Identity hashes over the raw (pre-sanitization) coordinates plus
-        // a kind tag; shm-name collisions are then detected at open.
-        uint64_t make_topic_identity(char const* topic) const;
-        uint64_t make_broadcast_identity(char const* channel) const;
-        uint64_t make_mailbox_identity(char const* owner, char const* tag) const;
 
         // unordered_map guarantees reference stability for elements
         // (only iterators are invalidated on rehash), so pointers

@@ -12,6 +12,12 @@
 #include "kickmsg/WaitSet.h"
 #include "kickmsg/Subscriber.h"
 
+#ifndef _WIN32
+    #include <arpa/inet.h>
+    #include <sys/socket.h>
+    #include <unistd.h>
+#endif
+
 using namespace kickmsg;
 
 class WaitFdTest : public ::testing::Test
@@ -89,10 +95,93 @@ TEST_F(WaitFdTest, TwoBackendsForOneNameAgreeWithoutCoordinating)
     EXPECT_LT(publisher_side.port(),
               UdpMulticastBackend::DEFAULT_PORT_BASE + UdpMulticastBackend::PORT_SPAN);
 
-    // A different channel lands on a different port, which is what isolates them.
     UdpMulticastBackend elsewhere{SHM_OTHER};
     EXPECT_NE(publisher_side.port(), elsewhere.port());
 }
+
+TEST_F(WaitFdTest, NodeScopedBackendsAgreeAcrossNodesOfOneNamespace)
+{
+    Node publisher_node("publisher", "robot/left");
+    Node subscriber_node("subscriber", "robot.left");
+
+    auto topic_pub = UdpMulticastBackend::for_topic(publisher_node, "fault");
+    auto topic_sub = UdpMulticastBackend::for_topic(subscriber_node, "fault");
+    EXPECT_EQ(topic_pub.group(), topic_sub.group());
+    EXPECT_EQ(topic_pub.port(), topic_sub.port());
+
+    auto bcast_a = UdpMulticastBackend::for_broadcast(publisher_node, "fault");
+    auto bcast_b = UdpMulticastBackend::for_broadcast(subscriber_node, "fault");
+    EXPECT_EQ(bcast_a.group(), bcast_b.group());
+    EXPECT_EQ(bcast_a.port(), bcast_b.port());
+
+    Node owner_node("robot/arm", "robot.left");
+    auto mailbox_owner  = UdpMulticastBackend::for_mailbox(owner_node, "cmd");
+    auto mailbox_sender = UdpMulticastBackend::for_mailbox(publisher_node, "cmd", "/robot/arm");
+    EXPECT_EQ(mailbox_owner.group(), mailbox_sender.group());
+    EXPECT_EQ(mailbox_owner.port(), mailbox_sender.port());
+}
+
+TEST_F(WaitFdTest, NodeScopedBackendsUseKindAndNamespace)
+{
+    Node left("node", "robot.left");
+    Node right("node", "robot.right");
+
+    auto topic = UdpMulticastBackend::for_topic(left, "fault");
+    EXPECT_NE(topic.port(), UdpMulticastBackend::for_topic(right, "fault").port());
+    EXPECT_NE(topic.port(), UdpMulticastBackend::for_topic(left, "status").port());
+    EXPECT_NE(topic.port(), UdpMulticastBackend::for_broadcast(left, "fault").port());
+    EXPECT_NE(topic.port(), UdpMulticastBackend::for_mailbox(left, "fault").port());
+
+    auto own_mailbox = UdpMulticastBackend::for_mailbox(left, "fault");
+    EXPECT_NE(own_mailbox.port(), UdpMulticastBackend::for_mailbox(left, "fault", "other").port());
+}
+
+TEST_F(WaitFdTest, NodeScopedBackendsRejectANullName)
+{
+    Node node("node", "robot.left");
+    EXPECT_THROW(UdpMulticastBackend::for_topic(node, nullptr), std::invalid_argument);
+    EXPECT_THROW(UdpMulticastBackend::for_broadcast(node, nullptr), std::invalid_argument);
+    EXPECT_THROW(UdpMulticastBackend::for_mailbox(node, nullptr), std::invalid_argument);
+    EXPECT_THROW(UdpMulticastBackend(nullptr), std::invalid_argument);
+}
+
+#ifndef _WIN32
+TEST_F(WaitFdTest, DifferentGroupsOnOnePortDoNotWakeEachOther)
+{
+    constexpr uint16_t shared_port = 31000;
+    UdpMulticastBackend first(0xEFFF1234u, shared_port);
+    UdpMulticastBackend second(0xEFFF5678u, shared_port);
+    Waker first_waker(first);
+    Waker second_waker(second);
+    ASSERT_TRUE(first_waker.valid());
+    ASSERT_TRUE(second_waker.valid());
+
+    first.signal();
+    EXPECT_TRUE(readable(wait_descriptor(first_waker), 500ms));
+    EXPECT_FALSE(readable(wait_descriptor(second_waker), 50ms));
+    first_waker.drain();
+}
+
+TEST_F(WaitFdTest, AUnicastToTheWakePortDoesNotWake)
+{
+    constexpr uint16_t port = 31001;
+    UdpMulticastBackend carrier(0xEFFF1234u, port);
+    Waker waker(carrier);
+    ASSERT_TRUE(waker.valid());
+
+    int stray = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(stray, 0);
+    sockaddr_in to{};
+    to.sin_family      = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port        = htons(port);
+    char const datagram = 1;
+    ASSERT_EQ(1, ::sendto(stray, &datagram, 1, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to)));
+    ::close(stray);
+
+    EXPECT_FALSE(readable(wait_descriptor(waker), 50ms));
+}
+#endif
 
 TEST_F(WaitFdTest, TheUdpBackendRejectsAnAddressItCannotDeliverTo)
 {
