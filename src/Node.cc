@@ -54,7 +54,7 @@ namespace kickmsg
         std::string mailbox_topic(char const* owner, char const* tag)
         {
             std::string out = "/";
-            out += owner;
+            out += sanitize_shm_component(owner, "mailbox owner");
             out += '/';
             out += tag;
             return out;
@@ -62,10 +62,10 @@ namespace kickmsg
 
         /// Chain one identity component: bytes, then length as a separator
         /// so ("ab","c") and ("a","bc") never hash alike.
-        uint64_t identity_chain(std::string_view s, uint64_t h)
+        uint64_t identity_chain(std::string_view component, uint64_t identity)
         {
-            h = hash::fnv1a_64(s, h);
-            return hash::fnv1a_64(s.size(), h);
+            identity = hash::fnv1a_64(component, identity);
+            return hash::fnv1a_64(component.size(), identity);
         }
 
         /// Cache hits must validate identity and config because sanitized names can collide.
@@ -179,14 +179,14 @@ namespace kickmsg
         // Reuse cached regions; create() would replace the shared object.
         if (auto* r = find_region(shm_name))
         {
-            check_cached_identity(*r, shm_name, make_topic_identity(topic));
+            check_cached_identity(*r, shm_name, topic_identity(topic));
             check_cached_config(*r, shm_name, channel::PubSub, cfg);
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Pubsub, registry::Publisher);
             return Publisher(*r, backend);
         }
         channel::Config stamped_cfg = cfg;
-        stamped_cfg.identity = make_topic_identity(topic);
+        stamped_cfg.identity = topic_identity(topic);
         auto [it, _]  = regions_.emplace(
             shm_name,
             SharedRegion::create(shm_name.c_str(), channel::PubSub, stamped_cfg, name_.c_str()));
@@ -201,14 +201,14 @@ namespace kickmsg
         auto topic_path = with_leading_slash(topic);
         if (auto* r = find_region(shm_name))
         {
-            check_cached_identity(*r, shm_name, make_topic_identity(topic));
+            check_cached_identity(*r, shm_name, topic_identity(topic));
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Pubsub, registry::Subscriber);
             return Subscriber(*r);
         }
         auto [it, _] = regions_.emplace(
             shm_name,
-            SharedRegion::open(shm_name.c_str(), make_topic_identity(topic)));
+            SharedRegion::open(shm_name.c_str(), topic_identity(topic)));
         touch_registry(shm_name, topic_path, channel::PubSub,
                        registry::Pubsub, registry::Subscriber);
         return Subscriber(it->second);
@@ -242,7 +242,7 @@ namespace kickmsg
                                       WakeBackend* backend)
     {
         channel::Config stamped_cfg = cfg;
-        stamped_cfg.identity = make_topic_identity(topic);
+        stamped_cfg.identity = topic_identity(topic);
         return create_or_open_handle<Publisher>(
             make_topic_name(topic), with_leading_slash(topic),
             channel::PubSub, registry::Pubsub, registry::Publisher, stamped_cfg, backend);
@@ -251,7 +251,7 @@ namespace kickmsg
     Subscriber Node::subscribe_or_create(char const* topic, channel::Config const& cfg)
     {
         channel::Config stamped_cfg = cfg;
-        stamped_cfg.identity = make_topic_identity(topic);
+        stamped_cfg.identity = topic_identity(topic);
         return create_or_open_handle<Subscriber>(
             make_topic_name(topic), with_leading_slash(topic),
             channel::PubSub, registry::Pubsub, registry::Subscriber, stamped_cfg);
@@ -264,14 +264,14 @@ namespace kickmsg
         auto topic_path = with_leading_slash(channel);
         if (auto* r = find_region(shm_name))
         {
-            check_cached_identity(*r, shm_name, make_broadcast_identity(channel));
+            check_cached_identity(*r, shm_name, broadcast_identity(channel));
             check_cached_config(*r, shm_name, channel::Broadcast, cfg);
             touch_registry(shm_name, topic_path, channel::Broadcast,
                            registry::Broadcast, registry::Both);
             return BroadcastHandle{Publisher{*r, backend}, Subscriber{*r}};
         }
         channel::Config stamped_cfg = cfg;
-        stamped_cfg.identity = make_broadcast_identity(channel);
+        stamped_cfg.identity = broadcast_identity(channel);
         auto [it, _] = regions_.emplace(
             shm_name,
             SharedRegion::create_or_open(
@@ -285,7 +285,7 @@ namespace kickmsg
     {
         channel::Config mbx_cfg = cfg;
         mbx_cfg.max_subscribers = 1;
-        mbx_cfg.identity        = make_mailbox_identity(name_.c_str(), tag);
+        mbx_cfg.identity        = mailbox_identity(name_.c_str(), tag);
         auto shm_name   = make_mailbox_name(name_.c_str(), tag);
         auto topic_path = mailbox_topic(name_.c_str(), tag);
         // Reuse the region so a duplicate subscriber fails without replacing it.
@@ -313,7 +313,7 @@ namespace kickmsg
         auto topic_path = mailbox_topic(owner_node, tag);
         if (auto* r = find_region(shm_name))
         {
-            check_cached_identity(*r, shm_name, make_mailbox_identity(owner_node, tag));
+            check_cached_identity(*r, shm_name, mailbox_identity(owner_node, tag));
             touch_registry(shm_name, topic_path, channel::PubSub,
                            registry::Mailbox, registry::Publisher);
             return Publisher(*r, backend);
@@ -321,7 +321,7 @@ namespace kickmsg
         auto [it, _] = regions_.emplace(
             shm_name,
             SharedRegion::open(shm_name.c_str(),
-                               make_mailbox_identity(owner_node, tag)));
+                               mailbox_identity(owner_node, tag)));
         // Mailbox sender is the Publisher side.
         touch_registry(shm_name, topic_path, channel::PubSub,
                        registry::Mailbox, registry::Publisher);
@@ -333,7 +333,7 @@ namespace kickmsg
     {
         channel::Config mbx_cfg = cfg;
         mbx_cfg.max_subscribers = 1;
-        mbx_cfg.identity        = make_mailbox_identity(name_.c_str(), tag);
+        mbx_cfg.identity        = mailbox_identity(name_.c_str(), tag);
         return create_or_open_handle<Subscriber>(
             make_mailbox_name(name_.c_str(), tag),
             mailbox_topic(name_.c_str(), tag),
@@ -346,7 +346,7 @@ namespace kickmsg
     {
         channel::Config mbx_cfg = cfg;
         mbx_cfg.max_subscribers = 1;
-        mbx_cfg.identity        = make_mailbox_identity(owner_node, tag);
+        mbx_cfg.identity        = mailbox_identity(owner_node, tag);
         return create_or_open_handle<Publisher>(
             make_mailbox_name(owner_node, tag),
             mailbox_topic(owner_node, tag),
@@ -462,26 +462,27 @@ namespace kickmsg
     // Raw per-call components disambiguate colliding sanitized names; the
     // leading kind tag keeps the three channel kinds in disjoint domains.
 
-    uint64_t Node::make_topic_identity(char const* topic) const
+    uint64_t Node::topic_identity(char const* topic) const
     {
-        uint64_t h = identity_chain("topic", hash::FNV1A_64_OFFSET_BASIS);
-        h = identity_chain(namespace_, h);
-        return identity_chain(topic, h);
+        uint64_t identity = identity_chain("topic", hash::FNV1A_64_OFFSET_BASIS);
+        identity = identity_chain(namespace_, identity);
+        return identity_chain(topic, identity);
     }
 
-    uint64_t Node::make_broadcast_identity(char const* channel) const
+    uint64_t Node::broadcast_identity(char const* channel) const
     {
-        uint64_t h = identity_chain("broadcast", hash::FNV1A_64_OFFSET_BASIS);
-        h = identity_chain(namespace_, h);
-        return identity_chain(channel, h);
+        uint64_t identity = identity_chain("broadcast", hash::FNV1A_64_OFFSET_BASIS);
+        identity = identity_chain(namespace_, identity);
+        return identity_chain(channel, identity);
     }
 
-    uint64_t Node::make_mailbox_identity(char const* owner, char const* tag) const
+    uint64_t Node::mailbox_identity(char const* owner, char const* tag) const
     {
-        uint64_t h = identity_chain("mailbox", hash::FNV1A_64_OFFSET_BASIS);
-        h = identity_chain(namespace_, h);
-        h = identity_chain(owner, h);
-        return identity_chain(tag, h);
+        // Match the owner's sanitized Node name even when the sender spells it differently.
+        uint64_t identity = identity_chain("mailbox", hash::FNV1A_64_OFFSET_BASIS);
+        identity = identity_chain(namespace_, identity);
+        identity = identity_chain(sanitize_shm_component(owner, "mailbox owner"), identity);
+        return identity_chain(tag, identity);
     }
 
     SharedRegion* Node::find_region(std::string const& shm_name)

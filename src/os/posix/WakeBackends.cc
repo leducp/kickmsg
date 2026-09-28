@@ -103,9 +103,10 @@ namespace kickmsg
         // Best effort: SO_REUSEADDR already covers multicast rebinding.
         (void) ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
 #endif
+        // Binding to the group filters other traffic on the same port.
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_addr.s_addr = htonl(group_);
         addr.sin_port        = htons(port_);
         if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
         {

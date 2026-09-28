@@ -5,8 +5,7 @@
 /// ends a wake backend instead and the subscriber hands out a descriptor, so one loop can
 /// serve it alongside a socket, a timer, or anything else the caller already polls.
 ///
-/// Single-process for simplicity; in production the publisher and the subscriber are two
-/// processes, each building its own backend from the same name.
+/// Single-process for simplicity; each process normally builds its own backend.
 
 #include <cstring>
 #include <iostream>
@@ -28,12 +27,11 @@ int main()
 {
     kickmsg::SharedMemory::unlink("/demo_wait_temperature");
 
-    // Both ends are given the same backend. Nothing about it is negotiated through shared
-    // memory: each side derives the same address from the name.
-    UdpMulticastBackend backend("demo/temperature");
-
     Node sensor("sensor", "demo_wait");
-    auto pub = sensor.advertise("temperature", {}, &backend);
+
+    // Each node in the namespace derives the same wake address for this topic.
+    auto backend = UdpMulticastBackend::for_topic(sensor, "temperature");
+    auto pub     = sensor.advertise("temperature", {}, &backend);
 
     Node display("display", "demo_wait");
     auto sub = display.subscribe("temperature");

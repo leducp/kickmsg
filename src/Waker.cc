@@ -1,11 +1,25 @@
-#include <cstring>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 #include "kickmsg/Hash.h"
+#include "kickmsg/Node.h"
 #include "kickmsg/Waker.h"
 
 namespace kickmsg
 {
+    namespace
+    {
+        char const* require_name(char const* name, char const* what)
+        {
+            if (name == nullptr)
+            {
+                throw std::invalid_argument(std::string{"UdpMulticastBackend: "} + what + " must not be null");
+            }
+            return name;
+        }
+    }
+
     UdpMulticastBackend::UdpMulticastBackend(uint32_t group, uint16_t port)
         : group_{group}
         , port_{port}
@@ -26,11 +40,39 @@ namespace kickmsg
     }
 
     UdpMulticastBackend::UdpMulticastBackend(char const* name, uint16_t port_base)
+        : UdpMulticastBackend(derive(hash::fnv1a_64(std::string_view{require_name(name, "name")}), port_base))
     {
-        if (name == nullptr)
+    }
+
+    UdpMulticastBackend UdpMulticastBackend::for_topic(Node const& node, char const* topic, uint16_t port_base)
+    {
+        return UdpMulticastBackend(derive(node.topic_identity(require_name(topic, "topic")), port_base));
+    }
+
+    UdpMulticastBackend UdpMulticastBackend::for_broadcast(Node const& node, char const* channel, uint16_t port_base)
+    {
+        return UdpMulticastBackend(derive(node.broadcast_identity(require_name(channel, "channel")), port_base));
+    }
+
+    UdpMulticastBackend UdpMulticastBackend::for_mailbox(Node const& node, char const* tag, char const* owner_node, uint16_t port_base)
+    {
+        char const* owner = owner_node;
+        if (owner == nullptr)
         {
-            throw std::invalid_argument("UdpMulticastBackend: name must not be null");
+            owner = node.name().c_str();
         }
+        return UdpMulticastBackend(derive(node.mailbox_identity(owner, require_name(tag, "tag")), port_base));
+    }
+
+    UdpMulticastBackend::UdpMulticastBackend(Address address)
+        : group_{address.group}
+        , port_{address.port}
+    {
+        open_sender();
+    }
+
+    UdpMulticastBackend::Address UdpMulticastBackend::derive(uint64_t hash, uint16_t port_base)
+    {
         if (port_base == 0 or port_base > UINT16_MAX - PORT_SPAN + 1)
         {
             throw std::invalid_argument(
@@ -38,10 +80,10 @@ namespace kickmsg
         }
         // 239.255.0.0/16 is administratively scoped: routers never forward it. The port
         // takes the other half of the hash, so the two collisions stay independent.
-        uint64_t const h = hash::fnv1a_64(name, std::strlen(name));
-        group_ = 0xEFFF0000u | static_cast<uint32_t>(h & 0xFFFFu);
-        port_  = static_cast<uint16_t>(port_base + ((h >> 32) % PORT_SPAN));
-        open_sender();
+        Address address;
+        address.group = 0xEFFF0000u | static_cast<uint32_t>(hash & 0xFFFFu);
+        address.port  = static_cast<uint16_t>(port_base + ((hash >> 32) % PORT_SPAN));
+        return address;
     }
 
     Waker::Waker(WakeBackend& backend)

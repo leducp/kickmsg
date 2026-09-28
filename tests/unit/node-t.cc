@@ -158,6 +158,22 @@ TEST_F(NodeTest, MailboxPattern)
     EXPECT_EQ(std::string(static_cast<char const*>(msg->data()), msg->len()), reply);
 }
 
+TEST_F(NodeTest, MailboxOwnerMayBeNamedAsGivenToItsNode)
+{
+    track("test", "robot.arm_mbx_inbox");
+
+    kickmsg::Node owner("/robot/arm", "test");
+    auto inbox = owner.create_mailbox("inbox", small_cfg());
+
+    kickmsg::Node sender("sender", "test");
+    auto pub = sender.open_mailbox("/robot/arm", "inbox");
+    EXPECT_EQ(owner.mailbox_identity(owner.name().c_str(), "inbox"), sender.mailbox_identity("/robot/arm", "inbox"));
+
+    uint32_t val = 7;
+    ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+    EXPECT_TRUE(inbox.try_receive().has_value());
+}
+
 // --- Schema descriptor through the Node API -------------------------------
 
 namespace
