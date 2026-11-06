@@ -207,6 +207,18 @@ void run_all_mpmc(TestRunner& runner)
         runner.run("mpmc contended (pool 32, tiny)", [&]{ return run_stress_test(tc); });
     }
 
+    // Smallest valid ring: every publish wraps and evicts the previous entry.
+    {
+        TestConfig tc;
+        tc.num_publishers  = 4;
+        tc.num_subscribers = 4;
+        tc.msgs_per_pub    = 10000 / TSAN_SCALE;
+        tc.pool_size       = 32;
+        tc.ring_capacity   = 2;
+        tc.max_subs        = 4;
+        runner.run("mpmc 4p/4s single-slot ring (pool 32, ring 2)", [&]{ return run_stress_test(tc); });
+    }
+
     // Zero-copy receive tests -- exercises SampleView pin CAS,
     // refcount increment/decrement, and destructor release path
     {

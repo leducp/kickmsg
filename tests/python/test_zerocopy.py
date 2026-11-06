@@ -17,6 +17,16 @@ import pytest
 import kickmsg
 
 
+def evict_ring(pub, cfg) -> int:
+    """Overwrite every entry of the subscriber ring: a ring entry holds its slot
+    until overwritten, so afterwards a pinned slot is held by its pin alone.
+    Returns pool_free once no pin is held.
+    """
+    for _ in range(cfg.sub_ring_capacity):
+        pub.send(b"evict")
+    return cfg.pool_size - cfg.sub_ring_capacity
+
+
 def test_publisher_allocate_returns_writable_slot(shm_name, small_cfg):
     region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
     pub = kickmsg.Publisher(region)
@@ -88,22 +98,27 @@ def test_double_publish_raises(shm_name, small_cfg):
         slot.publish(4)
 
 
-def test_view_release_returns_slot_to_pool(shm_name, small_cfg):
+def test_superseded_slot_refuses_buffer_and_publish(shm_name, small_cfg):
+    """A later allocate() takes the slot back: the earlier handle must refuse
+    new buffers and publish() instead of committing the newer reservation."""
     region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
     pub = kickmsg.Publisher(region)
     sub = kickmsg.Subscriber(region)
 
-    # Publish + consume a zero-copy view, then explicitly release the pin.
-    # Publishing `pool_size` more messages afterwards must still succeed
-    # (the ring/pool isn't wedged).
-    pub.send(b"ephemeral")
-    view = sub.try_receive_view()
-    assert view is not None
-    _ = bytes(memoryview(view))
-    view.release()
+    stale = pub.allocate()
+    live = pub.allocate()
+    assert not stale.valid
+    assert not stale.published
 
-    for i in range(small_cfg.pool_size):
-        assert pub.send(f"msg-{i}".encode()) > 0
+    with pytest.raises(BufferError, match="superseded"):
+        memoryview(stale)
+    with pytest.raises(ValueError, match="superseded"):
+        stale.publish(4)
+    assert sub.try_receive() is None
+
+    memoryview(live)[:4] = b"live"
+    live.publish(4)
+    assert sub.try_receive() == b"live"
 
 
 def test_view_release_makes_new_memoryview_error(shm_name, small_cfg):
@@ -115,8 +130,13 @@ def test_view_release_makes_new_memoryview_error(shm_name, small_cfg):
     pub.send(b"fleeting")
     view = sub.try_receive_view()
     assert view is not None
-    _ = memoryview(view)  # valid while pin is held
+    mv = memoryview(view)  # valid while pin is held
+
+    ring_held = evict_ring(pub, small_cfg)
+    assert region.stats().pool_free == ring_held - 1
+
     view.release()
+    assert region.stats().pool_free == ring_held
     with pytest.raises(BufferError):
         memoryview(view)
 
@@ -163,21 +183,22 @@ def test_zerocopy_camera_frame_pattern(shm_name):
 
 
 def test_view_context_manager_releases_pin(shm_name, small_cfg):
-    """`with view:` must release the pin on normal block exit — the pool
-    is replenished immediately and new publishes don't starve."""
+    """`with view:` must release the pin on normal block exit -- the slot
+    returns to the pool immediately."""
     region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
     pub = kickmsg.Publisher(region)
     sub = kickmsg.Subscriber(region)
 
     pub.send(b"in-block")
     view = sub.try_receive_view()
+
+    ring_held = evict_ring(pub, small_cfg)
+
     with view:
         assert bytes(memoryview(view)) == b"in-block"
+        assert region.stats().pool_free == ring_held - 1
     assert not view.valid
-
-    # Pool must be fully available — publish pool_size more messages.
-    for i in range(small_cfg.pool_size):
-        assert pub.send(f"m{i}".encode()) > 0
+    assert region.stats().pool_free == ring_held
 
 
 def test_view_context_manager_releases_on_exception(shm_name, small_cfg):
@@ -211,4 +232,11 @@ def test_memoryview_pins_sampleview(shm_name, small_cfg):
     mv = memoryview(view)
     del view  # only `mv` keeps the SampleView alive now
     gc.collect(); gc.collect()
+
+    ring_held = evict_ring(pub, small_cfg)
+    assert region.stats().pool_free == ring_held - 1
     assert bytes(mv) == b"retained"
+
+    mv.release()
+    gc.collect()
+    assert region.stats().pool_free == ring_held

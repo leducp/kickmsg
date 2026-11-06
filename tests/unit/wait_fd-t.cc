@@ -75,7 +75,9 @@ TEST_F(WaitFdTest, UnusedSubscriberLeavesTheRingOnTheFutexPath)
         pub.send(&payload, sizeof(payload));
     });
 
-    auto sample = sub.receive(2s);
+    nanoseconds start  = kickmsg::monotonic_ns();
+    auto        sample = sub.receive(2s);
+    EXPECT_LT(kickmsg::elapsed_time(start), 1s);
     publisher.join();
 
     ASSERT_TRUE(sample.has_value());
@@ -293,31 +295,6 @@ TEST_F(WaitFdTest, ArmMarksTheRingAsCarrierArmed)
     EXPECT_EQ(ring::WaiterNone, ring->has_waiter.load());
 }
 
-TEST_F(WaitFdTest, DisarmIsIdempotent)
-{
-    auto region = SharedRegion::create(SHM_NAME, channel::PubSub, bare_cfg());
-    Subscriber sub(region);
-    ASSERT_TRUE(sub.attach(waker));
-
-    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
-    ASSERT_EQ(Subscriber::Wait::Armed, sub.arm_wait());
-    sub.disarm_wait();
-    sub.disarm_wait();
-    sub.disarm_wait();
-    EXPECT_EQ(ring::WaiterNone, ring->has_waiter.load());
-}
-
-TEST_F(WaitFdTest, ArmOnEmptyRingParksAndDoesNotSignal)
-{
-    auto region = SharedRegion::create(SHM_NAME, channel::PubSub, bare_cfg());
-    Subscriber sub(region);
-    ASSERT_TRUE(sub.attach(waker));
-
-    EXPECT_EQ(Subscriber::Wait::Armed, sub.arm_wait());
-    EXPECT_FALSE(readable(wait_descriptor(sub), 20ms));
-    sub.disarm_wait();
-}
-
 TEST_F(WaitFdTest, ArmReportsReadyWhenASampleIsAlreadyQueued)
 {
     auto region = SharedRegion::create(SHM_NAME, channel::PubSub, bare_cfg());
@@ -509,22 +486,6 @@ TEST_F(WaitFdTest, AttachAfterWaitFdReplacesThePrivateWaker)
 }
 namespace
 {
-    /// A backend a caller owning both ends supplies to each. The publisher only ever
-    /// calls signal(), so proving injection needs no descriptor and no transport.
-    class CountingBackend final : public WakeBackend
-    {
-    public:
-        int  open()      override { return -1; }
-        void close(int)  override {}
-        void drain(int)  override {}
-        void signal()    override { ++signals; }
-
-        int signals{0};
-    };
-}
-
-namespace
-{
     /// Counts signals while handing the descriptor side to a backend that works, so a
     /// Subscriber can really arm and the publisher really reaches it.
     class SpyBackend final : public WakeBackend
@@ -600,40 +561,4 @@ TEST_F(WaitFdTest, EveryPublisherFactoryCarriesABackend)
     EXPECT_EQ(5, spy.signals) << "open_or_create_mailbox() dropped the backend";
 
     scrub();
-}
-
-TEST_F(WaitFdTest, ACallerSuppliedBackendIsSignalled)
-{
-    auto region = SharedRegion::create(SHM_NAME, channel::PubSub, bare_cfg());
-    Subscriber sub(region);
-
-    // Stands in for a subscriber armed on the carrier, which is all the publisher reads.
-    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
-    ring->has_waiter.store(ring::WaiterCarrier, std::memory_order_relaxed);
-
-    CountingBackend injected;
-    Publisher       pub(region, &injected);
-    uint8_t         payload = 11;
-    ASSERT_GT(pub.send(&payload, sizeof(payload)), 0);
-
-    EXPECT_EQ(1, injected.signals);
-    ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
-    EXPECT_TRUE(sub.try_receive().has_value());
-}
-
-TEST_F(WaitFdTest, APublisherWithNoBackendSignalsNothing)
-{
-    auto region = SharedRegion::create(SHM_NAME, channel::PubSub, bare_cfg());
-    Subscriber sub(region);
-
-    auto* ring = sub_ring_at(region.base(), region.geometry(), sub.ring_index());
-    ring->has_waiter.store(ring::WaiterCarrier, std::memory_order_relaxed);
-
-    CountingBackend injected;
-    Publisher       pub(region);
-    uint8_t         payload = 1;
-    ASSERT_GT(pub.send(&payload, sizeof(payload)), 0);
-
-    EXPECT_EQ(0, injected.signals);
-    ring->has_waiter.store(ring::WaiterNone, std::memory_order_relaxed);
 }

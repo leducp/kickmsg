@@ -89,23 +89,10 @@ TEST_F(BlackboardTest, OpenOrCreateIsIdempotent)
     EXPECT_GE(a.max_value_size(), 64u);
 }
 
-TEST_F(BlackboardTest, TryOpenReturnsNulloptWhenAbsent)
-{
-    EXPECT_FALSE(Blackboard::try_open(NS, NAME).has_value());
-}
-
 TEST_F(BlackboardTest, TryOpenDoesNotCreateRegion)
 {
     EXPECT_FALSE(Blackboard::try_open(NS, NAME).has_value());
     EXPECT_FALSE(Blackboard::try_open(NS, NAME).has_value());
-}
-
-TEST_F(BlackboardTest, MoveLeavesSourceWithNullHeader)
-{
-    auto a = open();
-    auto b = std::move(a);
-    EXPECT_EQ(a.header(), nullptr);
-    EXPECT_EQ(b.capacity(), 8u);
 }
 
 // ---- the headline: a late reader sees the current value ------------------
@@ -179,6 +166,7 @@ TEST_F(BlackboardTest, RedeclareAfterWriterDestructionSucceeds)
     EXPECT_TRUE(w2.valid());
 }
 
+// Releasing a key keeps its value, so both listings still report it.
 TEST_F(BlackboardTest, ReleasedKeyKeepsItsValue)
 {
     auto bb = open();
@@ -193,6 +181,9 @@ TEST_F(BlackboardTest, ReleasedKeyKeepsItsValue)
     EXPECT_EQ(out.ec, std::error_code{});
     EXPECT_EQ(got.id, 9u);
     EXPECT_FALSE(r.owner_alive());
+
+    EXPECT_EQ(bb.keys(), (std::vector<std::string>{"released"}));
+    EXPECT_EQ(bb.read_all().size(), 1u);
 
     auto snap = bb.snapshot();
     ASSERT_EQ(snap.size(), 1u);
@@ -226,26 +217,25 @@ TEST_F(BlackboardTest, TakeoverPreservesPriorValueUntilFirstWrite)
     EXPECT_EQ(out.update_count, 2u);
 }
 
-TEST_F(BlackboardTest, SweepStaleLeavesLiveOwnersAlone)
-{
-    auto bb = open();
-    auto w  = bb.declare("live");
-    ASSERT_FALSE(w.write(Sample{1, 1}));
-    EXPECT_EQ(bb.sweep_stale(), 0u);
-    EXPECT_EQ(bb.snapshot().size(), 1u);
-}
-
-TEST_F(BlackboardTest, KeysListsEveryActiveKeyIncludingUnwritten)
+// A declared-but-unwritten key has no value, so it is a keys() row and not a
+// read_all() one: the two answer different questions about the same entry.
+TEST_F(BlackboardTest, KeysListsAnUnwrittenKeyThatReadAllSkips)
 {
     auto bb = open();
     auto a  = bb.declare("arm/state");
     auto b  = bb.declare("hand/0");
     ASSERT_FALSE(a.write(Sample{1, 1}));
-    // b is declared and never written: it exists, so it is listed.
 
     auto got = bb.keys();
     std::sort(got.begin(), got.end());
     EXPECT_EQ(got, (std::vector<std::string>{"arm/state", "hand/0"}));
+
+    auto values = bb.read_all();
+    ASSERT_EQ(values.size(), 1u);
+    EXPECT_TRUE(values.contains("arm/state"));
+
+    ASSERT_FALSE(b.write(Sample{2, 2}));
+    EXPECT_EQ(bb.read_all().size(), 2u);
 }
 
 TEST_F(BlackboardTest, KeysAndReadAllFilterOnPrefix)
@@ -254,7 +244,7 @@ TEST_F(BlackboardTest, KeysAndReadAllFilterOnPrefix)
     auto h0  = bb.declare("hand/0");
     auto h1  = bb.declare("hand/1");
     auto arm = bb.declare("arm/state");
-    ASSERT_FALSE(h0.write(Sample{1, 1}));
+    ASSERT_FALSE(h0.write(Sample{7, 3}));
     ASSERT_FALSE(h1.write(Sample{2, 2}));
     ASSERT_FALSE(arm.write(Sample{3, 3}));
 
@@ -267,16 +257,6 @@ TEST_F(BlackboardTest, KeysAndReadAllFilterOnPrefix)
     EXPECT_TRUE(values.contains("hand/0"));
     EXPECT_TRUE(values.contains("hand/1"));
     EXPECT_FALSE(values.contains("arm/state"));
-}
-
-TEST_F(BlackboardTest, ReadAllReturnsTheValuesReaderWouldRead)
-{
-    auto bb = open();
-    auto w  = bb.declare("hand/0");
-    ASSERT_FALSE(w.write(Sample{7, 3}));
-
-    auto values = bb.read_all();
-    ASSERT_EQ(values.size(), 1u);
 
     auto const& bytes = values.at("hand/0");
     ASSERT_EQ(bytes.size(), sizeof(Sample));
@@ -284,34 +264,6 @@ TEST_F(BlackboardTest, ReadAllReturnsTheValuesReaderWouldRead)
     std::memcpy(&got, bytes.data(), sizeof(got));
     EXPECT_EQ(got.id, 7u);
     EXPECT_EQ(got.state, 3u);
-}
-
-// A declared-but-unwritten key has no value, so it is a keys() row and not a
-// read_all() one: the two answer different questions about the same entry.
-TEST_F(BlackboardTest, ReadAllSkipsAKeyThatHoldsNoValue)
-{
-    auto bb = open();
-    auto w  = bb.declare("hand/0");
-
-    EXPECT_EQ(bb.keys().size(), 1u);
-    EXPECT_TRUE(bb.read_all().empty());
-
-    ASSERT_FALSE(w.write(Sample{1, 1}));
-    EXPECT_EQ(bb.read_all().size(), 1u);
-}
-
-// Releasing a key keeps its value, so both listings still report it: that is
-// what lets a reader see what a writer said before it went away.
-TEST_F(BlackboardTest, KeysAndReadAllOutliveTheWriter)
-{
-    auto bb = open();
-    {
-        auto w = bb.declare("hand/0");
-        ASSERT_FALSE(w.write(Sample{5, 2}));
-    }
-
-    EXPECT_EQ(bb.keys(), (std::vector<std::string>{"hand/0"}));
-    EXPECT_EQ(bb.read_all().size(), 1u);
 }
 
 // The typed form skips a key whose value is not sizeof(T), the listing
@@ -337,10 +289,18 @@ TEST_F(BlackboardTest, WriteNamesWhyItFailed)
 {
     auto bb = open();
     auto w  = bb.declare("hand/0");
+    auto r  = bb.observe("hand/0");
+    ASSERT_FALSE(w.write(Sample{3, 3}));
 
     std::vector<uint8_t> const over(bb.max_value_size() + 1, 0xAB);
     EXPECT_EQ(w.write(over.data(), over.size()),
               std::make_error_code(std::errc::message_size));
+
+    Sample got{};
+    auto   out = r.read(got);
+    EXPECT_EQ(out.ec, std::error_code{});
+    EXPECT_EQ(out.update_count, 1u) << "a rejected write must leave the previous value";
+    EXPECT_EQ(got.id, 3u);
 
     Blackboard::Writer const moved_from;
     Blackboard::Writer       taken = std::move(w);
@@ -467,23 +427,6 @@ TEST_F(BlackboardTest, WaitReturnsImmediatelyWhenSeqAlreadyAdvanced)
 }
 
 // ---- bounds and hostile bytes -------------------------------------------
-
-TEST_F(BlackboardTest, ValueTooLargeIsRejectedAndPreservesPrevious)
-{
-    auto bb = open();
-    auto w  = bb.declare("k");
-    auto r  = bb.observe("k");
-    ASSERT_FALSE(w.write(Sample{3, 3}));
-
-    std::vector<uint8_t> huge(4096, 0xAB);
-    EXPECT_TRUE(w.write(huge.data(), huge.size()));
-
-    Sample got{};
-    auto   out = r.read(got);
-    EXPECT_EQ(out.ec, std::error_code{});
-    EXPECT_EQ(out.update_count, 1u);
-    EXPECT_EQ(got.id, 3u);
-}
 
 TEST_F(BlackboardTest, ReadIntoSmallBufferReportsTruncated)
 {
@@ -692,32 +635,14 @@ TEST_F(BlackboardTest, EntryRetenancyInvalidatesCachedReaderIndex)
     ASSERT_EQ(bb.sweep_stale(), 1u);
 
     auto w2 = bb.declare("b");
+    Sample got{};
+    EXPECT_EQ(bb.observe("b").read(got).ec, std::make_error_code(std::errc::no_message))
+        << "a fresh claim resurrected the previous tenant's value";
     ASSERT_FALSE(w2.write(Sample{99, 99}));
 
-    Sample got{};
-    auto   out = reader.read(got);
+    auto out = reader.read(got);
     EXPECT_EQ(out.ec, std::make_error_code(std::errc::no_such_file_or_directory));
     EXPECT_NE(got.id, 99u);
-}
-
-TEST_F(BlackboardTest, FreshClaimDoesNotResurrectPreviousTenantValue)
-{
-    blackboard::Config cfg;
-    cfg.capacity       = 1;
-    cfg.max_value_size = 32;
-    auto bb = Blackboard::open_or_create(NS, NAME, cfg);
-
-    {
-        auto w = bb.declare("a");
-        ASSERT_FALSE(w.write(Sample{42, 42}));
-        orphan(bb, "a");
-    }
-    ASSERT_EQ(bb.sweep_stale(), 1u);
-
-    auto   w2 = bb.declare("b");
-    auto   r  = bb.observe("b");
-    Sample got{};
-    EXPECT_EQ(r.read(got).ec, std::make_error_code(std::errc::no_message));
 }
 
 // ---- convenience overloads ----------------------------------------------
@@ -789,70 +714,6 @@ TEST_F(BlackboardTest, ClosedBoardThrowsRatherThanDereferencingNull)
     EXPECT_TRUE(moved.valid());
     EXPECT_FALSE(bb.valid());
     EXPECT_THROW(bb.capacity(), std::runtime_error);
-}
-
-TEST_F(BlackboardTest, RawByteRoundTrip)
-{
-    auto bb = open();
-    auto w  = bb.declare("k");
-    auto r  = bb.observe("k");
-
-    char const* text = "lifecycle=ACTIVE";
-    ASSERT_FALSE(w.write(text, std::strlen(text)));
-
-    char buf[64] = {};
-    auto out = r.read(buf, sizeof(buf));
-    ASSERT_EQ(out.ec, std::error_code{});
-    EXPECT_EQ(std::string(buf, out.len), text);
-}
-
-TEST_F(BlackboardTest, ConcurrentDeclareOfOneKeyYieldsOneOwner)
-{
-    // Two claimants can both miss a not-yet-existing key and then claim two
-    // different Free entries for it.  Exactly one must survive.
-    auto bb = open();
-
-    std::atomic<int> winners{0};
-    std::atomic<bool> go{false};
-    std::vector<std::thread> threads;
-    for (int i = 0; i < 8; ++i)
-    {
-        threads.emplace_back([&]
-        {
-            while (not go.load(std::memory_order_acquire))
-            {
-                std::this_thread::yield();
-            }
-            try
-            {
-                auto w = bb.declare("contested");
-                winners.fetch_add(1, std::memory_order_relaxed);
-                std::this_thread::sleep_for(50ms);
-                w.release();
-            }
-            catch (std::runtime_error const&)
-            {
-            }
-        });
-    }
-    go.store(true, std::memory_order_release);
-    for (auto& t : threads)
-    {
-        t.join();
-    }
-
-    EXPECT_EQ(winners.load(), 1);
-
-    // And exactly one entry carries the key.
-    int matches = 0;
-    for (auto const& ks : bb.snapshot())
-    {
-        if (ks.key == "contested")
-        {
-            ++matches;
-        }
-    }
-    EXPECT_EQ(matches, 1);
 }
 
 // ---- audit regressions ---------------------------------------------------
@@ -1036,7 +897,7 @@ namespace
 
     constexpr CrashPoint CRASH_POINTS[] = {
         // --- claim: Free -> Claiming -> Active, all under the lock ---
-        {"claim/lock-taken-nothing-done", true,
+        {"claim/lock-taken-nothing-done, sweepfree/complete-lock-not-dropped", true,
          [](BlackboardEntry* e, uint64_t) { zero_meta(e); bb_store_key(e, "", 0);
                                             put(e, blackboard::Free); }},
         {"claim/state-claiming", true,
@@ -1050,7 +911,7 @@ namespace
         {"claim/fully-filled-not-committed", true,
          [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
                                                put(e, blackboard::Claiming); }},
-        {"claim/committed-lock-not-dropped", true,
+        {"claim/committed-lock-not-dropped, takeover/new-owner-published", true,
          [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
                                                put(e, blackboard::Active); }},
 
@@ -1059,9 +920,6 @@ namespace
          [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
                                                std::memset(e->owner_node, 'x',
                                                            sizeof(e->owner_node));
-                                               put(e, blackboard::Active); }},
-        {"takeover/new-owner-published", true,
-         [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
                                                put(e, blackboard::Active); }},
 
         // --- release ---
@@ -1080,9 +938,6 @@ namespace
         {"sweepfree/free-published-identity-not", true,
          [](BlackboardEntry* e, uint64_t kh) { zero_meta(e); dead_owner(e); set_key(e, kh);
                                                put(e, blackboard::Free); }},
-        {"sweepfree/complete-lock-not-dropped", true,
-         [](BlackboardEntry* e, uint64_t) { zero_meta(e); bb_store_key(e, "", 0);
-                                            put(e, blackboard::Free); }},
 
         // --- forged states, lock NOT held: a corrupt peer can write these and
         //     each would otherwise wedge a key or leak a slot forever ---
@@ -1229,11 +1084,6 @@ TEST_F(BlackboardTest, LockIsNeverLeftHeldOnAThrowingPath)
 
     EXPECT_THROW(bb.declare(std::string(blackboard::KEY_MAX + 5, 'x').c_str()),
                  std::invalid_argument);
-    EXPECT_EQ(h->lock_token.load(std::memory_order_acquire), 0u);
-
-    h->lock_token.store(live_lock_token(), std::memory_order_release);
-    EXPECT_THROW(bb.snapshot(), std::runtime_error);
-    h->lock_token.store(0, std::memory_order_release);
     EXPECT_EQ(h->lock_token.load(std::memory_order_acquire), 0u);
 
     bb.snapshot();

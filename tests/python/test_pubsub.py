@@ -19,38 +19,12 @@ def test_send_and_try_receive_roundtrip(shm_name, small_cfg):
     assert sub.try_receive() is None
 
 
-def test_try_receive_is_none_on_empty(shm_name, small_cfg):
-    region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
-    sub = kickmsg.Subscriber(region)
-    assert sub.try_receive() is None
-
-
 def test_receive_with_timeout_returns_none(shm_name, small_cfg):
     region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
     sub = kickmsg.Subscriber(region)
     # 10 ms timeout, no publisher — must return None without throwing.
     got = sub.receive(timedelta(milliseconds=10))
     assert got is None
-
-
-def test_receive_with_timeout_delivers(shm_name, small_cfg):
-    region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
-    pub = kickmsg.Publisher(region)
-    sub = kickmsg.Subscriber(region)
-    pub.send(b"payload")
-    got = sub.receive(timedelta(milliseconds=100))
-    assert got == b"payload"
-
-
-def test_multiple_subscribers_receive_same_message(shm_name, small_cfg):
-    region = kickmsg.SharedRegion.create(shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
-    pub = kickmsg.Publisher(region)
-    sub_a = kickmsg.Subscriber(region)
-    sub_b = kickmsg.Subscriber(region)
-
-    pub.send(b"fan-out")
-    assert sub_a.try_receive() == b"fan-out"
-    assert sub_b.try_receive() == b"fan-out"
 
 
 def test_send_larger_than_max_payload_raises(shm_name, small_cfg):

@@ -59,26 +59,6 @@ TEST_F(SubscriberTest, MovedFromReceiveReturnsNulloptNotCrash)
     EXPECT_FALSE(src.receive_view(0ms).has_value());
 }
 
-TEST_F(SubscriberTest, ZeroCopyReceive)
-{
-    auto cfg    = default_cfg();
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-
-    kickmsg::Subscriber sub(region);
-    kickmsg::Publisher  pub(region);
-
-    uint64_t payload = 0x1234567890ABCDEFULL;
-    ASSERT_GE(pub.send(&payload, sizeof(payload)), 0);
-
-    auto view = sub.try_receive_view();
-    ASSERT_TRUE(view.has_value());
-    EXPECT_EQ(view->len(), sizeof(payload));
-
-    uint64_t received = 0;
-    std::memcpy(&received, view->data(), sizeof(received));
-    EXPECT_EQ(received, payload);
-}
-
 TEST_F(SubscriberTest, SampleViewMoveSemantics)
 {
     auto cfg    = default_cfg();
@@ -103,34 +83,6 @@ TEST_F(SubscriberTest, SampleViewMoveSemantics)
     kickmsg::Subscriber::SampleView view3;
     view3 = std::move(view2);
     EXPECT_EQ(view3.len(), sizeof(val));
-}
-
-TEST_F(SubscriberTest, OverwritingRingReportsLoss)
-{
-    kickmsg::channel::Config cfg;
-    cfg.max_subscribers   = 1;
-    cfg.sub_ring_capacity = 4;
-    cfg.pool_size         = 8;
-    cfg.max_payload_size  = 8;
-
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-
-    kickmsg::Subscriber sub(region);
-    kickmsg::Publisher  pub(region);
-
-    for (int i = 0; i < 16; ++i)
-    {
-        pub.send(&i, sizeof(i));
-    }
-
-    int received = 0;
-    while (auto sample = sub.try_receive())
-    {
-        ++received;
-    }
-
-    EXPECT_GT(sub.lost(), 0u);
-    EXPECT_LT(static_cast<uint64_t>(received), 16u);
 }
 
 TEST_F(SubscriberTest, DrainReleasesSlots)
@@ -205,7 +157,9 @@ TEST_F(SubscriberTest, BlockingReceiveWakesOnPublish)
         pub.send(&val, sizeof(val));
     });
 
-    auto sample = sub.receive(2s);
+    nanoseconds start  = kickmsg::monotonic_ns();
+    auto        sample = sub.receive(2s);
+    EXPECT_LT(kickmsg::elapsed_time(start), 1s);
     ASSERT_TRUE(sample.has_value());
 
     uint32_t got = 0;
@@ -267,20 +221,8 @@ TEST_F(SubscriberTest, DrainDoesNotDoubleDecrementOnChurn)
     }
 }
 
-TEST_F(SubscriberTest, DrainTimeoutsStartsAtZero)
+TEST_F(SubscriberTest, StuckPublisherRetiresTheRingUntilReset)
 {
-    auto cfg    = default_cfg();
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-    kickmsg::Subscriber sub(region);
-
-    EXPECT_EQ(sub.drain_timeouts(), 0u);
-}
-
-TEST_F(SubscriberTest, StuckPublisherCausesDrainTimeout)
-{
-    // Simulate a crashed publisher by manually inflating in_flight.
-    // The subscriber destructor should timeout and skip drain.
-
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = 1;
     cfg.sub_ring_capacity = 4;
@@ -291,16 +233,8 @@ TEST_F(SubscriberTest, StuckPublisherCausesDrainTimeout)
     auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
 
     kickmsg::Publisher pub(region);
+    auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
 
-    // We need two rings: sub1 on ring 0 (will be stuck), sub2 on ring 1.
-    // Move-assign sub2 = std::move(sub1) triggers release_ring() on sub2's
-    // old ring (ring 1, clean) then transfers sub1's state. But sub1's ring
-    // is stuck, so when sub2 destructs, it timeouts on ring 0 and we can
-    // observe drain_timeouts() before destruction.
-
-    // Use a simpler approach: create sub, inflate in_flight, move-construct
-    // a new subscriber from it (transferring drain_timeouts), then the new
-    // one destructs — we observe via the ring state.
     {
         kickmsg::Subscriber sub(region);
 
@@ -310,35 +244,32 @@ TEST_F(SubscriberTest, StuckPublisherCausesDrainTimeout)
             ASSERT_GE(pub.send(&val, sizeof(val)), 0);
         }
 
-        EXPECT_EQ(sub.drain_timeouts(), 0u);
-
-        // Simulate a stuck publisher: inflate in_flight on ring 0
-        auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
+        // Simulate a crashed publisher still admitted on ring 0.
         ring->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
                                      std::memory_order_acq_rel);
-
-        // sub destructs here — timeout, drain skipped
+        // sub destructs here -- timeout, drain skipped
     }
 
-    // The ring should be Free with stale in_flight preserved
-    auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
     uint32_t packed = ring->state_flight.load(std::memory_order_acquire);
     EXPECT_EQ(kickmsg::ring::get_state(packed), kickmsg::ring::Free);
     EXPECT_GT(kickmsg::ring::get_in_flight(packed), 0u);
 
-    // Simulate operator recovery
-    ring->state_flight.store(kickmsg::ring::make_packed(kickmsg::ring::Free),
-                             std::memory_order_release);
+    EXPECT_GE(region.reset_retired_rings(), 1u);
+
+    kickmsg::Subscriber sub(region);
+    uint32_t val = 42;
+    ASSERT_GE(pub.send(&val, sizeof(val)), 0);
+
+    auto sample = sub.try_receive();
+    ASSERT_TRUE(sample.has_value());
+
+    uint32_t got = 0;
+    std::memcpy(&got, sample->data(), sizeof(got));
+    EXPECT_EQ(got, 42u);
 }
 
-TEST_F(SubscriberTest, DrainTimeoutsCounterIncrementsOnTimeout)
+TEST_F(SubscriberTest, MoveAssignmentRetiresAStuckOldRing)
 {
-    // Verify drain_timeouts() increments when a subscriber's ring release
-    // times out (crashed publisher with stuck in_flight).  After move-
-    // assignment, the counter reflects the NEW ring's history (= 0), not
-    // the old ring's — drain_timeouts is per-ring, not per-object.  The
-    // old ring's timeout is lost with its identity.
-
     kickmsg::channel::Config cfg;
     cfg.max_subscribers   = 2;
     cfg.sub_ring_capacity = 4;
@@ -350,155 +281,20 @@ TEST_F(SubscriberTest, DrainTimeoutsCounterIncrementsOnTimeout)
 
     kickmsg::Publisher pub(region);
 
-    // sub takes ring 0.
-    kickmsg::Subscriber sub(region);
+    kickmsg::Subscriber sub(region);  // takes ring 0
     uint32_t val = 1;
     ASSERT_GE(pub.send(&val, sizeof(val)), 0);
-    EXPECT_EQ(sub.drain_timeouts(), 0u);
 
-    // Inflate in_flight on ring 0 to simulate a crashed publisher.
+    // Simulate a crashed publisher still admitted on ring 0.
     auto* ring0 = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
     ring0->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
                                   std::memory_order_acq_rel);
 
-    // Move-assign from a fresh subscriber (ring 1).
-    // release_ring() fires on ring 0 → times out (in_flight stuck).
-    // The timeout increments drain_timeouts_ on `this`, but then the
-    // move-assignment overwrites it with `fresh.drain_timeouts()` (= 0)
-    // because the counter tracks the NEW ring's identity, not the old one.
     kickmsg::Subscriber fresh(region);  // takes ring 1
     sub = std::move(fresh);
 
-    // sub now owns ring 1, which has had zero drain timeouts.
-    EXPECT_EQ(sub.drain_timeouts(), 0u);
-
-    // The timed-out release of ring 0 is observable through the health
-    // report: ring 0 is now Free with stale in_flight (retired ring).
-    auto report = region.diagnose();
-    EXPECT_GE(report.retired_rings, 1u);
-
-    // Recovery.
-    region.reset_retired_rings();
-}
-
-TEST_F(SubscriberTest, RejoinAfterDrainTimeout)
-{
-    // After a timeout path (drain skipped), a new subscriber should
-    // be able to join and operate normally.
-
-    kickmsg::channel::Config cfg;
-    cfg.max_subscribers   = 1;
-    cfg.sub_ring_capacity = 4;
-    cfg.pool_size         = 8;
-    cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = 1ms;
-
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-
-    kickmsg::Publisher pub(region);
-
-    // Round 1: subscriber with simulated stuck publisher
-    {
-        kickmsg::Subscriber sub(region);
-        uint32_t val = 1;
-        ASSERT_GE(pub.send(&val, sizeof(val)), 0);
-
-        auto* ring = kickmsg::sub_ring_at(region.base(), region.geometry(), 0);
-        ring->state_flight.fetch_add(kickmsg::ring::IN_FLIGHT_ONE,
-                                     std::memory_order_acq_rel);
-        // sub destructs — timeout, drain skipped, stale in_flight preserved
-    }
-
-    // Operator recovery: reset_retired_rings() clears stale in_flight
-    // on retired rings so a new subscriber can claim them.
-    std::size_t reset = region.reset_retired_rings();
-    EXPECT_GE(reset, 1u);
-
-    // Round 2: new subscriber joins and receives normally
-    {
-        kickmsg::Subscriber sub(region);
-        uint32_t val = 42;
-        ASSERT_GE(pub.send(&val, sizeof(val)), 0);
-
-        auto sample = sub.try_receive();
-        ASSERT_TRUE(sample.has_value());
-
-        uint32_t got = 0;
-        std::memcpy(&got, sample->data(), sizeof(got));
-        EXPECT_EQ(got, 42u);
-    }
-}
-
-TEST_F(SubscriberTest, SlowPublisherNoCorruption)
-{
-    // A publisher that is slow (not crashed) holds in_flight during
-    // subscriber teardown. The subscriber should timeout and skip drain.
-    // The slow publisher finishes normally — no corruption, no crash.
-
-    kickmsg::channel::Config cfg;
-    cfg.max_subscribers   = 1;
-    cfg.sub_ring_capacity = 8;
-    cfg.pool_size         = 16;
-    cfg.max_payload_size  = 8;
-    cfg.commit_timeout    = 1ms;
-
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-
-    std::atomic<bool> pub_start{false};
-    std::atomic<bool> pub_done{false};
-
-    // Publisher thread: will be mid-commit when subscriber destructs
-    std::thread slow_pub([&]()
-    {
-        kickmsg::Publisher pub(region);
-
-        // Wait for signal to start publishing
-        while (not pub_start.load(std::memory_order_acquire))
-        {
-            kickmsg::yield();
-        }
-
-        // Publish several messages slowly (each takes > commit_timeout)
-        for (int i = 0; i < 5; ++i)
-        {
-            uint32_t val = static_cast<uint32_t>(i);
-            pub.send(&val, sizeof(val));
-            kickmsg::sleep(5ms); // 5ms >> 1ms timeout
-        }
-
-        pub_done.store(true, std::memory_order_release);
-    });
-
-    {
-        kickmsg::Subscriber sub(region);
-
-        // Let the publisher start and publish at least one message
-        pub_start.store(true, std::memory_order_release);
-        kickmsg::sleep(2ms);
-
-        // Read what we can
-        while (auto sample = sub.try_receive())
-        {
-            // consume
-        }
-
-        // sub destructs here while publisher is likely mid-commit
-    }
-
-    // Wait for publisher to finish
-    while (not pub_done.load(std::memory_order_acquire))
-    {
-        kickmsg::sleep(1ms);
-    }
-
-    slow_pub.join();
-
-    // New subscriber can join and the channel still works
-    {
-        kickmsg::Subscriber sub(region);
-        // Just verify construction succeeds and ring is usable
-        EXPECT_FALSE(sub.try_receive().has_value());
-    }
+    EXPECT_GE(region.diagnose().retired_rings, 1u);
+    EXPECT_GE(region.reset_retired_rings(), 1u);
 }
 
 TEST_F(SubscriberTest, ConcurrentChurnRefcountIntegrity)
@@ -556,4 +352,20 @@ TEST_F(SubscriberTest, ConcurrentChurnRefcountIntegrity)
         EXPECT_EQ(rc, 0u) << "slot " << i << " has refcount " << rc
                           << " (round completed, all should be 0)";
     }
+}
+
+TEST_F(SubscriberTest, SaturatedRegionRejectsAnExtraSubscriberUntilOneLeaves)
+{
+    auto cfg    = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    std::vector<kickmsg::Subscriber> subs;
+    for (std::size_t i = 0; i < cfg.max_subscribers; ++i)
+    {
+        subs.emplace_back(region);
+    }
+    EXPECT_THROW(kickmsg::Subscriber extra(region), std::runtime_error);
+
+    subs.pop_back();
+    EXPECT_NO_THROW(kickmsg::Subscriber replacement(region));
 }

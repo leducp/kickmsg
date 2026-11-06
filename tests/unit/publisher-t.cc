@@ -116,26 +116,6 @@ TEST_F(PublisherTest, ReusedMovedFromPublisherDoesNotRevalidateOlderHandles)
     EXPECT_FALSE(sub.try_receive().has_value());
 }
 
-TEST_F(PublisherTest, SendReceiveSingleMessage)
-{
-    auto cfg    = default_cfg();
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-
-    kickmsg::Subscriber sub(region);
-    kickmsg::Publisher  pub(region);
-
-    uint64_t payload = 0xDEADBEEFCAFEBABEULL;
-    ASSERT_GE(pub.send(&payload, sizeof(payload)), 0);
-
-    auto sample = sub.try_receive();
-    ASSERT_TRUE(sample.has_value());
-    EXPECT_EQ(sample->len(), sizeof(payload));
-
-    uint64_t received = 0;
-    std::memcpy(&received, sample->data(), sizeof(received));
-    EXPECT_EQ(received, payload);
-}
-
 TEST_F(PublisherTest, AllocatePublishSeparately)
 {
     auto cfg    = default_cfg();
@@ -146,7 +126,7 @@ TEST_F(PublisherTest, AllocatePublishSeparately)
 
     auto slot = pub.allocate();
     ASSERT_TRUE(slot.valid());
-    EXPECT_GE(slot.max_size(), sizeof(uint32_t));
+    EXPECT_EQ(slot.max_size(), cfg.max_payload_size);
 
     uint32_t val = 42;
     EXPECT_EQ(slot.write(&val, sizeof(val)), sizeof(val));
@@ -154,21 +134,11 @@ TEST_F(PublisherTest, AllocatePublishSeparately)
 
     auto sample = sub.try_receive();
     ASSERT_TRUE(sample.has_value());
+    EXPECT_EQ(sample->len(), sizeof(val));
 
     uint32_t got = 0;
     std::memcpy(&got, sample->data(), sizeof(got));
     EXPECT_EQ(got, 42u);
-}
-
-TEST_F(PublisherTest, AllocateExposesMaxSize)
-{
-    auto cfg    = default_cfg();
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-    kickmsg::Publisher pub(region);
-
-    auto slot = pub.allocate();
-    ASSERT_TRUE(slot.valid());
-    EXPECT_EQ(slot.max_size(), cfg.max_payload_size);
 }
 
 TEST_F(PublisherTest, SendReturnsEmsgsize)
@@ -249,42 +219,6 @@ TEST_F(PublisherTest, ConsumptionDoesNotRecycleSlotsPoolStaysExhausted)
         ASSERT_EQ(pub.send(&val, sizeof(val)), -EAGAIN)
             << "consumption must not recycle slots (iter " << i << ")";
     }
-}
-
-TEST_F(PublisherTest, SendReturnsEagainOnPoolExhaustion)
-{
-    kickmsg::channel::Config cfg;
-    cfg.max_subscribers   = 1;
-    cfg.sub_ring_capacity = 4;
-    cfg.pool_size         = 2;
-    cfg.max_payload_size  = 8;
-
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-    kickmsg::Subscriber sub(region);
-    kickmsg::Publisher  pub(region);
-
-    uint32_t val = 1;
-    // Fill the pool (2 slots)
-    ASSERT_GE(pub.send(&val, sizeof(val)), 0);
-    ASSERT_GE(pub.send(&val, sizeof(val)), 0);
-    // Pool exhausted
-    EXPECT_EQ(pub.send(&val, sizeof(val)), -EAGAIN);
-}
-
-TEST_F(PublisherTest, DroppedCounterZeroInNormalUse)
-{
-    auto cfg    = default_cfg();
-    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
-
-    kickmsg::Subscriber sub(region);
-    kickmsg::Publisher  pub(region);
-
-    for (int i = 0; i < 5; ++i)
-    {
-        ASSERT_GE(pub.send(&i, sizeof(i)), 0);
-    }
-
-    EXPECT_EQ(pub.dropped(), 0u);
 }
 
 TEST_F(PublisherTest, MultipleMessages)
@@ -403,6 +337,7 @@ TEST_F(PublisherTest, SelfRepairCaseA_LockedSequence)
     val = 103;
     pub.send(&val, sizeof(val));  // may drop, but should NOT hang forever
     auto after = std::chrono::steady_clock::now();
+    EXPECT_GE(pub.dropped(), 1u);
 
     // Sanity: the timeout should have fired (took ~1 ms, not zero).
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(

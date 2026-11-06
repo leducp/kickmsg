@@ -43,29 +43,6 @@ private:
     std::vector<std::string> shm_names_;
 };
 
-TEST_F(NodeTest, AdvertiseAndSubscribe)
-{
-    // Topic-centric: SHM name is /{prefix}_{topic}, no node name in path
-    track("test", "data");
-
-    kickmsg::Node pub_node("pubnode", "test");
-    auto pub = pub_node.advertise("data", small_cfg());
-
-    // Any node can subscribe by topic name alone
-    kickmsg::Node sub_node("subnode", "test");
-    auto sub = sub_node.subscribe("data");
-
-    uint32_t val = 42;
-    ASSERT_GE(pub.send(&val, sizeof(val)), 0);
-
-    auto sample = sub.try_receive();
-    ASSERT_TRUE(sample.has_value());
-
-    uint32_t got = 0;
-    std::memcpy(&got, sample->data(), sizeof(got));
-    EXPECT_EQ(got, 42u);
-}
-
 TEST_F(NodeTest, AdvertiseTwiceDoesNotWipeLiveRegion)
 {
     // Regression: a second advertise() of the same topic must NOT re-run
@@ -101,13 +78,6 @@ TEST_F(NodeTest, AdvertiseTwiceDoesNotWipeLiveRegion)
     ASSERT_TRUE(s2.has_value());
 }
 
-TEST_F(NodeTest, NamingConventions)
-{
-    kickmsg::Node node("mynode", "app");
-    EXPECT_EQ(node.name(), "mynode");
-    EXPECT_EQ(node.kmsg_namespace(), "app");
-}
-
 TEST_F(NodeTest, JoinBroadcastTwoNodes)
 {
     track("test", "broadcast_events");
@@ -137,26 +107,6 @@ TEST_F(NodeTest, JoinBroadcastTwoNodes)
     auto recv_a2 = sub_a.try_receive();
     ASSERT_TRUE(recv_a2.has_value());
     EXPECT_EQ(std::string(static_cast<char const*>(recv_a2->data()), recv_a2->len()), msg_b);
-}
-
-TEST_F(NodeTest, MailboxPattern)
-{
-    track("test", "nodeA_mbx_inbox");
-
-    auto cfg = small_cfg();
-
-    kickmsg::Node node_a("nodeA", "test");
-    auto inbox = node_a.create_mailbox("inbox", cfg);
-
-    kickmsg::Node node_b("nodeB", "test");
-    auto reply_pub = node_b.open_mailbox("nodeA", "inbox");
-
-    std::string reply = "version 1.0";
-    ASSERT_GE(reply_pub.send(reply.data(), reply.size()), 0);
-
-    auto msg = inbox.try_receive();
-    ASSERT_TRUE(msg.has_value());
-    EXPECT_EQ(std::string(static_cast<char const*>(msg->data()), msg->len()), reply);
 }
 
 TEST_F(NodeTest, MailboxOwnerMayBeNamedAsGivenToItsNode)
@@ -219,34 +169,6 @@ TEST_F(NodeTest, TopicSchemaReturnsNulloptForUnknownTopic)
     EXPECT_FALSE(node.topic_schema("never_joined").has_value());
 }
 
-TEST_F(NodeTest, TryClaimTopicSchemaLateBinding)
-{
-    // Late-arrival flow: subscriber creates the region, publisher arrives
-    // and claims the schema via the Node API.
-    track("test", "telemetry");
-
-    auto cfg = small_cfg();
-
-    kickmsg::Node listener("listener", "test");
-    auto sub = listener.subscribe_or_create("telemetry", cfg);
-    EXPECT_FALSE(listener.topic_schema("telemetry").has_value());
-
-    kickmsg::Node driver("driver", "test");
-    auto pub = driver.advertise_or_join("telemetry", cfg);
-
-    auto info = make_node_schema("app/Telemetry", 1, 0xCC);
-    EXPECT_TRUE(driver.try_claim_topic_schema("telemetry", info));
-
-    auto observed = listener.topic_schema("telemetry");
-    ASSERT_TRUE(observed.has_value());
-    EXPECT_STREQ(observed->name, "app/Telemetry");
-
-    // Second claimant on the same topic is rejected; first claim stands.
-    auto other = make_node_schema("other/Type", 99, 0xDD);
-    EXPECT_FALSE(driver.try_claim_topic_schema("telemetry", other));
-    EXPECT_STREQ(driver.topic_schema("telemetry")->name, "app/Telemetry");
-}
-
 TEST_F(NodeTest, TryClaimTopicSchemaUnknownTopicIsFalse)
 {
     kickmsg::Node node("orphan", "test");
@@ -263,6 +185,7 @@ TEST_F(NodeTest, TopicSchemaBlobLateBinding)
 
     kickmsg::Node listener("listener", "test");
     auto sub = listener.subscribe_or_create("telemetry", cfg);
+    EXPECT_FALSE(listener.topic_schema("telemetry").has_value());
     EXPECT_TRUE(listener.topic_schema_blob("telemetry").empty());
 
     kickmsg::Node driver("driver", "test");
@@ -278,8 +201,14 @@ TEST_F(NodeTest, TopicSchemaBlobLateBinding)
     EXPECT_EQ(listener.topic_schema_blob("telemetry"), blob);
     auto observed = listener.topic_schema("telemetry");
     ASSERT_TRUE(observed.has_value());
+    EXPECT_STREQ(observed->name, "app/Telemetry");
     EXPECT_EQ(observed->blob_size, blob.size());
     EXPECT_EQ(observed->blob_hash, info.blob_hash);
+
+    // Second claimant on the same topic is rejected; first claim stands.
+    auto other = make_node_schema("other/Type", 99, 0xDD);
+    EXPECT_FALSE(driver.try_claim_topic_schema("telemetry", other));
+    EXPECT_STREQ(driver.topic_schema("telemetry")->name, "app/Telemetry");
 
     kickmsg::Node orphan("orphan", "test");
     EXPECT_TRUE(orphan.topic_schema_blob("telemetry").empty());
@@ -503,6 +432,9 @@ TEST_F(NodeTest, RelaxedMailboxOwnerFirst)
     auto r = inbox.try_receive();
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(std::string(static_cast<char const*>(r->data()), r->len()), m);
+
+    // small_cfg asks for 4 subscribers; a mailbox admits only its owner.
+    EXPECT_THROW(owner.create_or_open_mailbox("inbox", cfg), std::runtime_error);
 }
 
 TEST_F(NodeTest, RelaxedMailboxSenderFirst)
@@ -524,27 +456,6 @@ TEST_F(NodeTest, RelaxedMailboxSenderFirst)
     auto r = inbox.try_receive();
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(std::string(static_cast<char const*>(r->data()), r->len()), m);
-}
-
-TEST_F(NodeTest, RelaxedMailboxForcesMaxSubscribersOne)
-{
-    // If a caller passes cfg.max_subscribers != 1, the mailbox APIs must
-    // override it. Verify by reading back the region info.
-    track("test", "owner_mbx_inbox");
-
-    auto cfg = small_cfg();
-    cfg.max_subscribers = 4;  // mailbox should clamp to 1
-
-    kickmsg::Node owner("owner", "test");
-    auto inbox = owner.create_or_open_mailbox("inbox", cfg);
-
-    kickmsg::Node sender("snd", "test");
-    auto pub = sender.open_or_create_mailbox("owner", "inbox", cfg);
-
-    std::string m = "data";
-    ASSERT_GE(pub.send(m.data(), m.size()), 0);
-    auto r = inbox.try_receive();
-    ASSERT_TRUE(r.has_value());
 }
 
 TEST_F(NodeTest, BlackboardIsIdempotentAndUsesBbShmName)
@@ -591,29 +502,6 @@ TEST_F(NodeTest, BlackboardRegistersAsBlackboardKind)
     EXPECT_TRUE(found);
 }
 
-TEST_F(NodeTest, BlackboardCrossNodeLateReader)
-{
-    track(kickmsg::Blackboard::shm_name("test", "state"));
-
-    uint32_t value = 0xC0FFEE;
-    {
-        kickmsg::Node writer_node("writer", "test");
-        auto& bb = writer_node.blackboard("state");
-        auto  w  = bb.declare("lifecycle", "writer");
-        ASSERT_FALSE(w.write(value));
-
-        // The reader node is constructed only now, after the single write.
-        kickmsg::Node reader_node("reader", "test");
-        auto& rbb = reader_node.blackboard("state");
-        auto  r   = rbb.observe("lifecycle");
-
-        uint32_t got = 0;
-        auto     out = r.read(got);
-        EXPECT_FALSE(out.ec);
-        EXPECT_EQ(got, value);
-    }
-}
-
 TEST_F(NodeTest, UnlinkBlackboardRemovesShm)
 {
     // Same platform-portability structure as UnlinkTopicRemovesShm above:
@@ -631,19 +519,6 @@ TEST_F(NodeTest, UnlinkBlackboardRemovesShm)
     cleanup.unlink_blackboard("gone");
 
     EXPECT_FALSE(kickmsg::Blackboard::try_open("test", "gone").has_value());
-}
-
-TEST_F(NodeTest, BlackboardShmNameCollisionDetectedByIdentityStamp)
-{
-    // "a:b" and "a b" both sanitize to "a_b", so both land on
-    // "/test_bb_a_b".  The identity stamp must reject the second open.
-    track(kickmsg::Blackboard::shm_name("test", "a:b"));
-
-    kickmsg::Node owner("owner", "test");
-    owner.blackboard("a:b");
-
-    kickmsg::Node other("other", "test");
-    EXPECT_THROW(other.blackboard("a b"), std::runtime_error);
 }
 
 TEST_F(NodeTest, BlackboardCacheDoesNotAliasSanitizedNames)

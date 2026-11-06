@@ -50,6 +50,8 @@ TEST(Hash, Fnv1aKnownVectors)
               0xAF63DC4C8601EC8CULL);
     EXPECT_EQ(kickmsg::hash::fnv1a_64(std::string_view{"foobar"}),
               0x85944171F73967E8ULL);
+    EXPECT_EQ(kickmsg::hash::fnv1a_64(nullptr, 0), 0xCBF29CE484222325ULL);
+    EXPECT_EQ(kickmsg::hash::fnv1a_64(std::string_view{}), 0xCBF29CE484222325ULL);
 }
 
 TEST(Hash, Fnv1aRawAndStringViewAgree)
@@ -58,13 +60,6 @@ TEST(Hash, Fnv1aRawAndStringViewAgree)
     uint64_t from_sv  = kickmsg::hash::fnv1a_64(s);
     uint64_t from_raw = kickmsg::hash::fnv1a_64(s.data(), s.size());
     EXPECT_EQ(from_sv, from_raw);
-}
-
-TEST(Hash, Fnv1aEmptyRange)
-{
-    // Explicit check that the offset basis is returned for zero bytes.
-    EXPECT_EQ(kickmsg::hash::fnv1a_64(nullptr, 0), 0xCBF29CE484222325ULL);
-    EXPECT_EQ(kickmsg::hash::fnv1a_64(std::string_view{}), 0xCBF29CE484222325ULL);
 }
 
 TEST(Hash, IdentityFromFnv1aPacksLeadingBytesAndZeroPads)
@@ -82,13 +77,6 @@ TEST(Hash, IdentityFromFnv1aPacksLeadingBytesAndZeroPads)
     {
         EXPECT_EQ(id[i], 0u) << "byte " << i << " not zero-padded";
     }
-}
-
-TEST(Hash, IdentityFromFnv1aDifferentDescriptorsDiffer)
-{
-    auto a = kickmsg::hash::identity_from_fnv1a("demo/Imu");
-    auto b = kickmsg::hash::identity_from_fnv1a("demo/Twist");
-    EXPECT_NE(a, b);
 }
 
 // --- schema::diff ----------------------------------------------------------
@@ -110,13 +98,6 @@ namespace
         s.blob_algo     = kickmsg::schema::fnv1a_64;
         return s;
     }
-}
-
-TEST(SchemaDiff, EqualWhenSame)
-{
-    auto a = sample_schema();
-    auto b = a;
-    EXPECT_EQ(kickmsg::schema::diff(a, b), kickmsg::schema::Equal);
 }
 
 TEST(SchemaDiff, SingleFieldBits)

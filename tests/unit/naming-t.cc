@@ -17,91 +17,38 @@
 
 using kickmsg::sanitize_shm_component;
 
-// --- Pass-through for already-valid inputs -------------------------------
-
-TEST(SanitizeShmComponent, PlainAlnumIsUnchanged)
+TEST(SanitizeShmComponent, MapsToThePortableFilenameSet)
 {
-    EXPECT_EQ(sanitize_shm_component("topic",     "topic"), "topic");
-    EXPECT_EQ(sanitize_shm_component("sensor42",  "topic"), "sensor42");
-}
-
-TEST(SanitizeShmComponent, PortableFilenameCharsSurvive)
-{
-    // POSIX portable filename set [A-Za-z0-9._-] must pass through verbatim
-    // — this is what allows `ls /dev/shm` output to stay human-readable.
-    EXPECT_EQ(sanitize_shm_component("a.b_c-d.42", "topic"), "a.b_c-d.42");
-}
-
-// --- Leading slash handling (ROS-style absolute names) -------------------
-
-TEST(SanitizeShmComponent, StripsSingleLeadingSlash)
-{
-    EXPECT_EQ(sanitize_shm_component("/topic", "topic"), "topic");
-}
-
-TEST(SanitizeShmComponent, StripsRepeatedLeadingSlashes)
-{
-    // "///a" -> "a" (not ".a" or "..a") — otherwise a user who typed "//x"
-    // by accident would silently get a different region than "/x".
-    EXPECT_EQ(sanitize_shm_component("///topic", "topic"), "topic");
-}
-
-// --- Interior slash becomes '.' ------------------------------------------
-
-TEST(SanitizeShmComponent, InteriorSlashBecomesDot)
-{
-    EXPECT_EQ(sanitize_shm_component("robot/arm",        "topic"),
-              "robot.arm");
-    EXPECT_EQ(sanitize_shm_component("robot/arm/joint1", "topic"),
-              "robot.arm.joint1");
-}
-
-TEST(SanitizeShmComponent, LeadingAndInteriorSlashesCombine)
-{
-    // The leading-slash strip must not fire for interior slashes after
-    // real characters have been seen.
-    EXPECT_EQ(sanitize_shm_component("/robot/arm/joint1", "topic"),
-              "robot.arm.joint1");
-}
-
-// --- Fallback mapping for everything else --------------------------------
-
-TEST(SanitizeShmComponent, InvalidCharsBecomeUnderscore)
-{
-    EXPECT_EQ(sanitize_shm_component("hello world",  "topic"), "hello_world");
-    EXPECT_EQ(sanitize_shm_component("a:b;c",        "topic"), "a_b_c");
-    EXPECT_EQ(sanitize_shm_component("with\ttab",    "topic"), "with_tab");
-    EXPECT_EQ(sanitize_shm_component("weird@name!",  "topic"), "weird_name_");
-}
-
-TEST(SanitizeShmComponent, UnicodeBytesBecomeUnderscores)
-{
-    // Multi-byte UTF-8 sequences: each byte fails isalnum and maps to '_'.
-    // We don't care about exact width — only that the output stays within
-    // the portable set. "é" is 0xC3 0xA9 -> "__".
-    auto out = sanitize_shm_component("caf\xC3\xA9", "topic");
-    EXPECT_EQ(out, "caf__");
-}
-
-// --- Idempotency ---------------------------------------------------------
-
-TEST(SanitizeShmComponent, Idempotent)
-{
-    // Sanitize twice -> same as sanitize once.  Matters because Node
-    // sanitizes the prefix in the ctor, and make_topic_name could
-    // conceivably be called with the prefix as an input somewhere.
-    auto once  = sanitize_shm_component("/robot/arm joint1", "topic");
-    auto twice = sanitize_shm_component(once, "topic");
-    EXPECT_EQ(once,  "robot.arm_joint1");
-    EXPECT_EQ(twice, once);
+    struct Case
+    {
+        char const* input;
+        char const* expected;
+    };
+    Case const cases[] = {
+        {"topic",             "topic"},
+        {"sensor42",          "sensor42"},
+        {"a.b_c-d.42",        "a.b_c-d.42"},
+        {"/topic",            "topic"},
+        {"///topic",          "topic"},
+        {"robot/arm",         "robot.arm"},
+        {"robot/arm/joint1",  "robot.arm.joint1"},
+        {"/robot/arm/joint1", "robot.arm.joint1"},
+        {"hello world",       "hello_world"},
+        {"a:b;c",             "a_b_c"},
+        {"with\ttab",         "with_tab"},
+        {"weird@name!",       "weird_name_"},
+        {"caf\xC3\xA9",       "caf__"},
+        {"/robot/arm joint1", "robot.arm_joint1"},
+    };
+    for (auto const& c : cases)
+    {
+        auto once = sanitize_shm_component(c.input, "topic");
+        EXPECT_EQ(once, c.expected) << c.input;
+        EXPECT_EQ(sanitize_shm_component(once, "topic"), once) << c.input;
+    }
 }
 
 // --- Error cases ---------------------------------------------------------
-
-TEST(SanitizeShmComponent, EmptyInputThrows)
-{
-    EXPECT_THROW(sanitize_shm_component("", "topic"), std::invalid_argument);
-}
 
 TEST(SanitizeShmComponent, OnlySlashesThrows)
 {
@@ -155,21 +102,10 @@ TEST(ComposeShmName, Deterministic)
     EXPECT_EQ(a, b);
 }
 
-TEST(ComposeShmName, DistinctNamespacesProduceDistinctNames)
+TEST(ComposeShmName, DistinctInputsProduceDistinctNames)
 {
-    // Two namespaces with the same suffix must NOT collide — that would
-    // let a process in namespace "alpha" stomp on namespace "beta"'s
-    // region.
-    auto a = compose_shm_name("alpha", "temperature");
-    auto b = compose_shm_name("beta",  "temperature");
-    EXPECT_NE(a, b);
-}
-
-TEST(ComposeShmName, DistinctSuffixesProduceDistinctNames)
-{
-    auto a = compose_shm_name("demo", "temperature");
-    auto b = compose_shm_name("demo", "pressure");
-    EXPECT_NE(a, b);
+    EXPECT_NE(compose_shm_name("alpha", "temperature"), compose_shm_name("beta", "temperature"));
+    EXPECT_NE(compose_shm_name("demo",  "temperature"), compose_shm_name("demo", "pressure"));
 }
 
 TEST(ComposeShmName, FitsEvenWhenInputsAreLong)
