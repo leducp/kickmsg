@@ -1648,6 +1648,11 @@ Time             kickmsg/os/           clock_nanosleep    nanosleep          Que
 The ABI has been stable since macOS 10.12 and is used internally by libc++
 and libdispatch, but Apple has not published a formal stability guarantee.
 
+On Windows, `SharedMemory::create()` rejects an already existing mapping.
+Windows cannot unlink a live mapping as POSIX does; reopening and stamping
+it would overwrite live peers' state. Use `try_create()` / `create_or_open()`
+when joining an existing mapping is intended.
+
 **Windows limitation.** `WakeByAddressAll` wakes only the calling process.
 A blocking `receive()` or Blackboard wait may sleep until timeout when the
 writer is in another process. Unread messages can overflow the ring during

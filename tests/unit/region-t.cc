@@ -108,6 +108,23 @@ TEST_F(RegionTest, OpenNonexistentThrows)
     EXPECT_THROW(kickmsg::SharedRegion::open("/kickmsg_nonexistent_42"), std::runtime_error);
 }
 
+#ifdef _WIN32
+TEST_F(RegionTest, CreateRejectsExistingWindowsMapping)
+{
+    auto cfg = default_cfg();
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    kickmsg::Subscriber sub(region);
+    kickmsg::Publisher pub(region);
+    ASSERT_EQ(pub.send("intact", 7), 7);
+
+    EXPECT_THROW(kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg),
+                 std::exception);
+    auto sample = sub.try_receive();
+    ASSERT_TRUE(sample.has_value());
+    EXPECT_EQ(std::memcmp(sample->data(), "intact", 7), 0);
+}
+#endif
+
 #ifndef _WIN32
 TEST(SharedMemoryTest, TryOpenOnSizeZeroSegmentReturnsFalse)
 {

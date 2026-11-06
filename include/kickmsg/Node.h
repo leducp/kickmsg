@@ -62,6 +62,9 @@ namespace kickmsg
         // Strict variants assume a fixed startup order:
         //   advertise() creates the region (publisher must arrive first),
         //   subscribe() opens an existing one (subscriber arrives later).
+        // On Windows, advertise() and create_mailbox() throw while any process
+        // still maps the name (e.g. a restarted publisher with live subscribers);
+        // use the *_or_* variants there.
         //
         // The *_or_* variants relax that: either side may be the first to
         // materialize the region, mirroring join_broadcast()'s behavior.

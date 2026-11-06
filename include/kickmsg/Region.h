@@ -93,8 +93,9 @@ namespace kickmsg
 
         /// Create a fresh region under `name`, replacing any existing
         /// object: peers keep their old (orphaned) mapping, never a
-        /// truncated one.  Single-creator only; concurrent creators must
-        /// use create_or_open().
+        /// truncated one.  On Windows a mapping still held by any process
+        /// cannot be replaced and throws.  Single-creator only; concurrent
+        /// creators must use create_or_open().
         static SharedRegion create(char const* name, channel::Type type,
                                    channel::Config const& cfg,
                                    char const* creator_name = "");

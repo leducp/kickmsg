@@ -39,8 +39,9 @@ namespace kickmsg
 
         /// Create a new region of \p size bytes.  An existing object under
         /// this name is unlinked and replaced: peers keep their old mapping,
-        /// never a truncated one.  Single-creator only; concurrent creators
-        /// must go through try_create.
+        /// never a truncated one.  On Windows, where a live mapping cannot be
+        /// unlinked, an existing mapping throws instead.  Single-creator only;
+        /// concurrent creators must go through try_create.
         void create(std::string const& name, std::size_t size);
 
         /// Attempt to create a new shared-memory region.
