@@ -33,7 +33,7 @@ jobs:
             configure_args: "--with=benchmarks"
 
           # macOS (Apple Silicon)
-          - os: macos-14
+          - os: macos-15
             label: macos-tests
             configure_args: "--with=unit_tests --with=examples"
 
@@ -130,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     env:
       # Build for the runner's own architecture.
       CIBW_ARCHS: native
