@@ -12,6 +12,42 @@ namespace kickmsg
         ring->owner_starttime.store(0, std::memory_order_relaxed);
     }
 
+    void store_words(std::atomic<uint64_t>* shared, void const* src, std::size_t len)
+    {
+        auto const* in   = static_cast<uint8_t const*>(src);
+        std::size_t full = len / sizeof(uint64_t);
+        for (std::size_t w = 0; w < full; ++w)
+        {
+            uint64_t word;
+            std::memcpy(&word, in + w * sizeof(uint64_t), sizeof(word));
+            shared[w].store(word, std::memory_order_relaxed);
+        }
+        std::size_t rest = len % sizeof(uint64_t);
+        if (rest != 0)
+        {
+            uint64_t word = 0;
+            std::memcpy(&word, in + full * sizeof(uint64_t), rest);
+            shared[full].store(word, std::memory_order_relaxed);
+        }
+    }
+
+    void load_words(void* dst, std::atomic<uint64_t> const* shared, std::size_t len)
+    {
+        auto*       out  = static_cast<uint8_t*>(dst);
+        std::size_t full = len / sizeof(uint64_t);
+        for (std::size_t w = 0; w < full; ++w)
+        {
+            uint64_t word = shared[w].load(std::memory_order_relaxed);
+            std::memcpy(out + w * sizeof(uint64_t), &word, sizeof(word));
+        }
+        std::size_t rest = len % sizeof(uint64_t);
+        if (rest != 0)
+        {
+            uint64_t word = shared[full].load(std::memory_order_relaxed);
+            std::memcpy(out + full * sizeof(uint64_t), &word, rest);
+        }
+    }
+
     SubRingHeader* sub_ring_at(void* base, Geometry const& geometry, uint32_t idx)
     {
         auto* p = static_cast<uint8_t*>(base) + geometry.sub_rings_offset;
@@ -55,6 +91,7 @@ namespace kickmsg
         h = hash::fnv1a_64(cfg.pool_size,              h);
         h = hash::fnv1a_64(cfg.max_payload_size,       h);
         h = hash::fnv1a_64(cfg.commit_timeout.count(), h);
+        h = hash::fnv1a_64(cfg.schema_capacity,        h);
         return h;
     }
 
@@ -70,7 +107,10 @@ namespace kickmsg
             if (std::strncmp(a.name, b.name, sizeof(a.name)) != 0) d |= Name;
             if (a.identity_algo != b.identity_algo) d |= IdentityAlgo;
             if (a.layout_algo   != b.layout_algo)   d |= LayoutAlgo;
-            // Ignore reserved fields for forward compatibility.
+            if (a.blob_hash     != b.blob_hash)     d |= Blob;
+            if (a.blob_algo     != b.blob_algo)     d |= BlobAlgo;
+            // Ignore reserved fields for forward compatibility, and blob_size: a
+            // reader's expected descriptor cannot know the length the library stamps.
             return d;
         }
     }

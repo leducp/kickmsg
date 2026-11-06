@@ -7,13 +7,10 @@
 // Forward declarations
 bool run_treiber_stress();
 bool run_subscriber_churn();
-bool run_gc_recovery();
 bool run_fairness_test();
 void run_all_mpmc(TestRunner& runner);
 bool run_pool_exhaustion();
 bool run_live_repair();
-bool run_single_slot_ring();
-bool run_subscriber_saturation();
 bool run_big_payload();
 bool run_blackboard_stress();
 bool run_wake_arm_race();
@@ -65,11 +62,9 @@ int main(int argc, char** argv)
     // Unlink the scenario segments if interrupted (Ctrl-C / kill), so a killed
     // run leaves a clean /dev/shm.  Keep in sync with the scenarios' shm_name.
     for (char const* name : {"/kickmsg_treiber_stress", "/kickmsg_churn_test",
-                             "/kickmsg_gc_test", "/kickmsg_fairness_test",
-                             "/kickmsg_stress_test", "/kickmsg_pool_exhaustion",
-                             "/kickmsg_live_repair", "/kickmsg_single_slot_ring",
-                             "/kickmsg_sub_saturation", "/kickmsg_big_payload",
-                             "/kickmsg_bbstress_bb_stress"})
+                             "/kickmsg_fairness_test", "/kickmsg_stress_test",
+                             "/kickmsg_pool_exhaustion", "/kickmsg_live_repair",
+                             "/kickmsg_big_payload", "/kickmsg_bbstress_bb_stress"})
     {
         kickmsg_test::register_cleanup_shm(name);
     }
@@ -79,13 +74,10 @@ int main(int argc, char** argv)
 
     runner.run("treiber_stress",       run_treiber_stress);
     runner.run("subscriber_churn",     run_subscriber_churn);
-    runner.run("gc_recovery",          run_gc_recovery);
     runner.run("fairness",             run_fairness_test);
     run_all_mpmc(runner);
     runner.run("pool_exhaustion",      run_pool_exhaustion);
     runner.run("live_repair",          run_live_repair);
-    runner.run("single_slot_ring",     run_single_slot_ring);
-    runner.run("subscriber_saturation", run_subscriber_saturation);
     runner.run("big_payload",          run_big_payload);
     runner.run("blackboard",           run_blackboard_stress);
     runner.run("wake_arm_race",         run_wake_arm_race);

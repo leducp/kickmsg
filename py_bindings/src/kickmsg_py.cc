@@ -161,6 +161,30 @@ namespace
         std::memset(s.name, 0, sizeof(s.name));
         std::memcpy(s.name, name.data(), n);
     }
+
+    nb::bytes fingerprint_bytes(std::array<uint8_t, 64> const& fingerprint)
+    {
+        return nb::bytes(reinterpret_cast<char const*>(fingerprint.data()), fingerprint.size());
+    }
+
+    void set_fingerprint(std::array<uint8_t, 64>& fingerprint, nb::bytes const& bytes, char const* error)
+    {
+        if (bytes.size() != fingerprint.size())
+        {
+            throw nb::value_error(error);
+        }
+        std::memcpy(fingerprint.data(), bytes.c_str(), fingerprint.size());
+    }
+
+    std::span<uint8_t const> bytes_span(nb::bytes const& bytes)
+    {
+        return {reinterpret_cast<uint8_t const*>(bytes.c_str()), bytes.size()};
+    }
+
+    nb::bytes vector_bytes(std::vector<uint8_t> const& data)
+    {
+        return nb::bytes(reinterpret_cast<char const*>(data.data()), data.size());
+    }
 }
 
 namespace kickmsg
@@ -191,6 +215,16 @@ namespace kickmsg
                 { c.commit_timeout = us; },
                 "Commit timeout as a timedelta (microsecond resolution).")
             .def_rw("schema", &channel::Config::schema)
+            .def_rw("schema_capacity", &channel::Config::schema_capacity,
+                "Bytes reserved for the schema blob. Part of the config hash.")
+            .def_prop_rw("schema_blob",
+                [](channel::Config const& c) { return vector_bytes(c.schema_blob); },
+                [](channel::Config& c, nb::bytes const& b)
+                {
+                    auto view = bytes_span(b);
+                    c.schema_blob.assign(view.begin(), view.end());
+                },
+                "Schema blob baked with `schema` at create time. Ignored on open.")
             .def_rw("identity", &channel::Config::identity,
                 "Optional logical-identity fingerprint stamped into the "
                 "region header at create time and verified at open when "
@@ -208,31 +242,17 @@ namespace kickmsg
         nb::class_<SchemaInfo>(m, "SchemaInfo")
             .def(nb::init<>())
             .def_prop_rw("identity",
-                [](SchemaInfo const& s) -> nb::bytes
-                { return nb::bytes(reinterpret_cast<char const*>(s.identity.data()),
-                                   s.identity.size()); },
+                [](SchemaInfo const& s) { return fingerprint_bytes(s.identity); },
                 [](SchemaInfo& s, nb::bytes const& b)
-                {
-                    if (b.size() != s.identity.size())
-                    {
-                        throw nb::value_error(
-                            "SchemaInfo.identity must be exactly 64 bytes");
-                    }
-                    std::memcpy(s.identity.data(), b.c_str(), s.identity.size());
-                })
+                { set_fingerprint(s.identity, b, "SchemaInfo.identity must be exactly 64 bytes"); })
             .def_prop_rw("layout",
-                [](SchemaInfo const& s) -> nb::bytes
-                { return nb::bytes(reinterpret_cast<char const*>(s.layout.data()),
-                                   s.layout.size()); },
+                [](SchemaInfo const& s) { return fingerprint_bytes(s.layout); },
                 [](SchemaInfo& s, nb::bytes const& b)
-                {
-                    if (b.size() != s.layout.size())
-                    {
-                        throw nb::value_error(
-                            "SchemaInfo.layout must be exactly 64 bytes");
-                    }
-                    std::memcpy(s.layout.data(), b.c_str(), s.layout.size());
-                })
+                { set_fingerprint(s.layout, b, "SchemaInfo.layout must be exactly 64 bytes"); })
+            .def_prop_rw("blob_hash",
+                [](SchemaInfo const& s) { return fingerprint_bytes(s.blob_hash); },
+                [](SchemaInfo& s, nb::bytes const& b)
+                { set_fingerprint(s.blob_hash, b, "SchemaInfo.blob_hash must be exactly 64 bytes"); })
             .def_prop_rw("name",
                 [](SchemaInfo const& s) -> std::string { return schema_name_str(s); },
                 [](SchemaInfo& s, std::string const& n) { set_schema_name(s, n); })
@@ -240,6 +260,9 @@ namespace kickmsg
             .def_rw("identity_algo", &SchemaInfo::identity_algo)
             .def_rw("layout_algo",   &SchemaInfo::layout_algo)
             .def_rw("flags",         &SchemaInfo::flags)
+            .def_rw("blob_algo",     &SchemaInfo::blob_algo)
+            .def_ro("blob_size",     &SchemaInfo::blob_size,
+                "Set by the library from the claimed blob; any value written here is ignored.")
             .def("__repr__", [](SchemaInfo const& s)
             {
                 return "SchemaInfo(name='" + schema_name_str(s) +
@@ -254,9 +277,44 @@ namespace kickmsg
             .value("Version",      schema::Version)
             .value("Name",         schema::Name)
             .value("IdentityAlgo", schema::IdentityAlgo)
-            .value("LayoutAlgo",   schema::LayoutAlgo);
+            .value("LayoutAlgo",   schema::LayoutAlgo)
+            .value("Blob",         schema::Blob)
+            .value("BlobAlgo",     schema::BlobAlgo);
         schema_mod.def("diff", &schema::diff, "a"_a, "b"_a,
             "Return a schema.Diff bitmask of the fields that differ.");
+        nb::enum_<schema::Algo>(schema_mod, "Algo", nb::is_arithmetic())
+            .value("unspecified", schema::unspecified)
+            .value("fnv1a_64",    schema::fnv1a_64)
+            .value("xxh64",       schema::xxh64)
+            .value("xxh3_64",     schema::xxh3_64)
+            .value("xxh3_128",    schema::xxh3_128)
+            .value("crc32c",      schema::crc32c)
+            .value("md5",         schema::md5)
+            .value("sha1",        schema::sha1)
+            .value("sha256",      schema::sha256)
+            .value("sha384",      schema::sha384)
+            .value("sha512",      schema::sha512)
+            .value("sha3_256",    schema::sha3_256)
+            .value("sha3_512",    schema::sha3_512)
+            .value("blake2s_256", schema::blake2s_256)
+            .value("blake2b_256", schema::blake2b_256)
+            .value("blake2b_512", schema::blake2b_512)
+            .value("blake3_256",  schema::blake3_256)
+            .value("user_base",   schema::user_base);
+        schema_mod.def("digest_size", &schema::digest_size, "algo"_a,
+            "Digest length in bytes; 0 for unspecified, unknown, and user-defined tags.");
+        schema_mod.def("algo_name",
+            [](uint32_t algo) -> nb::object
+            {
+                char const* name = schema::algo_name(algo);
+                if (name == nullptr)
+                {
+                    return nb::none();
+                }
+                return nb::str(name);
+            },
+            "algo"_a,
+            "Lowercase algorithm name, or None for unspecified, unknown, and user-defined tags.");
 
         // hash submodule
 
@@ -352,6 +410,7 @@ namespace kickmsg
             .def_ro("pool_size",         &RegionInfo::pool_size)
             .def_ro("max_payload_size",  &RegionInfo::max_payload_size)
             .def_ro("commit_timeout_us", &RegionInfo::commit_timeout_us)
+            .def_ro("schema_capacity",   &RegionInfo::schema_capacity)
             .def_ro("creator_pid",       &RegionInfo::creator_pid)
             .def_ro("creator_name",      &RegionInfo::creator_name)
             .def_ro("created_at_ns",     &RegionInfo::created_at_ns)
@@ -384,7 +443,13 @@ namespace kickmsg
             .def_prop_ro("name",         &SharedRegion::name)
             .def_prop_ro("channel_type", &SharedRegion::channel_type)
             .def("schema",               &SharedRegion::schema)
-            .def("try_claim_schema",   &SharedRegion::try_claim_schema,   "info"_a)
+            .def("schema_blob",
+                [](SharedRegion const& r) { return vector_bytes(r.schema_blob()); },
+                "Published schema blob; empty while unset, claiming, or absent.")
+            .def("try_claim_schema",
+                [](SharedRegion& r, SchemaInfo const& info, nb::bytes const& blob)
+                { return r.try_claim_schema(info, bytes_span(blob)); },
+                "info"_a, "blob"_a = nb::bytes("", 0))
             .def("reset_schema_claim", &SharedRegion::reset_schema_claim)
             .def("diagnose",               &SharedRegion::diagnose)
             .def("stats",                  &SharedRegion::stats,
@@ -1025,8 +1090,13 @@ namespace kickmsg
                 },
                 "tag"_a, "owner_node"_a = nb::none())
             .def("topic_schema",           &Node::topic_schema,           "topic"_a)
-            .def("try_claim_topic_schema", &Node::try_claim_topic_schema,
-                 "topic"_a, "info"_a)
+            .def("topic_schema_blob",
+                [](Node const& n, char const* topic) { return vector_bytes(n.topic_schema_blob(topic)); },
+                "topic"_a)
+            .def("try_claim_topic_schema",
+                [](Node& n, char const* topic, SchemaInfo const& info, nb::bytes const& blob)
+                { return n.try_claim_topic_schema(topic, info, bytes_span(blob)); },
+                "topic"_a, "info"_a, "blob"_a = nb::bytes("", 0))
             .def_prop_ro("name",      &Node::name)
             .def_prop_ro("namespace", &Node::kmsg_namespace)
             .def("__repr__", [](Node const& n)

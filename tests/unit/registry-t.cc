@@ -61,15 +61,16 @@ private:
     std::vector<std::string> shm_to_unlink_;
 };
 
-TEST_F(RegistryTest, OpenOrCreateIsIdempotent)
+TEST_F(RegistryTest, OpenOrCreateReusesTheExistingRegion)
 {
-    auto r1 = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
-    EXPECT_EQ(r1.name(), registry_shm());
+    auto created = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 8);
+    EXPECT_EQ(created.name(), registry_shm());
+    EXPECT_EQ(created.capacity(), 8u);
 
-    // Second call opens the existing region — same name, same capacity.
-    auto r2 = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
-    EXPECT_EQ(r1.capacity(), r2.capacity());
-    EXPECT_EQ(r1.name(), r2.name());
+    // Capacity comes from the existing region, not the requested one.
+    auto opened = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1024);
+    EXPECT_EQ(opened.capacity(), 8u);
+    EXPECT_EQ(opened.name(), created.name());
 }
 
 TEST_F(RegistryTest, RegisterAndSnapshotRoundTrip)
@@ -149,16 +150,6 @@ TEST_F(RegistryTest, CapacityExhaustionReturnsInvalidSlot)
     EXPECT_NE(reclaimed, kickmsg::INVALID_SLOT);
 }
 
-TEST_F(RegistryTest, VersionMismatchOnSmallerExistingRegionThrows)
-{
-    auto created = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 8);
-    EXPECT_EQ(created.capacity(), 8u);
-
-    auto opened = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1024);
-    // Capacity from the existing region, not the requested one.
-    EXPECT_EQ(opened.capacity(), 8u);
-}
-
 TEST_F(RegistryTest, OpenRejectsCorruptCapacity)
 {
     // Change the stored capacity so the entry array exceeds the mapping.
@@ -173,26 +164,43 @@ TEST_F(RegistryTest, OpenRejectsCorruptCapacity)
                  std::runtime_error);
 }
 
-TEST_F(RegistryTest, SweepStaleRemovesDeadPidEntries)
+TEST_F(RegistryTest, SweepStaleReclaimsAnActiveRowWhoseOwnerIsDead)
 {
     auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
 
-    // Live entry — current process pid.
     uint32_t alive = reg.register_participant(
         "/live_topic", "/live_topic", kickmsg::channel::PubSub,
         kickmsg::registry::Pubsub, kickmsg::registry::Publisher, "alive");
     ASSERT_NE(alive, kickmsg::INVALID_SLOT);
+    uint32_t dead = reg.register_participant(
+        "/dead_topic", "/dead_topic", kickmsg::channel::PubSub,
+        kickmsg::registry::Pubsub, kickmsg::registry::Subscriber, "dead");
+    ASSERT_NE(dead, kickmsg::INVALID_SLOT);
 
-    // Live entry for this process (via another participant).
-    reg.register_participant(
-        "/live_topic2", "/live_topic2", kickmsg::channel::PubSub,
-        kickmsg::registry::Pubsub, kickmsg::registry::Subscriber, "alive2");
-
-    EXPECT_EQ(reg.snapshot().size(), 2u);
-
-    // No sweep needed yet — both pids alive.
     EXPECT_EQ(reg.sweep_stale(), 0u);
     EXPECT_EQ(reg.snapshot().size(), 2u);
+
+    kickmsg::SharedMemory raw;
+    raw.open(registry_shm());
+    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
+        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
+    auto& e = entries[dead];
+
+    // Settled Active row, generation left even: only the owner is gone.
+    e.pid.store(0x7fffffff, std::memory_order_release);  // guaranteed-dead PID
+    ASSERT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Active);
+    ASSERT_EQ(e.generation.load(std::memory_order_acquire) & 1u, 0u);
+
+    EXPECT_EQ(reg.sweep_stale(), 1u);
+    EXPECT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Free);
+    EXPECT_EQ(e.pid.load(std::memory_order_acquire), 0u);
+    EXPECT_EQ(e.generation.load(std::memory_order_acquire) & 1u, 0u);
+
+    auto rows = reg.snapshot();
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].node_name, "alive");
+
+    reg.deregister(alive);
 }
 
 TEST_F(RegistryTest, SweepStaleReclaimsWedgedClaimingSlot)
@@ -682,37 +690,6 @@ TEST_F(RegistryTest, AcquireTenancyRefusesAVersionItDidNotValidate)
     reg.deregister(reuse);
 }
 
-TEST_F(RegistryTest, AcquireTenancySucceedsOnceForTheValidatedVersion)
-{
-    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
-
-    kickmsg::SharedMemory raw;
-    raw.open(registry_shm());
-    auto* entries = reinterpret_cast<kickmsg::ParticipantEntry*>(
-        static_cast<uint8_t*>(raw.address()) + sizeof(kickmsg::RegistryHeader));
-    auto& e = entries[0];
-
-    uint32_t slot = reg.register_participant(
-        "/shm", "/topic", kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
-        kickmsg::registry::Publisher, "node");
-    ASSERT_NE(slot, kickmsg::INVALID_SLOT);
-
-    uint32_t const validated = e.generation.load(std::memory_order_acquire);
-    EXPECT_TRUE(kickmsg::acquire_tenancy(e, validated));
-    EXPECT_EQ(e.generation.load(std::memory_order_acquire) & 1u, 1u)
-        << "an acquired row must read as in flux";
-
-    // A second caller holding the same validated version loses.
-    EXPECT_FALSE(kickmsg::acquire_tenancy(e, validated));
-
-    // Put the row back the way sweep_stale's phase 2 would.
-    e.pid.store(0, std::memory_order_relaxed);
-    e.pid_starttime.store(0, std::memory_order_relaxed);
-    uint32_t g = e.generation.load(std::memory_order_relaxed);
-    e.generation.store((g + 2) & ~1u, std::memory_order_relaxed);
-    e.state.store(kickmsg::registry::Free, std::memory_order_release);
-}
-
 TEST_F(RegistryTest, AcquireTenancyRefusesAVersionAnotherAcquirerIsHolding)
 {
     auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 1);
@@ -734,6 +711,9 @@ TEST_F(RegistryTest, AcquireTenancyRefusesAVersionAnotherAcquirerIsHolding)
     uint32_t const held = e.generation.load(std::memory_order_acquire);
     ASSERT_EQ(held & 1u, 1u);
     ASSERT_EQ(e.state.load(std::memory_order_acquire), kickmsg::registry::Active);
+
+    // A second caller holding the same validated version loses.
+    EXPECT_FALSE(kickmsg::acquire_tenancy(e, validated));
 
     // B reads that new version and must be refused.
     EXPECT_FALSE(kickmsg::acquire_tenancy(e, held))
@@ -904,25 +884,6 @@ TEST_F(RegistryTest, NodeAdvertiseRegistersPublisher)
     EXPECT_EQ(reg.snapshot().size(), 0u);
 }
 
-TEST_F(RegistryTest, NodeBroadcastRegistersBoth)
-{
-    kickmsg::channel::Config cfg;
-    cfg.max_subscribers   = 2;
-    cfg.sub_ring_capacity = 4;
-    cfg.pool_size         = 8;
-    cfg.max_payload_size  = 32;
-
-    kickmsg::Node n("bcast_node", KMSG_NAMESPACE);
-    auto bh = n.join_broadcast("chanX", cfg);
-    track(broadcast_shm("chanX"));
-
-    auto reg  = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
-    auto snap = reg.snapshot();
-    ASSERT_EQ(snap.size(), 1u);
-    EXPECT_EQ(snap[0].role,         kickmsg::registry::Both);
-    EXPECT_EQ(snap[0].channel_type, kickmsg::channel::Broadcast);
-}
-
 TEST_F(RegistryTest, NodeAdvertiseThenSubscribeUpgradesToBoth)
 {
     kickmsg::channel::Config cfg;
@@ -941,37 +902,6 @@ TEST_F(RegistryTest, NodeAdvertiseThenSubscribeUpgradesToBoth)
     ASSERT_EQ(snap.size(), 1u);
     EXPECT_EQ(snap[0].role, kickmsg::registry::Both);
     EXPECT_EQ(snap[0].node_name, "dual_node");
-}
-
-TEST_F(RegistryTest, MultipleNodesEachAppearOnce)
-{
-    kickmsg::channel::Config cfg;
-    cfg.max_subscribers   = 4;
-    cfg.sub_ring_capacity = 4;
-    cfg.pool_size         = 8;
-    cfg.max_payload_size  = 32;
-
-    kickmsg::Node pub("pub_a", KMSG_NAMESPACE);
-    auto p = pub.advertise("shared", cfg);
-    track(topic_shm("shared"));
-
-    kickmsg::Node s1("sub_a", KMSG_NAMESPACE);
-    auto s1_h = s1.subscribe("shared");
-    kickmsg::Node s2("sub_b", KMSG_NAMESPACE);
-    auto s2_h = s2.subscribe("shared");
-
-    auto reg  = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
-    auto snap = reg.snapshot();
-    EXPECT_EQ(snap.size(), 3u);
-
-    std::unordered_set<std::string> nodes;
-    for (auto const& part : snap)
-    {
-        nodes.insert(part.node_name);
-    }
-    EXPECT_TRUE(nodes.count("pub_a"));
-    EXPECT_TRUE(nodes.count("sub_a"));
-    EXPECT_TRUE(nodes.count("sub_b"));
 }
 
 // list_topics -- topic-centric aggregation
@@ -1005,6 +935,17 @@ TEST_F(RegistryTest, ListTopicsGroupsByShmName)
     EXPECT_EQ(t.stall_producers.size(), 0u);
     EXPECT_EQ(t.stall_consumers.size(), 0u);
     EXPECT_EQ(t.producers[0].node_name, "pub_a");
+
+    auto snap = reg.snapshot();
+    EXPECT_EQ(snap.size(), 3u);
+    std::unordered_set<std::string> nodes;
+    for (auto const& part : snap)
+    {
+        nodes.insert(part.node_name);
+    }
+    EXPECT_TRUE(nodes.count("pub_a"));
+    EXPECT_TRUE(nodes.count("sub_a"));
+    EXPECT_TRUE(nodes.count("sub_b"));
 }
 
 TEST_F(RegistryTest, ListTopicsBroadcastRoleBothInEveryLane)
@@ -1022,7 +963,13 @@ TEST_F(RegistryTest, ListTopicsBroadcastRoleBothInEveryLane)
     auto reg    = kickmsg::Registry::open_or_create(KMSG_NAMESPACE);
     auto topics = reg.list_topics();
 
+    auto snap = reg.snapshot();
+    ASSERT_EQ(snap.size(), 1u);
+    EXPECT_EQ(snap[0].role,         kickmsg::registry::Both);
+    EXPECT_EQ(snap[0].channel_type, kickmsg::channel::Broadcast);
+
     ASSERT_EQ(topics.size(), 1u);
+    EXPECT_EQ(topics[0].channel_type, kickmsg::channel::Broadcast);
     // A Both role counts as one producer AND one consumer.
     EXPECT_EQ(topics[0].producers.size(), 1u);
     EXPECT_EQ(topics[0].consumers.size(), 1u);
@@ -1051,4 +998,67 @@ TEST_F(RegistryTest, ListTopicsSortedByShmName)
     ASSERT_EQ(topics.size(), 3u);
     EXPECT_LT(topics[0].shm_name, topics[1].shm_name);
     EXPECT_LT(topics[1].shm_name, topics[2].shm_name);
+}
+
+// Names are read without a lock while a writer reuses the row; under TSan an
+// overlapping byte copy would report, and a torn copy must never be returned.
+TEST_F(RegistryTest, SnapshotNeverReturnsTornNamesDuringRowReuse)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 2);
+
+    std::atomic<bool> done{false};
+    std::atomic<int>  torn{0};
+    std::atomic<int>  seen{0};
+
+    std::thread writer([&]()
+    {
+        for (int i = 0; i < 20000; ++i)
+        {
+            char fill = 'a';
+            if (i % 2 != 0)
+            {
+                fill = 'b';
+            }
+            uint32_t slot = reg.register_participant(
+                "/" + std::string(126, fill), "/" + std::string(126, fill),
+                kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+                kickmsg::registry::Publisher, std::string(63, fill));
+            // Hold the row long enough for snapshots to land both inside and across it.
+            for (int spin = 0; spin < 64; ++spin)
+            {
+                std::this_thread::yield();
+            }
+            reg.deregister(slot);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    auto uniform = [](std::string const& name, std::size_t skip, char fill)
+    {
+        return name.find_first_not_of(fill, skip) == std::string::npos;
+    };
+
+    while (not done.load(std::memory_order_acquire))
+    {
+        for (auto const& p : reg.snapshot())
+        {
+            // Relaxed: only read after writer.join().
+            seen.fetch_add(1, std::memory_order_relaxed);
+            char fill = '?';
+            if (not p.node_name.empty())
+            {
+                fill = p.node_name[0];
+            }
+            if (p.shm_name.size() != 127 or p.topic_name.size() != 127 or p.node_name.size() != 63
+                or not uniform(p.shm_name, 1, fill) or not uniform(p.topic_name, 1, fill)
+                or not uniform(p.node_name, 0, fill))
+            {
+                torn.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    writer.join();
+
+    EXPECT_EQ(torn.load(std::memory_order_relaxed), 0);
+    EXPECT_GT(seen.load(std::memory_order_relaxed), 0) << "no snapshot observed a row: the test proves nothing";
 }

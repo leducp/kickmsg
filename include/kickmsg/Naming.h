@@ -41,13 +41,12 @@ namespace kickmsg
     /// throws std::system_error(ENAMETOOLONG) past the platform limit
     /// (Linux NAME_MAX, Windows MAX_PATH).
     ///
-    /// macOS caveat: PSHMNAMLEN (31) leaves no room for a readable name, so
-    /// the result is a hash and the suffix hash is truncated to fit. Two
-    /// distinct (namespace, suffix) pairs can therefore collide onto the
-    /// same shm object -- distinct topics would then share one region.
-    /// Linux names are exact and never collide. Collisions are astronomically
-    /// unlikely but not impossible; if it matters, keep names short enough to
-    /// stay readable (Linux) or verify topology out of band.
+    /// Distinct (namespace, suffix) pairs can map to one shm object. Linux /
+    /// Windows: '_' is legal inside both parts, so ("a_b", "c") and ("a", "b_c")
+    /// both give "/a_b_c". macOS: PSHMNAMLEN (31) leaves no room for a readable
+    /// name, so the result is a hash with the suffix hash truncated to fit.
+    /// Node and Blackboard stamp an identity hash of the raw names, so such a
+    /// collision fails at open instead of sharing one region.
     std::string compose_shm_name(std::string_view sanitized_namespace,
                                  std::string_view sanitized_suffix);
 }

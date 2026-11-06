@@ -423,14 +423,25 @@ namespace kickmsg
         return region->schema();
     }
 
-    bool Node::try_claim_topic_schema(char const* topic, SchemaInfo const& info)
+    std::vector<uint8_t> Node::topic_schema_blob(char const* topic) const
+    {
+        auto const* region = find_region(make_topic_name(topic));
+        if (region == nullptr)
+        {
+            return {};
+        }
+        return region->schema_blob();
+    }
+
+    bool Node::try_claim_topic_schema(char const* topic, SchemaInfo const& info,
+                                      std::span<uint8_t const> blob)
     {
         auto* region = find_region(make_topic_name(topic));
         if (region == nullptr)
         {
             return false;
         }
-        return region->try_claim_schema(info);
+        return region->try_claim_schema(info, blob);
     }
 
     void Node::unlink_blackboard(char const* name) const

@@ -34,6 +34,7 @@ class Geometry:
     max_payload_size: int
     commit_timeout_us: int
     total_size: int
+    schema_capacity: int
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,9 @@ class SchemaSnapshot:
     identity_algo: int | None = None
     layout_algo: int | None = None
     flags: int | None = None
+    blob_hash: bytes | None = None
+    blob_algo: int | None = None
+    blob_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,8 @@ class SchemaDiff:
     name: bool
     identity_algo: bool
     layout_algo: bool
+    blob: bool
+    blob_algo: bool
 
 
 @dataclass(frozen=True)
@@ -237,6 +243,9 @@ def _schema_snapshot(region: _native.SharedRegion) -> SchemaSnapshot:
             identity_algo=info.identity_algo,
             layout_algo=info.layout_algo,
             flags=info.flags,
+            blob_hash=info.blob_hash,
+            blob_algo=info.blob_algo,
+            blob_size=info.blob_size,
         )
     if region.diagnose().schema_stuck:
         return SchemaSnapshot(state="claiming")
@@ -268,6 +277,7 @@ def info(shm_name: str) -> RegionInfo:
             max_payload_size=header.max_payload_size,
             commit_timeout_us=header.commit_timeout_us,
             total_size=header.total_size,
+            schema_capacity=header.schema_capacity,
         ),
         creator=Creator(
             pid=header.creator_pid,
@@ -381,6 +391,11 @@ def schema(shm_name: str) -> SchemaSnapshot:
     return _schema_snapshot(_open(shm_name))
 
 
+def schema_blob(shm_name: str) -> bytes:
+    """Raw schema blob; empty when unset, claiming, or none was published."""
+    return _open(shm_name).schema_blob()
+
+
 def schema_diff(shm_a: str, shm_b: str) -> SchemaDiff:
     """Field-by-field diff of two schemas via `schema::diff()`.
 
@@ -400,6 +415,8 @@ def schema_diff(shm_a: str, shm_b: str) -> SchemaDiff:
         name=bool(bits & _native.schema.Diff.Name.value),
         identity_algo=bool(bits & _native.schema.Diff.IdentityAlgo.value),
         layout_algo=bool(bits & _native.schema.Diff.LayoutAlgo.value),
+        blob=bool(bits & _native.schema.Diff.Blob.value),
+        blob_algo=bool(bits & _native.schema.Diff.BlobAlgo.value),
     )
 
 

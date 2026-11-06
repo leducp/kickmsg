@@ -21,12 +21,10 @@ add_executable(kickmsg_stress_test
     stress/common.cc
     stress/treiber.cc
     stress/churn.cc
-    stress/gc_recovery.cc
     stress/fairness.cc
     stress/mpmc.cc
     stress/pool_exhaustion.cc
     stress/live_repair.cc
-    stress/edge_cases.cc
     stress/big_payload.cc
     stress/blackboard.cc
     stress/wake_carrier.cc

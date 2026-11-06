@@ -78,6 +78,14 @@ namespace kickmsg
         {
             throw_last_error("SharedMemory: CreateFileMappingA(create)", name);
         }
+        // Windows cannot unlink a live mapping; never let a creator restamp it.
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            CloseHandle(fd_);
+            fd_ = INVALID_SHM_HANDLE;
+            throw std::system_error(ERROR_ALREADY_EXISTS, std::system_category(),
+                                    "SharedMemory: mapping already exists '" + name + "'");
+        }
         map(size);
     }
 

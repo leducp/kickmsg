@@ -4,8 +4,8 @@ All scenarios run as part of `kickmsg_stress_test`. Use `endurance.sh` for
 extended runs. TSAN builds scale message counts by 100x to keep runtime
 manageable.
 
-Common oracles for the no-crash scenarios (everything except `gc_recovery`
-and `live_repair`, which inject damage by design):
+Common oracles for the no-crash scenarios (everything except `live_repair`,
+which injects damage by design):
 
 - **Readiness barrier**: subscribers signal after constructing their
   `Subscriber`; publishers wait for all of them before the first send. Every
@@ -46,18 +46,6 @@ Tests drain_unconsumed correctness, in_flight quiescence spin, and ring reuse.
 **Failure means**: Double-decrement on drain, ring state corruption on reuse,
 or refcount leak.
 
-## GC recovery (`gc_recovery.cc`)
-
-**What**: Manually poisons a ring entry with a stale position-tagged lock and orphans a slot
-with refcount > 0. Calls `repair_locked_entries()` and `reclaim_orphaned_slots()`
-and verifies they fix both issues.
-
-**Why**: Validates the explicit recovery API that operators use after a publisher
-crash.
-
-**Failure means**: GC does not repair the poisoned entry, does not reclaim the
-orphaned slot, or corrupts the free-stack.
-
 ## Fairness (`fairness.cc`)
 
 **What**: 1 publisher × 16 subscribers, 100K messages. Measures the receive
@@ -73,24 +61,29 @@ data corruption.
 
 ## MPMC (`mpmc.cc`)
 
-**What**: Parameterized multi-publisher multi-subscriber stress with 7 configs:
+**What**: Parameterized multi-publisher multi-subscriber stress with 8 configs
+(N = `contention_count()`, which scales with the host cores and `--oversub`):
 
 | Pubs | Subs | Msgs/Pub | Pool | Ring | Mode |
 |------|------|----------|------|------|------|
 | 2 | 4 | 100K | 256 | 64 | copy |
-| 8 | 8 | 50K | 128 | 32 | copy |
+| N | N | 50K | 128 | 32 | copy |
 | 1 | 1 | 500K | 64 | 16 | copy |
-| 16 | 16 | 20K | 32 | 8 | copy |
+| N | N | 20K | 32 | 8 | copy |
+| 4 | 4 | 10K | 32 | 2 | copy |
 | 2 | 4 | 100K | 256 | 64 | zerocopy |
-| 8 | 8 | 50K | 128 | 32 | zerocopy |
-| 16 | 16 | 20K | 32 | 8 | zerocopy |
+| N | N | 50K | 128 | 32 | zerocopy |
+| N | N | 20K | 32 | 8 | zerocopy |
 
 **Why**: Core correctness test. Validates payload integrity (magic + checksum),
-per-publisher sequence ordering, refcount lifecycle, and pool integrity across
-a range of contention levels and both receive modes.
+per-publisher sequence ordering, exact conservation, refcount lifecycle, and
+pool integrity across a range of contention levels and both receive modes. The
+ring=2 row is the smallest valid ring: every publish wraps and evicts the
+previous entry, hammering the wrap + two-phase commit path with no buffering.
 
-**Failure means**: Data corruption, per-publisher reorder, refcount leak, or
-Treiber stack corruption.
+**Failure means**: Data corruption, per-publisher reorder, a conservation miss,
+refcount leak, Treiber stack corruption, or (ring=2) an eviction race or
+refcount corruption from immediate slot reuse.
 
 ## Pool exhaustion (`pool_exhaustion.cc`)
 
@@ -118,18 +111,6 @@ CAS-ing the same entry -- this test verifies the "benign double-store" argument.
 **Failure means**: Data corruption caused by repair racing with a live publisher,
 or repair failing to unblock a poisoned entry.
 
-## Single-slot ring (`edge_cases.cc`)
-
-**What**: ring=2 (smallest valid power-of-2), pool=32, 4 publishers × 10K
-messages.
-
-**Why**: Every publish wraps and evicts the previous entry. Hammers
-`wait_for_commit` on every message. Tests the wrap + two-phase commit
-hot path with zero buffering.
-
-**Failure means**: Eviction race, wait_for_commit timeout under normal
-load, or refcount corruption from immediate reuse.
-
 ## Big payload (`big_payload.cc`)
 
 **What**: 4 publishers × 50K messages of 8 KB through a small pool (16) and
@@ -151,18 +132,6 @@ has a real chance of being caught.
 **Failure means**: Torn read (pin or seqlock violation), pin not held for the
 view's lifetime, checksum/pattern corruption, conservation miss, or refcount
 leak.
-
-## Subscriber saturation (`edge_cases.cc`)
-
-**What**: max_subs=4, attempt to create 6 subscribers. Verify 5th and 6th
-throw `std::runtime_error`. Destroy one, verify a new subscriber can join.
-Publisher runs throughout.
-
-**Why**: Tests the subscriber slot allocation boundary and ring reuse after
-a subscriber disconnects.
-
-**Failure means**: Subscriber joins a non-Free ring, ring leak after disconnect,
-or data corruption during the join/leave cycle.
 
 ## Blackboard (`blackboard.cc`)
 

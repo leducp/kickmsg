@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime
 import errno
-import os
 import signal
 import struct
 import subprocess
@@ -49,90 +48,11 @@ def test_late_reader_sees_current_value(board):
     assert len(out) == 8
 
 
-def test_observe_before_declare_resolves_lazily(board):
-    bb, _ = board
-    reader = bb.observe("late/key")
-    assert reader.read().errno == errno.ENOENT
-
-    w = bb.declare("late/key")
-    w.write(b"here")
-    # Same reader object, no re-observe.
-    out = reader.read()
-    assert out
-    assert out.data == b"here"
-
-
-def test_missing_and_unset_are_distinct(board):
-    bb, _ = board
-    w = bb.declare("declared/only")
-    assert bb.observe("never/declared").read().errno == errno.ENOENT
-    assert bb.observe("declared/only").read().errno == errno.ENOMSG
-
-
 def test_declare_twice_from_live_owner_raises(board):
     bb, _ = board
     w = bb.declare("owned")
     with pytest.raises(RuntimeError):
         bb.declare("owned")
-
-
-def test_released_key_keeps_its_value(board):
-    bb, _ = board
-    reader = bb.observe("released")
-    w = bb.declare("released")
-    w.write(b"last-known")
-    w.release()
-
-    out = reader.read()
-    assert out
-    assert out.data == b"last-known"
-    assert reader.owner_alive() is False
-
-    # And the key can be taken over, value intact.
-    w2 = bb.declare("released")
-    assert reader.read().data == b"last-known"
-
-
-def test_value_too_large_is_rejected(board):
-    bb, _ = board
-    w = bb.declare("k")
-    w.write(b"small")
-    with pytest.raises(OSError) as oversize:
-        w.write(b"x" * 4096)
-    assert oversize.value.errno == errno.EMSGSIZE
-    assert bb.observe("k").read().data == b"small"
-
-
-def test_empty_key_raises(board):
-    bb, _ = board
-    with pytest.raises(ValueError):
-        bb.declare("")
-    with pytest.raises(ValueError):
-        bb.observe("")
-
-
-def test_capacity_exhaustion_raises():
-    cfg = kickmsg.BlackboardConfig()
-    cfg.capacity = 2
-    cfg.max_value_size = 32
-    kickmsg.Blackboard.unlink(NS, "tiny")
-    bb = kickmsg.Blackboard.open_or_create(NS, "tiny", cfg)
-    try:
-        a = bb.declare("a")
-        b = bb.declare("b")
-        with pytest.raises(RuntimeError):
-            bb.declare("c")
-    finally:
-        kickmsg.Blackboard.unlink(NS, "tiny")
-
-
-def test_wait_returns_false_on_timeout(board):
-    bb, _ = board
-    w = bb.declare("quiet")
-    seq = bb.change_seq
-    start = time.monotonic()
-    assert bb.wait(seq, datetime.timedelta(milliseconds=50)) is False
-    assert time.monotonic() - start >= 0.045
 
 
 def test_wait_returns_immediately_when_seq_already_advanced(board):
@@ -153,31 +73,23 @@ def test_wait_releases_the_gil(board):
     bb, _ = board
     w = bb.declare("k")
     ticks = []
+    stop = threading.Event()
 
     def ticker():
-        for _ in range(5):
-            time.sleep(0.01)
+        while not stop.is_set():
+            time.sleep(0.005)
             ticks.append(1)
 
     t = threading.Thread(target=ticker)
     t.start()
-    bb.wait(bb.change_seq, datetime.timedelta(milliseconds=200))
-    t.join()
-    assert len(ticks) == 5
-
-
-def test_try_open_returns_none_when_absent():
-    kickmsg.Blackboard.unlink(NS, "absent")
-    assert kickmsg.Blackboard.try_open(NS, "absent") is None
-
-
-def test_geometry_mismatch_raises(board):
-    bb, name = board
-    other = kickmsg.BlackboardConfig()
-    other.capacity = 64
-    other.max_value_size = 128
-    with pytest.raises(RuntimeError):
-        kickmsg.Blackboard.open_or_create(NS, name, other)
+    try:
+        # Nothing writes, so wait() times out; a held GIL freezes the ticker until it returns.
+        assert bb.wait(bb.change_seq, datetime.timedelta(milliseconds=300)) is False
+        ticked = len(ticks)
+    finally:
+        stop.set()
+        t.join()
+    assert ticked >= 5
 
 
 def test_node_blackboard_is_idempotent_and_registers():

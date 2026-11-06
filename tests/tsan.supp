@@ -2,4 +2,5 @@
 #
 # Intentionally empty.  A new entry needs a comment proving the race benign; a
 # seqlock-style overlap does not qualify -- move those bytes as relaxed atomics
-# instead, as src/Blackboard.cc does for value payloads and key text.
+# instead with store_words / load_words (kickmsg/types.h), as the Blackboard does
+# for value payloads and key text and the registry does for participant names.

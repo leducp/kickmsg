@@ -110,6 +110,18 @@ will silently work on Linux and explode on macOS.
 Keep names short, or shorten the namespace prefix in `Node(name,
 prefix)`.
 
+## Schema blob errors
+
+- `std::length_error` from `try_claim_schema` (`ValueError` in Python): the
+  blob is larger than the region's `schema_capacity`. Capacity is fixed when
+  the region is created; raise `cfg.schema_capacity` on every side and
+  recreate the region.
+- `Config mismatch on existing region`: `schema_capacity` is part of the
+  channel geometry, so `advertise_or_join` / `subscribe_or_create` callers
+  must pass the same value.
+- `Schema blob size exceeds reserved schema_capacity` from `schema_blob()`:
+  the shared `blob_size` was corrupted; the region cannot be trusted.
+
 ## Permission errors
 
 ### `EACCES` opening `/dev/shm/...` on Linux

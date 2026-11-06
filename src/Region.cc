@@ -32,9 +32,30 @@ namespace kickmsg
             {
                 throw std::runtime_error("max_subscribers must be > 0");
             }
+            if (cfg.max_subscribers > MAX_SUBSCRIBERS)
+            {
+                throw std::runtime_error("max_subscribers exceeds MAX_SUBSCRIBERS");
+            }
             if (cfg.max_payload_size == 0)
             {
                 throw std::runtime_error("max_payload_size must be > 0");
+            }
+            if (cfg.max_payload_size > MAX_PAYLOAD_SIZE)
+            {
+                throw std::runtime_error("max_payload_size exceeds MAX_PAYLOAD_SIZE");
+            }
+            // SchemaInfo::blob_size is a uint32_t.
+            if (cfg.schema_capacity > UINT32_MAX)
+            {
+                throw std::runtime_error("schema_capacity exceeds 4 GiB");
+            }
+            if (cfg.schema_blob.size() > cfg.schema_capacity)
+            {
+                throw std::runtime_error("schema_blob exceeds schema_capacity");
+            }
+            if (not cfg.schema_blob.empty() and not cfg.schema.has_value())
+            {
+                throw std::runtime_error("schema_blob requires schema");
             }
         }
 
@@ -43,6 +64,7 @@ namespace kickmsg
             std::size_t header_size;
             std::size_t ring_stride;
             std::size_t slot_stride;
+            std::size_t schema_blob_offset;
             std::size_t sub_rings_offset;
             std::size_t pool_offset;
             std::size_t total_size;
@@ -74,11 +96,16 @@ namespace kickmsg
             }
 
             RegionLayout layout;
-            layout.creator_len      = static_cast<uint16_t>(name_len);
-            layout.header_size      = align_up(sizeof(Header) + layout.creator_len, CACHE_LINE);
-            layout.ring_stride      = align_up(sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
-            layout.slot_stride      = align_up(sizeof(SlotHeader) + cfg.max_payload_size, CACHE_LINE);
-            layout.sub_rings_offset = layout.header_size;
+            layout.creator_len        = static_cast<uint16_t>(name_len);
+            layout.header_size        = align_up(sizeof(Header) + layout.creator_len, CACHE_LINE);
+            layout.ring_stride        = align_up(sizeof(SubRingHeader) + cfg.sub_ring_capacity * sizeof(Entry), CACHE_LINE);
+            layout.slot_stride        = align_up(sizeof(SlotHeader) + cfg.max_payload_size, CACHE_LINE);
+            layout.schema_blob_offset = layout.header_size;
+            if (cfg.schema_capacity > SIZE_MAX - layout.schema_blob_offset - CACHE_LINE)
+            {
+                throw std::runtime_error("Config too large: schema_capacity overflows");
+            }
+            layout.sub_rings_offset   = align_up(layout.schema_blob_offset + cfg.schema_capacity, CACHE_LINE);
 
             // Reject sizes that overflow the mapped region length.
             if (cfg.max_subscribers > (SIZE_MAX - layout.sub_rings_offset) / layout.ring_stride)
@@ -99,6 +126,7 @@ namespace kickmsg
                                         char const* creator_name, std::size_t total_size,
                                         std::size_t sub_rings_offset, std::size_t pool_offset,
                                         std::size_t ring_stride,     std::size_t slot_stride,
+                                        std::size_t schema_blob_offset, std::size_t schema_blob_capacity,
                                         uint16_t    creator_len)
     {
         std::memset(base(), 0, total_size);
@@ -114,6 +142,8 @@ namespace kickmsg
         geometry_.slot_data_size    = cfg.max_payload_size;
         geometry_.max_subs          = cfg.max_subscribers;
         geometry_.commit_timeout_us = static_cast<uint64_t>(cfg.commit_timeout.count());
+        geometry_.schema_blob_offset   = schema_blob_offset;
+        geometry_.schema_blob_capacity = schema_blob_capacity;
 
         auto* h = header();
         h->version           = VERSION;
@@ -128,6 +158,8 @@ namespace kickmsg
         h->slot_data_size    = cfg.max_payload_size;
         h->slot_stride       = slot_stride;
         h->sub_ring_stride   = ring_stride;
+        h->schema_blob_offset   = schema_blob_offset;
+        h->schema_blob_capacity = schema_blob_capacity;
         h->commit_timeout_us = static_cast<uint64_t>(cfg.commit_timeout.count());
         h->config_hash       = compute_config_hash(type, cfg);
         h->creator_pid       = kickmsg::current_pid();
@@ -139,7 +171,15 @@ namespace kickmsg
         // the schema bytes and relaxed schema_state store.
         if (cfg.schema.has_value())
         {
-            std::memcpy(&h->schema_data, &*cfg.schema, sizeof(SchemaInfo));
+            if (not cfg.schema_blob.empty())
+            {
+                std::memcpy(static_cast<uint8_t*>(base()) + schema_blob_offset,
+                            cfg.schema_blob.data(), cfg.schema_blob.size());
+            }
+            SchemaInfo stamped = *cfg.schema;
+            stamped.blob_size  = static_cast<uint32_t>(cfg.schema_blob.size());
+            std::memset(stamped.reserved, 0, sizeof(stamped.reserved));
+            std::memcpy(&h->schema_data, &stamped, sizeof(SchemaInfo));
             h->schema_state.store(schema::Set, std::memory_order_relaxed);
         }
 
@@ -219,6 +259,15 @@ namespace kickmsg
             {
                 throw std::runtime_error("Header geometry: pool_size exceeds MAX_POOL_SIZE");
             }
+            // Publish narrows lengths to 32 bits and presets the refcount to max_subs.
+            if (geometry.slot_data_size > MAX_PAYLOAD_SIZE)
+            {
+                throw std::runtime_error("Header geometry: slot_data_size exceeds MAX_PAYLOAD_SIZE");
+            }
+            if (geometry.max_subs > MAX_SUBSCRIBERS)
+            {
+                throw std::runtime_error("Header geometry: max_subs exceeds MAX_SUBSCRIBERS");
+            }
             if (not is_power_of_two(geometry.sub_ring_capacity))
             {
                 throw std::runtime_error("Header geometry: sub_ring_capacity not a power of 2");
@@ -237,15 +286,29 @@ namespace kickmsg
                 throw std::runtime_error("Header geometry: ring/pool offsets out of range");
             }
 
-            // creator_name tail lives in [sizeof(Header), sub_rings_offset);
-            // bound it there so info() can't read into the ring/pool area.
-            if (snapshot.creator_name_len > geometry.sub_rings_offset - sizeof(Header))
+            // Schema blob area spans [schema_blob_offset, schema_blob_offset +
+            // schema_blob_capacity), inside [sizeof(Header), sub_rings_offset).
+            if (geometry.schema_blob_offset < sizeof(Header) or
+                geometry.schema_blob_offset > geometry.sub_rings_offset)
+            {
+                throw std::runtime_error("Header geometry: schema blob offset out of range");
+            }
+            if (geometry.schema_blob_capacity > UINT32_MAX or
+                geometry.schema_blob_capacity > geometry.sub_rings_offset - geometry.schema_blob_offset)
+            {
+                throw std::runtime_error("Header geometry: schema blob capacity out of range");
+            }
+
+            // creator_name tail lives in [sizeof(Header), schema_blob_offset);
+            // bound it there so info() can't read into the blob/ring/pool area.
+            if (snapshot.creator_name_len > geometry.schema_blob_offset - sizeof(Header))
             {
                 throw std::runtime_error("Header geometry: creator_name_len exceeds tail");
             }
 
             // Shared atomics require cache-line-aligned offsets and strides.
-            if ((geometry.sub_rings_offset % CACHE_LINE) != 0 or
+            if ((geometry.schema_blob_offset % CACHE_LINE) != 0 or
+                (geometry.sub_rings_offset % CACHE_LINE) != 0 or
                 (geometry.pool_offset      % CACHE_LINE) != 0 or
                 (geometry.sub_ring_stride  % CACHE_LINE) != 0 or
                 (geometry.slot_stride      % CACHE_LINE) != 0)
@@ -321,6 +384,8 @@ namespace kickmsg
             snapshot.geometry.slot_data_size    = h->slot_data_size;
             snapshot.geometry.max_subs          = h->max_subs;
             snapshot.geometry.commit_timeout_us = h->commit_timeout_us;
+            snapshot.geometry.schema_blob_offset   = h->schema_blob_offset;
+            snapshot.geometry.schema_blob_capacity = h->schema_blob_capacity;
             snapshot.channel_type               = h->channel_type;
             snapshot.total_size                 = h->total_size;
             snapshot.creator_name_len           = h->creator_name_len;
@@ -372,7 +437,8 @@ namespace kickmsg
         region.stamp_new_region(type, cfg, creator_name,
                                 layout.total_size, layout.sub_rings_offset,
                                 layout.pool_offset, layout.ring_stride,
-                                layout.slot_stride, layout.creator_len);
+                                layout.slot_stride, layout.schema_blob_offset,
+                                cfg.schema_capacity, layout.creator_len);
         return region;
     }
 
@@ -407,7 +473,8 @@ namespace kickmsg
         region.stamp_new_region(type, cfg, creator_name,
                                 layout.total_size, layout.sub_rings_offset,
                                 layout.pool_offset, layout.ring_stride,
-                                layout.slot_stride, layout.creator_len);
+                                layout.slot_stride, layout.schema_blob_offset,
+                                cfg.schema_capacity, layout.creator_len);
         return region;
     }
 
@@ -445,7 +512,8 @@ namespace kickmsg
             region.stamp_new_region(type, cfg, creator_name,
                                     layout.total_size, layout.sub_rings_offset,
                                     layout.pool_offset, layout.ring_stride,
-                                    layout.slot_stride, layout.creator_len);
+                                    layout.slot_stride, layout.schema_blob_offset,
+                                    cfg.schema_capacity, layout.creator_len);
             return region;
         }
         region.name_.clear();  // we didn't create; fall through to open loop
@@ -762,8 +830,30 @@ namespace kickmsg
         return out;
     }
 
-    bool SharedRegion::try_claim_schema(SchemaInfo const& info)
+    std::vector<uint8_t> SharedRegion::schema_blob() const
     {
+        auto const* h = header();
+        if (h->schema_state.load(std::memory_order_acquire) != schema::Set)
+        {
+            return {};
+        }
+        // Read once: a peer can rewrite the shared field after this bound check.
+        uint64_t size = h->schema_data.blob_size;
+        if (size > geometry_.schema_blob_capacity)
+        {
+            throw std::runtime_error("Schema blob size exceeds reserved schema_capacity");
+        }
+        auto const* blob = static_cast<uint8_t const*>(base()) + geometry_.schema_blob_offset;
+        return std::vector<uint8_t>(blob, blob + size);
+    }
+
+    bool SharedRegion::try_claim_schema(SchemaInfo const& info, std::span<uint8_t const> blob)
+    {
+        if (blob.size() > geometry_.schema_blob_capacity)
+        {
+            throw std::length_error("Schema blob exceeds the region's schema_capacity");
+        }
+
         auto*    h        = header();
         uint32_t expected = schema::Unset;
 
@@ -771,9 +861,17 @@ namespace kickmsg
         if (h->schema_state.compare_exchange_strong(expected, schema::Claiming,
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
-            std::memcpy(&h->schema_data, &info, sizeof(SchemaInfo));
+            if (not blob.empty())
+            {
+                std::memcpy(static_cast<uint8_t*>(base()) + geometry_.schema_blob_offset,
+                            blob.data(), blob.size());
+            }
+            SchemaInfo stamped = info;
+            stamped.blob_size  = static_cast<uint32_t>(blob.size());
+            std::memset(stamped.reserved, 0, sizeof(stamped.reserved));
+            std::memcpy(&h->schema_data, &stamped, sizeof(SchemaInfo));
             // Release: pairs with the acquire in schema() so a reader that
-            // observes Set sees the fully-written schema_data payload.
+            // observes Set sees the fully-written blob and schema_data.
             h->schema_state.store(schema::Set, std::memory_order_release);
             return true;
         }
@@ -871,6 +969,7 @@ namespace kickmsg
         out.pool_size         = geometry_.pool_size;
         out.max_payload_size  = geometry_.slot_data_size;
         out.commit_timeout_us = geometry_.commit_timeout_us;
+        out.schema_capacity   = geometry_.schema_blob_capacity;
         out.creator_pid       = h->creator_pid;
         out.created_at_ns     = h->created_at_ns;
 
@@ -878,7 +977,7 @@ namespace kickmsg
         // Re-bound the live length: a peer can rewrite it after validation.
         auto const* tail = static_cast<char const*>(base()) + sizeof(Header);
         std::size_t name_len = h->creator_name_len;
-        std::size_t tail_len = geometry_.sub_rings_offset - sizeof(Header);
+        std::size_t tail_len = geometry_.schema_blob_offset - sizeof(Header);
         if (name_len > tail_len)
         {
             name_len = tail_len;

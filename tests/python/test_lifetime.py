@@ -38,8 +38,7 @@ def test_broadcasthandle_pub_extracted_from_temporary(small_cfg):
 
 def test_sample_view_gc_releases_pin(shm_name, small_cfg):
     """Take a zero-copy view, discard it without calling .release(),
-    force GC, then verify the slot came back to the pool by publishing
-    pool_size more messages successfully.
+    force GC, then verify the slot came back to the pool.
     """
     region = kickmsg.SharedRegion.create(
         shm_name, kickmsg.ChannelType.PubSub, small_cfg, "test")
@@ -51,14 +50,17 @@ def test_sample_view_gc_releases_pin(shm_name, small_cfg):
     assert view is not None
     _ = bytes(memoryview(view))
 
+    # A ring entry holds its slot until overwritten; evict them so only the pin remains.
+    for _ in range(small_cfg.sub_ring_capacity):
+        pub.send(b"evict")
+    ring_held = small_cfg.pool_size - small_cfg.sub_ring_capacity
+    assert region.stats().pool_free == ring_held - 1
+
     # Drop the reference — Python GC should run SampleView's C++ dtor,
     # which in turn drops the slot pin.
     view = None
     gc.collect()
-
-    # Pool should be clean — pool_size more publishes must succeed.
-    for i in range(small_cfg.pool_size):
-        assert pub.send(f"msg-{i}".encode()) > 0
+    assert region.stats().pool_free == ring_held
 
 
 def test_publisher_outlives_shared_region_python_reference(shm_name, small_cfg):

@@ -117,10 +117,14 @@ def _humanize_age(seconds: float | None) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
-def _hex_or_dash(b: bytes | None) -> str:
-    if b is None:
+def _fingerprint(b: bytes | None, algo: int | None) -> str:
+    """`sha256:<digest>` for a known tag, else the full 64-byte slot; `-` when unset."""
+    if b is None or (algo == 0 and not any(b)):
         return "-"
-    return b.hex()
+    name = _native.schema.algo_name(algo)
+    if name is None:
+        return f"algo={algo}:{b.hex()}"
+    return f"{name}:{b[:_native.schema.digest_size(algo)].hex()}"
 
 
 # ----------------------------------------------------------------------
@@ -268,8 +272,9 @@ def cmd_info(args) -> int:
     s = i.schema
     if s.state == "set":
         print(f"schema:       name={s.name!r}, version={s.version}")
-        print(f"  identity:   {_hex_or_dash(s.identity)}")
-        print(f"  layout:     {_hex_or_dash(s.layout)}")
+        print(f"  identity:   {_fingerprint(s.identity, s.identity_algo)}")
+        print(f"  layout:     {_fingerprint(s.layout, s.layout_algo)}")
+        print(f"  blob:       {_fingerprint(s.blob_hash, s.blob_algo)} ({s.blob_size} B)")
     elif s.state == "claiming":
         print("schema:       claim in progress (possibly wedged — see `kickmsg diagnose`)")
     else:
@@ -532,7 +537,12 @@ def cmd_blackboard_watch(args) -> int:
 
 
 def cmd_schema(args) -> int:
-    s = diag.schema(_resolve_shm_name(args))
+    shm_name = _resolve_shm_name(args)
+    if args.blob:
+        sys.stdout.buffer.write(diag.schema_blob(shm_name))
+        sys.stdout.buffer.flush()
+        return 0
+    s = diag.schema(shm_name)
     if args.json:
         print(_to_json(s))
         return 0
@@ -544,10 +554,10 @@ def cmd_schema(args) -> int:
         return 1
     print(f"name:          {s.name}")
     print(f"version:       {s.version}")
-    print(f"identity:      {_hex_or_dash(s.identity)}")
-    print(f"layout:        {_hex_or_dash(s.layout)}")
-    print(f"identity_algo: {s.identity_algo}")
-    print(f"layout_algo:   {s.layout_algo}")
+    print(f"identity:      {_fingerprint(s.identity, s.identity_algo)}")
+    print(f"layout:        {_fingerprint(s.layout, s.layout_algo)}")
+    print(f"blob:          {_fingerprint(s.blob_hash, s.blob_algo)}")
+    print(f"blob_size:     {s.blob_size}")
     print(f"flags:         {s.flags}")
     return 0
 
@@ -559,7 +569,8 @@ def cmd_schema_diff(args) -> int:
         if d.equal:
             return 0
         return 1
-    for field_name in ("identity", "layout", "version", "name", "identity_algo", "layout_algo"):
+    for field_name in ("identity", "layout", "version", "name", "identity_algo", "layout_algo",
+                       "blob", "blob_algo"):
         differs = getattr(d, field_name)
         if differs:
             status = "differ"
@@ -645,7 +656,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("schema", help="Inspect the schema descriptor")
     _add_region_target(sp)
-    sp.add_argument("--json", action="store_true")
+    output = sp.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true")
+    output.add_argument("--blob", action="store_true",
+                        help="write the raw schema blob to stdout")
     sp.set_defaults(func=cmd_schema)
 
     sp = sub.add_parser("schema-diff", aliases=["sdiff"],

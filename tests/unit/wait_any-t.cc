@@ -75,28 +75,6 @@ TEST_F(WaitAnyTest, ReturnsImmediatelyWhenASampleIsAlreadyQueued)
     Subscriber  sub_b(b);
     Subscriber* subs[] = {&sub_a, &sub_b};
 
-    Publisher pub_b(b, &backend_b);
-    uint8_t   payload = 4;
-    ASSERT_GT(pub_b.send(&payload, sizeof(payload)), 0);
-
-    nanoseconds start = kickmsg::monotonic_ns();
-    EXPECT_TRUE(wait_any(subs, 2, 2s));
-    EXPECT_LT(kickmsg::elapsed_time(start), 20ms);
-
-    EXPECT_FALSE(sub_a.try_receive().has_value());
-    EXPECT_TRUE(sub_b.try_receive().has_value());
-}
-
-TEST_F(WaitAnyTest, AZeroTimeoutStillReportsAQueuedSample)
-{
-    auto cfg = default_cfg();
-    auto a   = SharedRegion::create(SHM_A, channel::PubSub, cfg);
-    auto b   = SharedRegion::create(SHM_B, channel::PubSub, default_cfg(SHM_B));
-
-    Subscriber  sub_a(a);
-    Subscriber  sub_b(b);
-    Subscriber* subs[] = {&sub_a, &sub_b};
-
     EXPECT_FALSE(wait_any(subs, 2, 0ns));
 
     Publisher pub_b(b, &backend_b);
@@ -104,6 +82,12 @@ TEST_F(WaitAnyTest, AZeroTimeoutStillReportsAQueuedSample)
     ASSERT_GT(pub_b.send(&payload, sizeof(payload)), 0);
 
     EXPECT_TRUE(wait_any(subs, 2, 0ns));
+
+    nanoseconds start = kickmsg::monotonic_ns();
+    EXPECT_TRUE(wait_any(subs, 2, 2s));
+    EXPECT_LT(kickmsg::elapsed_time(start), 20ms);
+
+    EXPECT_FALSE(sub_a.try_receive().has_value());
     EXPECT_TRUE(sub_b.try_receive().has_value());
 }
 
@@ -240,7 +224,9 @@ TEST_F(WaitAnyTest, PollsEveryAttachedWakerNotJustTheFirst)
         pub.send(&payload, sizeof(payload));
     });
 
+    nanoseconds start = kickmsg::monotonic_ns();
     EXPECT_TRUE(wait_any(subs.data(), subs.size(), 5s));
+    EXPECT_LT(kickmsg::elapsed_time(start), 1s);
     publisher.join();
 
     std::size_t delivered = 0;
