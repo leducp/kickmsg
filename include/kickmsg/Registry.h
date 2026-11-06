@@ -15,7 +15,7 @@ namespace kickmsg
 {
     namespace registry
     {
-        constexpr uint32_t VERSION          = 4;
+        constexpr uint32_t VERSION          = 5;
         constexpr uint64_t MAGIC            = 0x214745524B43494BULL; // "KICKREG!"
         // 4096 entries use 2 MB per namespace.
         constexpr uint32_t DEFAULT_CAPACITY = 4096;
@@ -52,7 +52,8 @@ namespace kickmsg
     }
 
     /// Shared-memory entry, 512 bytes. Use Registry::snapshot() to read it.
-    /// Scalar fields are atomic; generation and state detect changes during a copy.
+    /// Every field a snapshot reads is atomic; names are NUL-padded bytes moved only
+    /// with store_words / load_words. Generation and state detect changes during a copy.
     /// Changing the layout requires a registry::VERSION bump.
     struct ParticipantEntry
     {
@@ -65,9 +66,9 @@ namespace kickmsg
         std::atomic<uint64_t> pid;            ///< release/acquire-accessed; inspected while state==Claiming
         std::atomic<uint64_t> pid_starttime;  ///< OS-reported start time, or 0 if unavailable
         std::atomic<uint64_t> created_at_ns;
-        char                  shm_name[registry::SHM_NAME_MAX];
-        char                  topic_name[registry::TOPIC_NAME_MAX];
-        char                  node_name[registry::NODE_NAME_MAX];
+        std::atomic<uint64_t> shm_name[registry::SHM_NAME_MAX / sizeof(uint64_t)];
+        std::atomic<uint64_t> topic_name[registry::TOPIC_NAME_MAX / sizeof(uint64_t)];
+        std::atomic<uint64_t> node_name[registry::NODE_NAME_MAX / sizeof(uint64_t)];
         uint8_t               _padding[144];
     };
     static_assert(sizeof(ParticipantEntry) == 512,

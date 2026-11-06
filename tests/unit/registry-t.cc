@@ -1052,3 +1052,66 @@ TEST_F(RegistryTest, ListTopicsSortedByShmName)
     EXPECT_LT(topics[0].shm_name, topics[1].shm_name);
     EXPECT_LT(topics[1].shm_name, topics[2].shm_name);
 }
+
+// Names are read without a lock while a writer reuses the row; under TSan an
+// overlapping byte copy would report, and a torn copy must never be returned.
+TEST_F(RegistryTest, SnapshotNeverReturnsTornNamesDuringRowReuse)
+{
+    auto reg = kickmsg::Registry::open_or_create(KMSG_NAMESPACE, 2);
+
+    std::atomic<bool> done{false};
+    std::atomic<int>  torn{0};
+    std::atomic<int>  seen{0};
+
+    std::thread writer([&]()
+    {
+        for (int i = 0; i < 20000; ++i)
+        {
+            char fill = 'a';
+            if (i % 2 != 0)
+            {
+                fill = 'b';
+            }
+            uint32_t slot = reg.register_participant(
+                "/" + std::string(126, fill), "/" + std::string(126, fill),
+                kickmsg::channel::PubSub, kickmsg::registry::Pubsub,
+                kickmsg::registry::Publisher, std::string(63, fill));
+            // Hold the row long enough for snapshots to land both inside and across it.
+            for (int spin = 0; spin < 64; ++spin)
+            {
+                std::this_thread::yield();
+            }
+            reg.deregister(slot);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    auto uniform = [](std::string const& name, std::size_t skip, char fill)
+    {
+        return name.find_first_not_of(fill, skip) == std::string::npos;
+    };
+
+    while (not done.load(std::memory_order_acquire))
+    {
+        for (auto const& p : reg.snapshot())
+        {
+            // Relaxed: only read after writer.join().
+            seen.fetch_add(1, std::memory_order_relaxed);
+            char fill = '?';
+            if (not p.node_name.empty())
+            {
+                fill = p.node_name[0];
+            }
+            if (p.shm_name.size() != 127 or p.topic_name.size() != 127 or p.node_name.size() != 63
+                or not uniform(p.shm_name, 1, fill) or not uniform(p.topic_name, 1, fill)
+                or not uniform(p.node_name, 0, fill))
+            {
+                torn.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    writer.join();
+
+    EXPECT_EQ(torn.load(std::memory_order_relaxed), 0);
+    EXPECT_GT(seen.load(std::memory_order_relaxed), 0) << "no snapshot observed a row: the test proves nothing";
+}

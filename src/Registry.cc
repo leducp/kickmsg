@@ -1,6 +1,7 @@
 #include "kickmsg/Registry.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -24,6 +25,24 @@ namespace kickmsg
         {
             uint32_t g = e.generation.load(std::memory_order_relaxed);
             e.generation.store((g + 2) & ~1u, std::memory_order_relaxed);
+        }
+
+        constexpr std::size_t NAME_BUFFER = std::max({registry::SHM_NAME_MAX, registry::TOPIC_NAME_MAX,
+                                                      registry::NODE_NAME_MAX});
+
+        /// Truncate to field_size - 1 bytes so the stored name stays NUL-terminated.
+        void store_name(std::atomic<uint64_t>* field, std::size_t field_size, std::string const& name)
+        {
+            char bytes[NAME_BUFFER] = {};
+            std::memcpy(bytes, name.data(), std::min(name.size(), field_size - 1));
+            store_words(field, bytes, field_size);
+        }
+
+        std::string load_name(std::atomic<uint64_t> const* field, std::size_t field_size)
+        {
+            char bytes[NAME_BUFFER];
+            load_words(bytes, field, field_size);
+            return std::string(bytes, ::strnlen(bytes, field_size));
         }
     }
 
@@ -184,14 +203,6 @@ namespace kickmsg
             auto*    es  = entries();
             uint32_t cap = capacity_;
 
-            auto copy_field = [](char* dst, std::size_t dst_size,
-                                 std::string const& src)
-            {
-                std::memset(dst, 0, dst_size);
-                std::size_t n = std::min(src.size(), dst_size - 1);
-                std::memcpy(dst, src.data(), n);
-            };
-
             uint64_t my_pid       = current_pid();
             uint64_t my_starttime = process_starttime(my_pid);
             uint64_t now_ns       = static_cast<uint64_t>(
@@ -222,9 +233,9 @@ namespace kickmsg
                                  std::memory_order_relaxed);
                 es[i].created_at_ns.store(now_ns, std::memory_order_relaxed);
 
-                copy_field(es[i].shm_name,   sizeof(es[i].shm_name),   shm_name);
-                copy_field(es[i].topic_name, sizeof(es[i].topic_name), topic_name);
-                copy_field(es[i].node_name,  sizeof(es[i].node_name),  node_name);
+                store_name(es[i].shm_name,   sizeof(es[i].shm_name),   shm_name);
+                store_name(es[i].topic_name, sizeof(es[i].topic_name), topic_name);
+                store_name(es[i].node_name,  sizeof(es[i].node_name),  node_name);
                 std::memset(es[i]._padding, 0, sizeof(es[i]._padding));
 
                 es[i].state.store(registry::Active, std::memory_order_release);
@@ -322,9 +333,9 @@ namespace kickmsg
             p.channel_type  = es[i].channel_type.load(std::memory_order_relaxed);
             p.role          = es[i].role.load(std::memory_order_relaxed);
             p.kind          = es[i].kind.load(std::memory_order_relaxed);
-            p.shm_name.assign  (es[i].shm_name,   ::strnlen(es[i].shm_name, sizeof(es[i].shm_name)));
-            p.topic_name.assign(es[i].topic_name, ::strnlen(es[i].topic_name, sizeof(es[i].topic_name)));
-            p.node_name.assign (es[i].node_name,  ::strnlen(es[i].node_name, sizeof(es[i].node_name)));
+            p.shm_name   = load_name(es[i].shm_name,   sizeof(es[i].shm_name));
+            p.topic_name = load_name(es[i].topic_name, sizeof(es[i].topic_name));
+            p.node_name  = load_name(es[i].node_name,  sizeof(es[i].node_name));
 
             // Keep field reads before the generation and state recheck.
             std::atomic_thread_fence(std::memory_order_acquire);

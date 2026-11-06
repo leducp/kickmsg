@@ -455,6 +455,12 @@ namespace kickmsg
     constexpr uint32_t tagged_idx(uint64_t tagged) { return static_cast<uint32_t>(tagged); }
     constexpr uint32_t tagged_gen(uint64_t tagged) { return static_cast<uint32_t>(tagged >> 32); }
 
+    /// Copy bytes that peers may read concurrently as whole relaxed 64-bit words, so an
+    /// overlap a later generation or sequence check discards is not a data race. The
+    /// caller's fences order the copy. A partial last word is zero-padded on store.
+    void store_words(std::atomic<uint64_t>* shared, void const* src, std::size_t len);
+    void load_words(void* dst, std::atomic<uint64_t> const* shared, std::size_t len);
+
     SubRingHeader* sub_ring_at(void* base, Geometry const& geometry, uint32_t idx);
 
     /// Clear owner and wake mode before publishing Free, while no replacement

@@ -1772,9 +1772,13 @@ the **participant registry**.
 A single dedicated shared-memory region per namespace, at
 `/{namespace}_registry`, holding a fixed-size array of participant
 entries.  Each entry records one `(Node, channel, role)` membership.
-All scalar fields are `std::atomic<T>` so that the seqlock protocol
-between the writer and a concurrent new-tenant claim never involves
-plain non-atomic accesses on the same bytes:
+Every field a snapshot reads is atomic -- scalars as `std::atomic<T>`,
+names as NUL-padded `std::atomic<uint64_t>` words moved only with
+`store_words()` / `load_words()` -- so the seqlock overlap between a
+snapshot and a writer reusing the row never involves plain non-atomic
+accesses on the same bytes. The generation check discards a copy that
+overlapped; it cannot make a plain byte race defined, which is why
+version 5 replaced the `char` name arrays:
 
 - `state` — atomic `Free` / `Claiming` / `Active` / `Reclaiming`
 - `generation` -- atomic version; even means settled, odd means a writer
@@ -1784,9 +1788,9 @@ plain non-atomic accesses on the same bytes:
 - `channel_type` — atomic; PubSub / Broadcast
 - `role` — atomic; Publisher / Subscriber / Both
 - `kind` — atomic; Pubsub / Broadcast / Mailbox (registry-level intent tag)
-- `topic_name` — user-facing path (leading `/`, interior `/` preserved)
-- `shm_name` — implementation-level POSIX path
-- `node_name` — the `Node` that registered
+- `topic_name` -- atomic words; user-facing path (leading `/`, interior `/` preserved)
+- `shm_name` -- atomic words; implementation-level POSIX path
+- `node_name` -- atomic words; the `Node` that registered
 - `created_at_ns` — atomic; registration timestamp
 
 A `Node` lazily opens-or-creates the registry on its first
@@ -1907,7 +1911,9 @@ Registry invariants:
   reorder or resize must update the padding and bump `registry::VERSION`.
   So must a protocol change on an unchanged layout: version 4 kept every
   offset but made the generation parity-based (odd = held), which a
-  version-3 writer would violate.
+  version-3 writer would violate. Version 5 also kept every offset but
+  moves names as atomic words; a version-4 peer's plain `memcpy` would
+  race them again.
 - **A version mismatch is fatal.**  Opening a registry stamped with
   another `registry::VERSION` throws `VersionMismatch`; there is no
   migration and no fallback. The shm name is unversioned on purpose, so

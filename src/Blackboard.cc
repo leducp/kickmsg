@@ -39,42 +39,6 @@ namespace kickmsg
         static_assert(sizeof(BlackboardCell) % sizeof(uint64_t) == 0 and CACHE_LINE % sizeof(uint64_t) == 0,
             "a zero-padded last payload word must stay inside its cell");
 
-        void store_words(std::atomic<uint64_t>* shared, void const* src, std::size_t len)
-        {
-            auto const* in   = static_cast<uint8_t const*>(src);
-            std::size_t full = len / sizeof(uint64_t);
-            for (std::size_t w = 0; w < full; ++w)
-            {
-                uint64_t word;
-                std::memcpy(&word, in + w * sizeof(uint64_t), sizeof(word));
-                shared[w].store(word, std::memory_order_relaxed);
-            }
-            std::size_t rest = len % sizeof(uint64_t);
-            if (rest != 0)
-            {
-                uint64_t word = 0;
-                std::memcpy(&word, in + full * sizeof(uint64_t), rest);
-                shared[full].store(word, std::memory_order_relaxed);
-            }
-        }
-
-        void load_words(void* dst, std::atomic<uint64_t> const* shared, std::size_t len)
-        {
-            auto*       out  = static_cast<uint8_t*>(dst);
-            std::size_t full = len / sizeof(uint64_t);
-            for (std::size_t w = 0; w < full; ++w)
-            {
-                uint64_t word = shared[w].load(std::memory_order_relaxed);
-                std::memcpy(out + w * sizeof(uint64_t), &word, sizeof(word));
-            }
-            std::size_t rest = len % sizeof(uint64_t);
-            if (rest != 0)
-            {
-                uint64_t word = shared[full].load(std::memory_order_relaxed);
-                std::memcpy(out + full * sizeof(uint64_t), &word, rest);
-            }
-        }
-
         /// Compare a stored key against \p key.  Runs unlocked in Reader::resolve();
         /// a torn copy costs a retry once the tenancy re-check sees the entry move.
         bool key_equals(BlackboardEntry const* entry, char const* key, std::size_t key_len)
