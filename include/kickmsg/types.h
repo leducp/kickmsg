@@ -38,6 +38,13 @@ namespace kickmsg
     /// Entry::meta stores slot + 1 in 24 bits; zero means no slot.
     constexpr uint64_t    MAX_POOL_SIZE   = (1ULL << 24) - 2;
 
+    /// SlotHeader::payload_len is 32-bit and send() reports lengths as int32_t.
+    constexpr uint64_t    MAX_PAYLOAD_SIZE = INT32_MAX;
+
+    /// A publish presets the 32-bit slot refcount to max_subs; the margin to
+    /// UINT32_MAX absorbs SampleView pins.
+    constexpr uint64_t    MAX_SUBSCRIBERS  = 65535;
+
     // [tag:2 | pos:62]
     //   00: committed, pos + 1
     //   01: skip marker, pos + 1; no payload, but the slot claim remains valid

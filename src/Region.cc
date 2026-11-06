@@ -32,9 +32,17 @@ namespace kickmsg
             {
                 throw std::runtime_error("max_subscribers must be > 0");
             }
+            if (cfg.max_subscribers > MAX_SUBSCRIBERS)
+            {
+                throw std::runtime_error("max_subscribers exceeds MAX_SUBSCRIBERS");
+            }
             if (cfg.max_payload_size == 0)
             {
                 throw std::runtime_error("max_payload_size must be > 0");
+            }
+            if (cfg.max_payload_size > MAX_PAYLOAD_SIZE)
+            {
+                throw std::runtime_error("max_payload_size exceeds MAX_PAYLOAD_SIZE");
             }
             // SchemaInfo::blob_size is a uint32_t.
             if (cfg.schema_capacity > UINT32_MAX)
@@ -250,6 +258,15 @@ namespace kickmsg
             if (geometry.pool_size > MAX_POOL_SIZE)
             {
                 throw std::runtime_error("Header geometry: pool_size exceeds MAX_POOL_SIZE");
+            }
+            // Publish narrows lengths to 32 bits and presets the refcount to max_subs.
+            if (geometry.slot_data_size > MAX_PAYLOAD_SIZE)
+            {
+                throw std::runtime_error("Header geometry: slot_data_size exceeds MAX_PAYLOAD_SIZE");
+            }
+            if (geometry.max_subs > MAX_SUBSCRIBERS)
+            {
+                throw std::runtime_error("Header geometry: max_subs exceeds MAX_SUBSCRIBERS");
             }
             if (not is_power_of_two(geometry.sub_ring_capacity))
             {

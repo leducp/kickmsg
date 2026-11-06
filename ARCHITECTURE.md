@@ -596,6 +596,12 @@ the 24-bit slot field limits `pool_size` to `MAX_POOL_SIZE`.
 
 ### Validated geometry snapshot
 
+Creation and opening both bound what the 32-bit hot-path fields can
+represent: `max_payload_size <= MAX_PAYLOAD_SIZE` (`INT32_MAX`, the
+`SlotHeader::payload_len` width and the `send()` return range) and
+`max_subscribers <= MAX_SUBSCRIBERS` (65535, so the refcount preset of
+`max_subs` leaves headroom for `SampleView` pins).
+
 After creation or validation, each handle copies the header's offsets,
 strides, counts, and size limits into local `Geometry`. Pointer arithmetic
 uses this copy because peers can still modify the shared header. This

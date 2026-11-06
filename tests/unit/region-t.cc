@@ -210,6 +210,28 @@ TEST_F(RegionTest, RequiredSizeRejectsOverflowingConfig)
     EXPECT_THROW(kickmsg::SharedRegion::required_size(cfg), std::runtime_error);
 }
 
+TEST_F(RegionTest, RequiredSizeEnforcesRepresentableLimits)
+{
+    kickmsg::channel::Config cfg;
+    cfg.max_subscribers   = 1;
+    cfg.sub_ring_capacity = 1;
+    cfg.pool_size         = 1;
+    cfg.max_payload_size  = kickmsg::MAX_PAYLOAD_SIZE;
+    EXPECT_NO_THROW(kickmsg::SharedRegion::required_size(cfg));
+    cfg.max_payload_size  = kickmsg::MAX_PAYLOAD_SIZE + 1;
+    EXPECT_THROW(kickmsg::SharedRegion::required_size(cfg), std::runtime_error);
+    cfg.max_payload_size  = std::size_t{UINT32_MAX} + 1;
+    EXPECT_THROW(kickmsg::SharedRegion::required_size(cfg), std::runtime_error);
+
+    cfg.max_payload_size  = 1;
+    cfg.max_subscribers   = kickmsg::MAX_SUBSCRIBERS;
+    EXPECT_NO_THROW(kickmsg::SharedRegion::required_size(cfg));
+    cfg.max_subscribers   = kickmsg::MAX_SUBSCRIBERS + 1;
+    EXPECT_THROW(kickmsg::SharedRegion::required_size(cfg), std::runtime_error);
+    cfg.max_subscribers   = std::size_t{UINT32_MAX} + 1;
+    EXPECT_THROW(kickmsg::SharedRegion::required_size(cfg), std::runtime_error);
+}
+
 TEST_F(RegionTest, SchemaNameForcedNulTerminatedOnRead)
 {
     auto region = kickmsg::SharedRegion::create(
@@ -1678,9 +1700,8 @@ TEST_F(CorruptedHeaderTest, RejectsRingsOverflowingPoolOffset)
 {
     auto buf = make_stamped(default_cfg());
     // max_subs * sub_ring_stride must fit in [sub_rings_offset, pool_offset).
-    header(buf)->max_subs = UINT64_MAX;
-    EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
-                 std::runtime_error);
+    header(buf)->max_subs = kickmsg::MAX_SUBSCRIBERS;
+    expect_rejected(buf, "subscriber rings overflow pool_offset");
 }
 
 TEST_F(CorruptedHeaderTest, RejectsPoolOverflowingTotalSize)
@@ -1734,6 +1755,17 @@ TEST_F(CorruptedHeaderTest, RejectsCreatorNameLenPastTail)
         static_cast<uint16_t>(header(buf)->sub_rings_offset);
     EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
                  std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsUnrepresentablePayloadAndSubscriberCounts)
+{
+    auto buf = make_stamped(default_cfg());
+    header(buf)->slot_data_size = kickmsg::MAX_PAYLOAD_SIZE + 1;
+    expect_rejected(buf, "MAX_PAYLOAD_SIZE");
+
+    auto other = make_stamped(default_cfg());
+    header(other)->max_subs = kickmsg::MAX_SUBSCRIBERS + 1;
+    expect_rejected(other, "MAX_SUBSCRIBERS");
 }
 
 TEST_F(CorruptedHeaderTest, RejectsCorruptSchemaBlobGeometry)
