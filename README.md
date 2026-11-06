@@ -114,6 +114,20 @@ if (schema and schema->version != 2) { /* user-defined policy */ }
 
 The library stores the descriptor in the header but never interprets it — users
 choose how to compute identity/layout fingerprints and how to react to mismatches.
+`kickmsg::schema::Algo` names well-known hash algorithms (`fnv1a_64`, `xxh64`,
+`sha256`, `blake3_256`, ...) for the `*_algo` tags.
+
+A write-once schema blob (e.g. the `.proto` or `.fbs` text) can ride the same
+claim, so a peer that has never seen the type can parse it:
+
+```cpp
+cfg.schema_capacity = 4096;          // geometry: both sides must agree
+info.blob_hash = sha256(definition); // user-defined fingerprint
+info.blob_algo = kickmsg::schema::sha256;
+region.try_claim_schema(info, definition_bytes);  // or cfg.schema_blob at create
+
+std::vector<uint8_t> blob = region.schema_blob();  // any process, any number of times
+```
 
 ### Blackboard (state, not stream)
 
@@ -183,6 +197,7 @@ kickmsg watch <shm>                 # top-like live view, msg/s rates (interacti
 kickmsg diagnose <shm>              # wraps SharedRegion::diagnose()
 kickmsg repair   <shm> [--locked]   # run repair primitives
 kickmsg schema <shm>                # focused schema descriptor view
+kickmsg schema --shm <shm> --blob   # raw schema blob to stdout
 kickmsg schema-diff <a> <b>         # field-by-field schema comparison
 kickmsg blackboard <name>           # key table: size, freshness, owner, liveness
 kickmsg blackboard-watch <name>     # top-like live view, updates/s per key

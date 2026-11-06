@@ -3,6 +3,7 @@
 #include "kickmsg/Region.h"
 #include "kickmsg/Publisher.h"
 #include "kickmsg/Subscriber.h"
+#include "kickmsg/Hash.h"
 
 #include <atomic>
 #include <thread>
@@ -1037,6 +1038,244 @@ TEST_F(RegionTest, SchemaDoesNotAffectConfigHash)
     EXPECT_STREQ(got->name, "creator/Type");
 }
 
+// --- Schema blob (write-once, published with the descriptor) --------------
+
+namespace
+{
+    std::vector<uint8_t> make_blob(std::size_t size, uint8_t fill)
+    {
+        return std::vector<uint8_t>(size, fill);
+    }
+}
+
+TEST_F(RegionTest, SchemaBlobBakedAtCreate)
+{
+    auto cfg = default_cfg();
+    cfg.schema_capacity = 1000;
+    cfg.schema          = make_schema("my/Pose", 1, 0xAA, 0xBB);
+    cfg.schema->blob_hash = kickmsg::hash::identity_from_fnv1a("message Pose {}");
+    cfg.schema->blob_algo = kickmsg::schema::fnv1a_64;
+    cfg.schema->blob_size = 12345;  // ignored: the library stamps the real length
+    cfg.schema_blob     = make_blob(777, 0x5A);
+
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->blob_size, 777u);
+    EXPECT_EQ(got->blob_algo, static_cast<uint32_t>(kickmsg::schema::fnv1a_64));
+    EXPECT_EQ(got->blob_hash, kickmsg::hash::identity_from_fnv1a("message Pose {}"));
+    EXPECT_EQ(region.schema_blob(), cfg.schema_blob);
+    EXPECT_EQ(region.info().schema_capacity, 1000u);
+
+    auto opened = kickmsg::SharedRegion::open(SHM_NAME);
+    EXPECT_EQ(opened.schema_blob(), cfg.schema_blob);
+}
+
+TEST_F(RegionTest, SchemaReservedBytesAreZeroedOnWrite)
+{
+    auto info = make_schema("t", 1, 0, 0);
+    std::memset(info.reserved, 0xEE, sizeof(info.reserved));
+
+    {
+        auto cfg   = default_cfg();
+        cfg.schema = info;
+        auto baked = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+        auto got   = baked.schema();
+        ASSERT_TRUE(got.has_value());
+        for (uint8_t byte : got->reserved)
+        {
+            EXPECT_EQ(byte, 0u);
+        }
+    }
+
+    // The first region is unmapped first: Windows cannot replace a live mapping.
+    kickmsg::SharedMemory::unlink(SHM_NAME);
+    auto claimed = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, default_cfg());
+    ASSERT_TRUE(claimed.try_claim_schema(info));
+    auto got = claimed.schema();
+    ASSERT_TRUE(got.has_value());
+    for (uint8_t byte : got->reserved)
+    {
+        EXPECT_EQ(byte, 0u);
+    }
+}
+
+TEST_F(RegionTest, SchemaBlobLateClaimIsWriteOnce)
+{
+    auto cfg = default_cfg();
+    cfg.schema_capacity = 256;
+    auto creator = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    EXPECT_TRUE(creator.schema_blob().empty());
+
+    auto late = kickmsg::SharedRegion::create_or_open(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    auto blob = make_blob(256, 0x11);
+    auto info = make_schema("late/Type", 1, 0x01, 0x02);
+    info.blob_size = 3;  // ignored
+    EXPECT_TRUE(late.try_claim_schema(info, blob));
+
+    auto other = make_blob(10, 0x22);
+    EXPECT_FALSE(creator.try_claim_schema(make_schema("other/Type", 2, 0, 0), other));
+
+    EXPECT_EQ(creator.schema_blob(), blob);
+    auto got = creator.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(got->name, "late/Type");
+    EXPECT_EQ(got->blob_size, 256u);
+}
+
+TEST_F(RegionTest, SchemaBlobOversizeClaimThrowsBeforeClaiming)
+{
+    auto cfg = default_cfg();
+    cfg.schema_capacity = 16;
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto blob = make_blob(17, 0x01);
+    EXPECT_THROW(region.try_claim_schema(make_schema("big/Type", 1, 0, 0), blob), std::length_error);
+    EXPECT_EQ(region.header()->schema_state.load(std::memory_order_acquire),
+              static_cast<uint32_t>(kickmsg::schema::Unset));
+
+    EXPECT_TRUE(region.try_claim_schema(make_schema("fits/Type", 1, 0, 0), make_blob(16, 0x02)));
+}
+
+TEST_F(RegionTest, SchemaBlobAbsentWithoutCapacity)
+{
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, default_cfg());
+    EXPECT_EQ(region.info().schema_capacity, 0u);
+
+    EXPECT_THROW(region.try_claim_schema(make_schema("t", 1, 0, 0), make_blob(1, 0)), std::length_error);
+    EXPECT_TRUE(region.try_claim_schema(make_schema("t", 1, 0, 0)));
+
+    auto got = region.schema();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->blob_size, 0u);
+    EXPECT_TRUE(region.schema_blob().empty());
+}
+
+TEST_F(RegionTest, SchemaCapacityIsPartOfConfigHash)
+{
+    auto cfg = default_cfg();
+    cfg.schema_capacity = 128;
+    auto existing = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    auto other = default_cfg();
+    other.schema_capacity = 256;
+    EXPECT_THROW(kickmsg::SharedRegion::create_or_open(SHM_NAME, kickmsg::channel::PubSub, other),
+                 std::runtime_error);
+    EXPECT_NE(kickmsg::compute_config_hash(kickmsg::channel::PubSub, cfg),
+              kickmsg::compute_config_hash(kickmsg::channel::PubSub, other));
+
+    // The blob itself is not geometry.
+    auto same = cfg;
+    same.schema      = make_schema("t", 1, 0, 0);
+    same.schema_blob = make_blob(4, 0x01);
+    EXPECT_NO_THROW(kickmsg::SharedRegion::create_or_open(SHM_NAME, kickmsg::channel::PubSub, same));
+}
+
+TEST_F(RegionTest, SchemaBlobConfigIsValidated)
+{
+    auto cfg = default_cfg();
+    cfg.schema_capacity = 4;
+    cfg.schema          = make_schema("t", 1, 0, 0);
+    cfg.schema_blob     = make_blob(5, 0);
+    EXPECT_THROW(kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg),
+                 std::runtime_error);
+
+    cfg.schema_blob = make_blob(4, 0);
+    cfg.schema.reset();
+    EXPECT_THROW(kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg),
+                 std::runtime_error);
+
+    cfg.schema_blob.clear();
+    cfg.schema_capacity = std::size_t{UINT32_MAX} + 1;
+    EXPECT_THROW(kickmsg::SharedRegion::required_size(cfg), std::runtime_error);
+}
+
+TEST_F(RegionTest, SchemaBlobCorruptSizeThrowsOnRead)
+{
+    auto cfg = default_cfg();
+    cfg.schema_capacity = 64;
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+    ASSERT_TRUE(region.try_claim_schema(make_schema("t", 1, 0, 0), make_blob(8, 0x01)));
+
+    region.header()->schema_data.blob_size = 65;
+    EXPECT_THROW(region.schema_blob(), std::runtime_error);
+}
+
+TEST_F(RegionTest, SchemaBlobConcurrentClaimsAndReaders)
+{
+    auto cfg = default_cfg();
+    cfg.schema_capacity = 4096;
+    auto region = kickmsg::SharedRegion::create(SHM_NAME, kickmsg::channel::PubSub, cfg);
+
+    constexpr int CLAIMERS = 4;
+    constexpr int READERS  = 4;
+    std::atomic<bool>        start{false};
+    std::atomic<int>         winners{0};
+    std::atomic<int>         torn{0};
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < CLAIMERS; ++i)
+    {
+        threads.emplace_back([&, i]()
+        {
+            while (not start.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            auto fill = static_cast<uint8_t>(i + 1);
+            auto blob = make_blob(1024u * static_cast<std::size_t>(i + 1), fill);
+            if (region.try_claim_schema(make_schema("racer", fill, fill, fill), blob))
+            {
+                // Relaxed: only read after join(), which synchronizes.
+                winners.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (int i = 0; i < READERS; ++i)
+    {
+        threads.emplace_back([&]()
+        {
+            while (not start.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            for (int round = 0; round < 2000; ++round)
+            {
+                auto info = region.schema();
+                auto blob = region.schema_blob();
+                if (not info.has_value())
+                {
+                    continue;
+                }
+                // Write-once: once Set, the descriptor and blob never change.
+                // Relaxed: only read after join(), which synchronizes.
+                if (blob.size() != 1024u * info->version)
+                {
+                    torn.fetch_add(1, std::memory_order_relaxed);
+                }
+                for (uint8_t byte : blob)
+                {
+                    if (byte != info->version)
+                    {
+                        torn.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    EXPECT_EQ(winners.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(torn.load(std::memory_order_relaxed), 0);
+}
+
 // stats() -- cross-process counter snapshot
 
 TEST_F(RegionTest, StatsOnFreshRegionReportsZeros)
@@ -1354,6 +1593,20 @@ public:
     }
 
     kickmsg::Header* header(Buffer& b) { return static_cast<kickmsg::Header*>(b.get()); }
+
+    // The reason pins which check fired: a header can trip an earlier check than intended.
+    void expect_rejected(Buffer& buf, char const* reason)
+    {
+        try
+        {
+            kickmsg::SharedRegion::attach_open(buf.get(), buf.size);
+            ADD_FAILURE() << "attach_open accepted a header that should fail with: " << reason;
+        }
+        catch (std::runtime_error const& e)
+        {
+            EXPECT_NE(std::string(e.what()).find(reason), std::string::npos) << e.what();
+        }
+    }
 };
 
 TEST_F(CorruptedHeaderTest, RejectsZeroMaxSubs)
@@ -1464,6 +1717,37 @@ TEST_F(CorruptedHeaderTest, RejectsCreatorNameLenPastTail)
         static_cast<uint16_t>(header(buf)->sub_rings_offset);
     EXPECT_THROW(kickmsg::SharedRegion::attach_open(buf.get(), buf.size),
                  std::runtime_error);
+}
+
+TEST_F(CorruptedHeaderTest, RejectsCorruptSchemaBlobGeometry)
+{
+    struct Case
+    {
+        char const* reason;
+        void (*corrupt)(kickmsg::Header*);
+    };
+    Case const cases[] = {
+        {"schema blob offset out of range", [](kickmsg::Header* h) { h->schema_blob_offset = 0; }},
+        {"schema blob offset out of range",
+         [](kickmsg::Header* h) { h->schema_blob_offset = h->sub_rings_offset + kickmsg::CACHE_LINE; }},
+        {"not cache-line aligned", [](kickmsg::Header* h) { h->schema_blob_offset += 1; }},
+        {"schema blob capacity out of range", [](kickmsg::Header* h) { h->schema_blob_capacity = UINT64_MAX; }},
+        {"schema blob capacity out of range",
+         [](kickmsg::Header* h) { h->schema_blob_capacity = h->sub_rings_offset - h->schema_blob_offset + 1; }},
+        {"creator_name_len exceeds tail",
+         [](kickmsg::Header* h)
+         { h->creator_name_len = static_cast<uint16_t>(h->schema_blob_offset - sizeof(kickmsg::Header) + 1); }},
+    };
+
+    auto cfg = default_cfg();
+    // Not a cache-line multiple: the padding lets a +1 offset pass the capacity check.
+    cfg.schema_capacity = 200;
+    for (auto const& c : cases)
+    {
+        auto buf = make_stamped(cfg);
+        c.corrupt(header(buf));
+        expect_rejected(buf, c.reason);
+    }
 }
 
 

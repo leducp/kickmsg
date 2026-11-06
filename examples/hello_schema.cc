@@ -52,10 +52,6 @@ constexpr char const* SCHEMA_DESCRIPTOR =
     "gx:f32, gy:f32, gz:f32)";
 constexpr uint32_t    SCHEMA_VERSION    = 2;
 
-// User-defined tag so tooling can tell "these bytes are an FNV-1a" vs
-// some other hash family — library ignores it.
-constexpr uint32_t    ALGO_FNV1A_64     = 1;
-
 SchemaInfo make_imu_schema(std::string const& descriptor, uint32_t version)
 {
     SchemaInfo info{};
@@ -65,7 +61,7 @@ SchemaInfo make_imu_schema(std::string const& descriptor, uint32_t version)
     // skew can be distinguished from "different type altogether".
     std::snprintf(info.name, sizeof(info.name), "%s", SCHEMA_NAME);
     info.version       = version;
-    info.identity_algo = ALGO_FNV1A_64;
+    info.identity_algo = schema::fnv1a_64;
     return info;
 }
 

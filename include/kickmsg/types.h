@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace kickmsg
 {
@@ -30,7 +31,7 @@ namespace kickmsg
     };
 
     constexpr uint64_t    MAGIC           = 0x4B49434B4D534721ULL; // "KICKMSG!"
-    constexpr uint32_t    VERSION         = 9;
+    constexpr uint32_t    VERSION         = 10;
     constexpr uint32_t    INVALID_SLOT    = UINT32_MAX;
     constexpr std::size_t CACHE_LINE      = 64;
 
@@ -64,7 +65,9 @@ namespace kickmsg
 
     /// Opaque payload schema, stored in shared memory. Callers choose hashes,
     /// algorithm tags, versioning, and compatibility rules.
-    /// identity names the logical type; layout describes its binary layout.
+    /// identity names the logical type; layout describes its binary layout;
+    /// blob_hash fingerprints the schema blob stored next to the header.
+    /// Algorithm tags are schema::Algo values; the library never checks a digest.
     /// The fixed 512-byte layout includes reserved space for future fields.
     struct SchemaInfo
     {
@@ -72,10 +75,13 @@ namespace kickmsg
         std::array<uint8_t, 64> layout;         ///< Structural fingerprint (user-defined bytes)
         char                    name[128];      ///< Null-terminated, for diagnostics
         uint32_t                version;        ///< User-defined version number
-        uint32_t                identity_algo;  ///< User tag: 0 = unspecified
-        uint32_t                layout_algo;    ///< User tag: 0 = unspecified
+        uint32_t                identity_algo;  ///< schema::Algo tag: 0 = unspecified
+        uint32_t                layout_algo;    ///< schema::Algo tag: 0 = unspecified
         uint32_t                flags;          ///< Reserved bit flags (0 for now)
-        uint8_t                 reserved[240];  ///< Future fields -- zero on write
+        std::array<uint8_t, 64> blob_hash;      ///< Schema blob fingerprint (user-defined bytes)
+        uint32_t                blob_size;      ///< Written by the library from the claimed blob; caller value ignored
+        uint32_t                blob_algo;      ///< schema::Algo tag: 0 = unspecified
+        uint8_t                 reserved[168];  ///< Future fields -- zeroed by the library on write
     };
     static_assert(sizeof(SchemaInfo) == 512,
         "SchemaInfo layout is part of the shared-memory ABI");
@@ -94,7 +100,7 @@ namespace kickmsg
         };
 
         /// Fields that differ between two schemas. Zero means all checked fields match.
-        /// Flags and reserved bytes are ignored for forward compatibility.
+        /// Flags, reserved bytes, and the library-written blob_size are ignored.
         /// The caller decides which differences are acceptable.
         enum Diff : uint32_t
         {
@@ -105,10 +111,91 @@ namespace kickmsg
             Name         = 1u << 3,  ///< name strings differ (up to 128 B)
             IdentityAlgo = 1u << 4,  ///< identity_algo tags differ
             LayoutAlgo   = 1u << 5,  ///< layout_algo tags differ
+            Blob         = 1u << 6,  ///< blob_hash[] bytes differ
+            BlobAlgo     = 1u << 7,  ///< blob_algo tags differ
         };
 
         /// Compare schema fields without applying a compatibility policy.
         uint32_t diff(SchemaInfo const& a, SchemaInfo const& b);
+
+        /// Well-known hash algorithm tags for the *_algo fields. Tags only: kickmsg
+        /// implements fnv1a_64 (kickmsg/Hash.h) and none of the others.
+        /// Values are stored in shared memory and must never be renumbered.
+        enum Algo : uint32_t
+        {
+            unspecified = 0,
+
+            fnv1a_64    = 1,
+            xxh64       = 2,
+            xxh3_64     = 3,
+            xxh3_128    = 4,
+            crc32c      = 5,
+
+            md5         = 16,
+            sha1        = 17,
+            sha256      = 18,
+            sha384      = 19,
+            sha512      = 20,
+            sha3_256    = 21,
+            sha3_512    = 22,
+            blake2s_256 = 23,
+            blake2b_256 = 24,
+            blake2b_512 = 25,
+            blake3_256  = 26,
+
+            user_base   = 0x80000000u,  ///< Tags >= user_base are user-defined, never assigned by kickmsg
+        };
+
+        /// Digest length in bytes, or 0 for unspecified, unknown, and user-defined tags.
+        constexpr std::size_t digest_size(uint32_t algo)
+        {
+            switch (algo)
+            {
+                case fnv1a_64:    { return 8; }
+                case xxh64:       { return 8; }
+                case xxh3_64:     { return 8; }
+                case xxh3_128:    { return 16; }
+                case crc32c:      { return 4; }
+                case md5:         { return 16; }
+                case sha1:        { return 20; }
+                case sha256:      { return 32; }
+                case sha384:      { return 48; }
+                case sha512:      { return 64; }
+                case sha3_256:    { return 32; }
+                case sha3_512:    { return 64; }
+                case blake2s_256: { return 32; }
+                case blake2b_256: { return 32; }
+                case blake2b_512: { return 64; }
+                case blake3_256:  { return 32; }
+                default:          { return 0; }
+            }
+        }
+
+        /// Lowercase algorithm name ("sha256"), or nullptr for unspecified, unknown,
+        /// and user-defined tags.
+        constexpr char const* algo_name(uint32_t algo)
+        {
+            switch (algo)
+            {
+                case fnv1a_64:    { return "fnv1a_64"; }
+                case xxh64:       { return "xxh64"; }
+                case xxh3_64:     { return "xxh3_64"; }
+                case xxh3_128:    { return "xxh3_128"; }
+                case crc32c:      { return "crc32c"; }
+                case md5:         { return "md5"; }
+                case sha1:        { return "sha1"; }
+                case sha256:      { return "sha256"; }
+                case sha384:      { return "sha384"; }
+                case sha512:      { return "sha512"; }
+                case sha3_256:    { return "sha3_256"; }
+                case sha3_512:    { return "sha3_512"; }
+                case blake2s_256: { return "blake2s_256"; }
+                case blake2b_256: { return "blake2b_256"; }
+                case blake2b_512: { return "blake2b_512"; }
+                case blake3_256:  { return "blake3_256"; }
+                default:          { return nullptr; }
+            }
+        }
     }
 
     namespace channel
@@ -144,6 +231,14 @@ namespace kickmsg
             /// SharedRegion::schema() and apply their own mismatch policy.
             std::optional<SchemaInfo> schema;
 
+            /// Bytes reserved for the schema blob. Part of config_hash: a late
+            /// claimer can only write a blob into space the creator reserved.
+            std::size_t schema_capacity = 0;
+
+            /// Schema blob baked with `schema` at create time (requires `schema`,
+            /// at most schema_capacity bytes). Ignored on open, like `schema`.
+            std::vector<uint8_t> schema_blob;
+
             /// Optional logical-identity fingerprint, verified at open when
             /// both sides are nonzero (shm-name collision detection).  NOT
             /// part of config_hash.
@@ -172,6 +267,8 @@ namespace kickmsg
         uint64_t    slot_data_size;     ///< Max payload bytes per slot
         uint64_t    slot_stride;        ///< Bytes between consecutive slots (aligned)
         uint64_t    sub_ring_stride;    ///< Bytes between consecutive subscriber rings (aligned)
+        uint64_t    schema_blob_offset;   ///< Byte offset from base to the schema blob area
+        uint64_t    schema_blob_capacity; ///< Bytes reserved for the schema blob
 
         uint64_t    commit_timeout_us;  ///< Max wait for a previous writer to commit (crash detection)
         uint64_t    config_hash;        ///< FNV-1a of config fields -- detects parameter mismatches on open
@@ -182,8 +279,8 @@ namespace kickmsg
         uint16_t    creator_name_len;   ///< Length of creator name string
         // creator_name bytes follow immediately after sizeof(Header)
 
-        /// Write schema_data under Claiming, then release-store Set.
-        /// Readers acquire Set before copying schema_data.
+        /// Write the blob area and schema_data under Claiming, then release-store Set.
+        /// Readers acquire Set before copying either.
         alignas(CACHE_LINE) std::atomic<uint32_t> schema_state;
         alignas(CACHE_LINE) SchemaInfo            schema_data;
 
@@ -254,6 +351,8 @@ namespace kickmsg
         uint64_t slot_data_size;
         uint64_t max_subs;
         uint64_t commit_timeout_us;
+        uint64_t schema_blob_offset;
+        uint64_t schema_blob_capacity;
     };
 
     /// Ring entry: one per position in a subscriber ring.

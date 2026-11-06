@@ -140,9 +140,12 @@ def test_schema_set_after_claim(kmsg_namespace, small_cfg):
     info.version = 3
     info.identity = b"\x01" * 64
     info.layout = b"\x02" * 64
+    info.blob_hash = b"\x03" * 64
 
     cfg = small_cfg
     cfg.schema = info
+    cfg.schema_capacity = 16
+    cfg.schema_blob = b"blob"
 
     node = kickmsg.Node("n", namespace=kmsg_namespace)
     pub = node.advertise("topic", cfg)
@@ -152,6 +155,10 @@ def test_schema_set_after_claim(kmsg_namespace, small_cfg):
     assert s.name == "my/Type"
     assert s.version == 3
     assert s.identity == b"\x01" * 64
+    assert s.blob_size == 4
+    assert s.blob_hash == b"\x03" * 64
+    assert diag.schema_blob(f"/{kmsg_namespace}_topic") == b"blob"
+    assert diag.info(f"/{kmsg_namespace}_topic").geometry.schema_capacity == 16
 
     del pub, node
     kickmsg.unlink_shm(f"/{kmsg_namespace}_topic")

@@ -3,6 +3,7 @@
 
 #include "kickmsg/Naming.h"
 #include "kickmsg/Node.h"
+#include "kickmsg/Hash.h"
 
 class NodeTest : public ::testing::Test
 {
@@ -251,6 +252,37 @@ TEST_F(NodeTest, TryClaimTopicSchemaUnknownTopicIsFalse)
     kickmsg::Node node("orphan", "test");
     auto info = make_node_schema("stray/Type", 1, 0x00);
     EXPECT_FALSE(node.try_claim_topic_schema("never_joined", info));
+}
+
+TEST_F(NodeTest, TopicSchemaBlobLateBinding)
+{
+    track("test", "telemetry");
+
+    auto cfg = small_cfg();
+    cfg.schema_capacity = 512;
+
+    kickmsg::Node listener("listener", "test");
+    auto sub = listener.subscribe_or_create("telemetry", cfg);
+    EXPECT_TRUE(listener.topic_schema_blob("telemetry").empty());
+
+    kickmsg::Node driver("driver", "test");
+    auto pub = driver.advertise_or_join("telemetry", cfg);
+
+    std::string const definition = "message Telemetry { uint64 seq = 1; }";
+    std::vector<uint8_t> blob(definition.begin(), definition.end());
+    auto info = make_node_schema("app/Telemetry", 1, 0xCC);
+    info.blob_hash = kickmsg::hash::identity_from_fnv1a(definition);
+    info.blob_algo = kickmsg::schema::fnv1a_64;
+    EXPECT_TRUE(driver.try_claim_topic_schema("telemetry", info, blob));
+
+    EXPECT_EQ(listener.topic_schema_blob("telemetry"), blob);
+    auto observed = listener.topic_schema("telemetry");
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(observed->blob_size, blob.size());
+    EXPECT_EQ(observed->blob_hash, info.blob_hash);
+
+    kickmsg::Node orphan("orphan", "test");
+    EXPECT_TRUE(orphan.topic_schema_blob("telemetry").empty());
 }
 
 TEST_F(NodeTest, UnlinkTopicRemovesShm)

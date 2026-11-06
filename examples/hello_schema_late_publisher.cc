@@ -18,7 +18,8 @@
 ///      atomically publishes the descriptor (Unset → Claiming → Set).
 ///
 ///   4. Subscriber's next poll observes the schema, verifies it via
-///      schema::diff(), and starts consuming.
+///      schema::diff(), reads the schema blob the publisher attached
+///      (the full message definition), and starts consuming.
 ///
 /// The library does no waiting on behalf of the user — the polling loop
 /// is entirely policy.  Replace it with whatever fits the deployment
@@ -34,8 +35,6 @@
 using namespace kickmsg;
 using namespace std::chrono_literals;
 
-constexpr uint32_t ALGO_FNV1A_64 = 1;
-
 SchemaInfo make_schema(char const* name, std::string const& descriptor,
                        uint32_t version)
 {
@@ -43,7 +42,9 @@ SchemaInfo make_schema(char const* name, std::string const& descriptor,
     info.identity      = hash::identity_from_fnv1a(descriptor);
     std::snprintf(info.name, sizeof(info.name), "%s", name);
     info.version       = version;
-    info.identity_algo = ALGO_FNV1A_64;
+    info.identity_algo = schema::fnv1a_64;
+    info.blob_hash     = hash::identity_from_fnv1a(descriptor);
+    info.blob_algo     = schema::fnv1a_64;
     return info;
 }
 
@@ -69,6 +70,8 @@ channel::Config make_config()
     cfg.sub_ring_capacity = 8;
     cfg.pool_size         = 16;
     cfg.max_payload_size  = sizeof(Telemetry);
+    // Geometry: whichever side creates the region reserves room for the blob.
+    cfg.schema_capacity   = 256;
     // The subscriber deliberately leaves cfg.schema empty so the schema
     // slot starts Unset.  The publisher will claim it on arrival.
     return cfg;
@@ -101,8 +104,10 @@ int main()
         Node pub_node("driver", PREFIX);
         auto pub = pub_node.advertise_or_join(TOPIC, make_config());
 
-        SchemaInfo info = make_schema(SCHEMA_NAME, SCHEMA_DESCRIPTOR, SCHEMA_VERSION);
-        bool       won  = pub_node.try_claim_topic_schema(TOPIC, info);
+        SchemaInfo  info = make_schema(SCHEMA_NAME, SCHEMA_DESCRIPTOR, SCHEMA_VERSION);
+        std::string_view definition{SCHEMA_DESCRIPTOR};
+        std::vector<uint8_t> blob(definition.begin(), definition.end());
+        bool        won  = pub_node.try_claim_topic_schema(TOPIC, info, blob);
 
         char const* outcome = "found existing";
         if (won)
@@ -149,7 +154,7 @@ int main()
     }
 
     uint32_t d = schema::diff(*got, expected);
-    bool match = (d & (schema::Identity | schema::Version)) == 0;
+    bool match = (d & (schema::Identity | schema::Version | schema::Blob)) == 0;
 
     char const* verdict = "mismatch, refusing";
     if (match)
@@ -165,6 +170,10 @@ int main()
         publisher_thread.join();
         return 1;
     }
+
+    std::vector<uint8_t> blob = sub_node.topic_schema_blob(TOPIC);
+    std::cout << "[listener]  schema blob (" << blob.size() << " B): "
+              << std::string(blob.begin(), blob.end()) << "\n";
 
     // ----- Listener consumes once the schema is verified -----
     int received = 0;

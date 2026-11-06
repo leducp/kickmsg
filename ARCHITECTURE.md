@@ -123,8 +123,14 @@ the user's responsibility.
 
 The region header is self-describing and forward-compatible.
 
-`version` is 9. `Header` and `SubRingHeader` are unchanged from 8; the
-bump covers the entry and slot layouts. `Entry` replaced its
+`version` is 10. It adds the schema blob area: `Header` gained
+`schema_blob_offset` and `schema_blob_capacity`, `config_hash` chains
+`schema_capacity`, and `SchemaInfo` carved `blob_hash`, `blob_size` and
+`blob_algo` out of its reserved bytes (see Payload Schema Descriptor). A
+version-9 peer would place the rings at the wrong offset.
+
+Version 9 left `Header` and `SubRingHeader` unchanged from 8; that
+bump covered the entry and slot layouts. `Entry` replaced its
 `slot_idx` + `payload_len` pair with the single 64-bit `meta` claim word
 (see Entry meta-word encoding), and `SlotHeader` grew from 8 to 16 bytes
 to carry `payload_len`. Both drive ring-stride and slot-stride math, so
@@ -142,7 +148,7 @@ old processes and unlinking their regions and registry.
 Header (at offset 0)
 ┌───────────────────────────────────────────────────────────┐
 │  magic (atomic)     0x4B49434B4D534721 ("KICKMSG!")       │
-│  version            9                                     │
+│  version            10                                    │
 │  channel_type       PubSub | Broadcast                    │
 │  total_size         total mmap size in bytes              │
 │  sub_rings_offset   byte offset to first subscriber ring  │
@@ -154,6 +160,8 @@ Header (at offset 0)
 │  slot_data_size     max payload bytes per slot            │
 │  slot_stride        slot_data_size + metadata, aligned    │
 │  sub_ring_stride    ring header + entries, aligned        │
+│  schema_blob_offset byte offset to the schema blob area   │
+│  schema_blob_capacity bytes reserved for the schema blob  │
 │  commit_timeout_us  crash detection timeout (microseconds)│
 │  config_hash        FNV-1a hash of config (mismatch guard)│
 │  creator_pid        PID of the creating process           │
@@ -166,6 +174,11 @@ Header (at offset 0)
 │  steal_count        stale entries stolen by repair (u64)  │
 │  identity_hash      logical-identity stamp (u64, 0=unset) │
 └───────────────────────────────────────────────────────────┘
+  creator_name[]    at sizeof(Header)
+  schema blob[]     at schema_blob_offset (cache-line aligned),
+                    schema_blob_capacity bytes
+  subscriber rings  at sub_rings_offset
+  slot pool         at pool_offset
 ```
 
 Offsets (rather than fixed struct sizes) allow extending the header
@@ -196,11 +209,14 @@ SchemaInfo (512 B, 8 cache lines)
 │  identity[64]       logical fingerprint (user-defined bytes) │
 │  layout[64]         structural fingerprint (user-defined)    │
 │  name[128]          null-terminated, for diagnostics         │
-│  version            uint32 — user-defined version number     │
-│  identity_algo      uint32 — user tag (0 = unspecified)      │
-│  layout_algo        uint32 — user tag (0 = unspecified)      │
-│  flags              uint32 — reserved bit flags              │
-│  reserved[240]      future fields — zero on write            │
+│  version            uint32 -- user-defined version number    │
+│  identity_algo      uint32 -- schema::Algo tag (0 = unspec.) │
+│  layout_algo        uint32 -- schema::Algo tag (0 = unspec.) │
+│  flags              uint32 -- reserved bit flags             │
+│  blob_hash[64]      schema blob fingerprint (user-defined)   │
+│  blob_size          uint32 -- written by the library         │
+│  blob_algo          uint32 -- schema::Algo tag (0 = unspec.) │
+│  reserved[168]      future fields -- zero on write           │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -211,9 +227,49 @@ type* from *same type, different ABI*: two binaries may agree on
 field, bumping `sizeof`). The library reports both back via
 `SchemaInfo`; callers decide whether ABI skew is tolerable.
 
-**Generous reserve.** 240 bytes of `reserved[]` are zeroed on every
+**Generous reserve.** 168 bytes of `reserved[]` are zeroed on every
 write so future additions (e.g. a creator host string, a descriptor
 URL, a signature) don't require another version bump.
+
+**Algorithm tags.** `schema::Algo` assigns well-known values for the
+`*_algo` fields (`fnv1a_64`, `xxh64`, `sha256`, `blake3_256`, ...) so
+independent teams agree on what a fingerprint is; `digest_size()` and
+`algo_name()` let tooling print only the meaningful digest bytes. The
+values are stored in shared memory and are never renumbered; tags at or
+above `user_base` are left to users. These are tags only -- kickmsg
+implements FNV-1a (`kickmsg/Hash.h`) and nothing else, and never checks
+a fingerprint against its tag.
+
+### Schema blob
+
+`SchemaInfo` lets peers *detect* disagreement; the schema blob lets a
+peer that has never seen the type *parse* it. The blob is opaque bytes
+(a `.proto`/`.fbs`/`.msg` text, a JSON schema, a serialized descriptor
+set...) stored in its own area between the creator name and the rings:
+
+- **Space is geometry.** `channel::Config::schema_capacity` reserves the
+  area at create time and is chained into `config_hash`: a late
+  claimer can only write into space the creator reserved, so both sides
+  of `advertise_or_join` / `subscribe_or_create` must agree on it, and a
+  mismatch fails `create_or_open` like any other geometry field.
+- **Published with the descriptor.** The blob rides the same
+  `Unset -> Claiming -> Set` claim as `SchemaInfo`
+  (`try_claim_schema(info, blob)`, or `cfg.schema` + `cfg.schema_blob`
+  at create): the winner writes the blob bytes, then `schema_data`, then
+  release-stores `Set`. A reader that acquires `Set` sees both, and both
+  are immutable from then on. A crash mid-write wedges at `Claiming`
+  exactly like a descriptor-only claim; `reset_schema_claim()` recovers it
+  and the next claimant rewrites the whole blob.
+- **Size is library-owned, fingerprint is not.** `blob_size` is set from
+  the bytes actually written (a caller's value is overwritten) because it
+  bounds the reader's copy. `blob_hash` / `blob_algo` are user bytes like
+  `identity` / `layout`. `schema::diff` reports `Blob` on `blob_hash`
+  and `BlobAlgo` on the tag; it ignores `blob_size`, which a reader's
+  expected descriptor cannot know.
+- **Hostile bytes.** `schema_blob()` reads `blob_size` once and throws if
+  it exceeds the validated local `schema_blob_capacity`; it returns a
+  copy, never a view into shared memory. An oversize claim throws
+  `std::length_error` before touching the state.
 
 ### Publish protocol
 
@@ -228,8 +284,8 @@ The descriptor is published via a three-state atomic (`schema_state`):
                              between Claiming and Set
 ```
 
-- Writer CAS `Unset → Claiming` (acq_rel). Winner memcpys the
-  payload into `schema_data`, then release-stores `Set`.
+- Writer CAS `Unset -> Claiming` (acq_rel). Winner memcpys the blob
+  bytes, then the payload into `schema_data`, then release-stores `Set`.
 - Reader acquire-loads `schema_state`. If `Set`, the payload is
   stable to read. If `Unset` or `Claiming`, `schema()` returns
   `std::nullopt`.
@@ -265,10 +321,11 @@ region.
   connect time (a handful of times per process lifetime), never on
   `send` / `receive`. The 512 B blob lives on its own cache lines
   and never shares a line with `free_top` or any ring header.
-- **Orthogonal to `config_hash`.** Schema presence/absence does not
-  participate in the geometry hash, so a typed publisher can share
-  a region with an untyped subscriber as long as the channel
-  geometry matches. Users opt in to schema enforcement on their
+- **Orthogonal to `config_hash`.** Schema presence/absence (descriptor
+  and blob contents) does not participate in the geometry hash, so a
+  typed publisher can share a region with an untyped subscriber as long
+  as the channel geometry matches. Only `schema_capacity`, which moves
+  the rings, is geometry. Users opt in to schema enforcement on their
   own terms.
 - **Library is policy-agnostic.** `try_claim_schema()` returning
   `false` is not an error — it just says "someone else got there
@@ -282,7 +339,9 @@ v6 added the ring owner identity (`owner_pid`, `owner_starttime`)
 that `reclaim_dead_rings()` keys on; v7 changed the entry commit
 protocol (position-tagged locks, skip markers -- see the
 sequence-word encoding below) and added `steal_count` and
-`identity_hash` to the header. Each bump changes the in-memory
+`identity_hash` to the header; v10 added the schema blob area
+(`schema_blob_offset`, `schema_blob_capacity`, and the `blob_*` fields
+of `SchemaInfo`). Each bump changes the in-memory
 meaning of shared bytes, so mixed-version binaries cannot share a
 region; mismatches are rejected at `open()` by the version check.
 
@@ -543,7 +602,9 @@ uses this copy because peers can still modify the shared header. This
 covers `SharedRegion`'s own diagnostic and recovery walks (`diagnose`,
 `stats`, `info`, the repair and reclaim primitives) as well as publishers
 and subscribers. `info()` re-bounds the live `creator_name_len` against
-the validated tail. `sub_ring_at`, `slot_at` and `treiber_pop` take a
+the validated tail `[sizeof(Header), schema_blob_offset)`, and
+`schema_blob()` re-bounds the live `blob_size` against the validated
+`schema_blob_capacity`. `sub_ring_at`, `slot_at` and `treiber_pop` take a
 `Geometry` (or an explicit pool base and stride), never a `Header`, so the
 shared fields have no path into pointer arithmetic. `SampleView` stores
 the slot pointer already resolved by its subscriber.

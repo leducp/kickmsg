@@ -2,8 +2,10 @@
 #define KICKMSG_NODE_H
 
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "kickmsg/Region.h"
 #include "kickmsg/Publisher.h"
@@ -82,12 +84,12 @@ namespace kickmsg
         // threads -- use one handle per thread instead.
         //
         // NOTE on cfg.schema: only the *creator* of the region bakes
-        // cfg.schema into the header.  On the open branch (region already
-        // exists) cfg.schema is IGNORED and the existing region's schema
-        // is preserved -- schema is orthogonal to channel geometry and
-        // never part of the create_or_open config-mismatch check.  Use
-        // try_claim_topic_schema() afterwards to publish a descriptor
-        // regardless of which side ended up creating the region.
+        // cfg.schema and cfg.schema_blob into the header.  On the open branch
+        // (region already exists) both are IGNORED and the existing region's
+        // schema is preserved -- they are never part of the create_or_open
+        // config-mismatch check.  cfg.schema_capacity is geometry: both sides
+        // must pass the same value.  Use try_claim_topic_schema() afterwards
+        // to publish a descriptor regardless of which side created the region.
         Publisher  advertise(char const* topic, channel::Config const& cfg = {},
                              WakeBackend* backend = nullptr);
         Subscriber subscribe(char const* topic);
@@ -149,10 +151,15 @@ namespace kickmsg
         /// joined the topic.
         std::optional<SchemaInfo> topic_schema(char const* topic) const;
 
+        /// Read the schema blob of a topic this node has joined. Empty if no
+        /// blob is published or this node hasn't joined the topic.
+        std::vector<uint8_t> topic_schema_blob(char const* topic) const;
+
         /// Atomically claim the schema slot on a topic this node has joined.
         /// Returns true if this call published the schema, false if someone
         /// else got there first (read back with topic_schema()).
-        bool try_claim_topic_schema(char const* topic, SchemaInfo const& info);
+        bool try_claim_topic_schema(char const* topic, SchemaInfo const& info,
+                                    std::span<uint8_t const> blob = {});
 
         std::string const& name()           const { return name_; }
         std::string const& kmsg_namespace() const { return namespace_; }

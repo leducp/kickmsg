@@ -1,6 +1,7 @@
 #ifndef KICKMSG_REGION_H
 #define KICKMSG_REGION_H
 
+#include <span>
 #include <vector>
 
 #include "kickmsg/types.h"
@@ -44,6 +45,7 @@ namespace kickmsg
         uint64_t      pool_size;
         uint64_t      max_payload_size;
         uint64_t      commit_timeout_us;
+        uint64_t      schema_capacity;
         uint64_t      creator_pid;
         uint64_t      created_at_ns;
         std::string   creator_name;
@@ -102,8 +104,8 @@ namespace kickmsg
         /// region stamped by another kickmsg build.
         static SharedRegion open(char const* name, uint64_t expected_identity = 0);
 
-        /// Create or open a region. Opening ignores cfg.schema; use try_claim_schema()
-        /// to publish a descriptor. Schema is separate from geometry validation.
+        /// Create or open a region. Opening ignores cfg.schema and cfg.schema_blob; use
+        /// try_claim_schema() to publish them. Only cfg.schema_capacity is geometry.
         /// Throws VersionMismatch at once on a region stamped by another kickmsg build.
         static SharedRegion create_or_open(char const* name, channel::Type type,
                                            channel::Config const& cfg,
@@ -161,11 +163,17 @@ namespace kickmsg
         /// The caller decides whether the descriptor is compatible.
         std::optional<SchemaInfo> schema() const;
 
-        /// Publish a schema with Unset -> Claiming -> Set. Returns true on success.
+        /// Copy of the published schema blob; empty while Unset or Claiming, or when
+        /// none was published. Throws if the stored size exceeds the reserved capacity.
+        std::vector<uint8_t> schema_blob() const;
+
+        /// Publish a schema and its optional blob with Unset -> Claiming -> Set.
+        /// Returns true on success. info.blob_size is replaced by blob.size().
         /// If another claim is in progress, wait for a bounded number of yields,
         /// then return false. Read schema() to check the published descriptor.
+        /// Throws std::length_error, before claiming, if blob exceeds schema_capacity.
         /// Safe during live traffic. A dead claimant requires reset_schema_claim().
-        bool try_claim_schema(SchemaInfo const& info);
+        bool try_claim_schema(SchemaInfo const& info, std::span<uint8_t const> blob = {});
 
         /// Reset Claiming to Unset after confirming the claimant has stopped.
         /// Returns true if reset, false if the state was not Claiming.
@@ -233,6 +241,7 @@ namespace kickmsg
                               char const* creator_name, std::size_t total_size,
                               std::size_t sub_rings_offset, std::size_t pool_offset,
                               std::size_t ring_stride,     std::size_t slot_stride,
+                              std::size_t schema_blob_offset, std::size_t schema_blob_capacity,
                               uint16_t    creator_len);
 
         SharedMemory shm_;

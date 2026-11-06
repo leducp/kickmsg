@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import kickmsg
 
+DEFINITION = "demo.Imu(timestamp_ns:u64, ax:f32, ay:f32, az:f32)"
+
 
 def make_imu_schema(version: int) -> kickmsg.SchemaInfo:
     info = kickmsg.SchemaInfo()
-    info.identity = kickmsg.hash.identity_from_fnv1a(
-        "demo.Imu(timestamp_ns:u64, ax:f32, ay:f32, az:f32)"
-    )
+    info.identity = kickmsg.hash.identity_from_fnv1a(DEFINITION)
     info.name = "demo/Imu"
     info.version = version
-    info.identity_algo = 1  # user tag — e.g. 1 = FNV-1a-64
+    info.identity_algo = kickmsg.schema.Algo.fnv1a_64.value
+    info.blob_hash = kickmsg.hash.identity_from_fnv1a(DEFINITION)
+    info.blob_algo = kickmsg.schema.Algo.fnv1a_64.value
     return info
 
 
@@ -30,6 +32,8 @@ def main() -> int:
     cfg.pool_size = 16
     cfg.max_payload_size = 32
     cfg.schema = make_imu_schema(version=2)
+    cfg.schema_capacity = 256
+    cfg.schema_blob = DEFINITION.encode()
 
     _ = pub_node.advertise(topic, cfg)
     print("[driver] advertised '%s' with schema %s v%d" % (
@@ -43,6 +47,7 @@ def main() -> int:
     d = kickmsg.schema.diff(got, expected)
     print("[good_sub]  observed %s v%d — diff=0x%x %s" % (
         got.name, got.version, d, "OK" if d == kickmsg.schema.Diff.Equal else "MISMATCH"))
+    print("[good_sub]  schema blob: %s" % good.topic_schema_blob(topic).decode())
 
     # Bad subscriber: expects v1 → diff reports Version mismatch → refuses.
     bad = kickmsg.Node("bad_sub", prefix)

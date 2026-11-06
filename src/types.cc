@@ -55,6 +55,7 @@ namespace kickmsg
         h = hash::fnv1a_64(cfg.pool_size,              h);
         h = hash::fnv1a_64(cfg.max_payload_size,       h);
         h = hash::fnv1a_64(cfg.commit_timeout.count(), h);
+        h = hash::fnv1a_64(cfg.schema_capacity,        h);
         return h;
     }
 
@@ -70,7 +71,10 @@ namespace kickmsg
             if (std::strncmp(a.name, b.name, sizeof(a.name)) != 0) d |= Name;
             if (a.identity_algo != b.identity_algo) d |= IdentityAlgo;
             if (a.layout_algo   != b.layout_algo)   d |= LayoutAlgo;
-            // Ignore reserved fields for forward compatibility.
+            if (a.blob_hash     != b.blob_hash)     d |= Blob;
+            if (a.blob_algo     != b.blob_algo)     d |= BlobAlgo;
+            // Ignore reserved fields for forward compatibility, and blob_size: a
+            // reader's expected descriptor cannot know the length the library stamps.
             return d;
         }
     }
